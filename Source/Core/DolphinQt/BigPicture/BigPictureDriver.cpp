@@ -13,6 +13,7 @@
 // Windows.h first
 #include <SetupAPI.h>
 #include <cfgmgr32.h>
+#include <combaseapi.h>
 #include <devguid.h>
 #include <newdev.h>
 #include <shellapi.h>
@@ -23,6 +24,7 @@
 #pragma comment(lib, "setupapi")
 #pragma comment(lib, "newdev")
 #pragma comment(lib, "shell32")
+#pragma comment(lib, "ole32")
 #endif
 
 namespace BigPictureDriver
