@@ -196,6 +196,20 @@ Item PrefPercent(const QString& label, const QString& help, const QString& key, 
   return item;
 }
 
+Item CrtFilter()
+{
+  return Choice<std::string>(
+      Tr("Filtre d'image (CRT)"),
+      Tr("Imite une télé cathodique : lignes, phosphores et lueur, réglés pour la 1080p comme "
+         "pour la 4K, quelle que soit la résolution interne."),
+      Config::GFX_ENHANCE_POST_SHADER,
+      {{"", Tr("Aucun")},
+       {"crt_manette_trinitron", Tr("CRT Trinitron")},
+       {"crt_manette_pvm", Tr("CRT PVM (net)")},
+       {"crt_manette_arcade", Tr("CRT Arcade (bombé)")},
+       {"crt_lottes_fast", Tr("CRT Lottes (classique)")}});
+}
+
 QString Percent(float v)
 {
   return QStringLiteral("%1 %").arg(static_cast<int>(std::lround(v * 100.0f)));
@@ -277,6 +291,15 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  Tr("Jaquettes en rangée, ou liste avec les bannières des jeux."),
                                  QStringLiteral("bigpicture/view"),
                                  {Tr("Jaquettes"), Tr("Liste avec bannières")}, 0, changed));
+    c.items.push_back(PrefChoice(Tr("Trier les jeux"), Tr("Aussi avec Z dans la bibliothèque."),
+                                 QStringLiteral("bigpicture/sort"),
+                                 {Tr("Nom"), Tr("Dernière partie"), Tr("Temps de jeu")}, 0,
+                                 changed));
+    c.items.push_back(PrefToggle(
+        Tr("Vraie animation de démarrage GameCube"),
+        Tr("Lance le BIOS de ta console avant le jeu. Copie le fichier IPL.bin de ta GameCube "
+           "dans le dossier GC\\EUR (ou USA, JAP) de Dolphin."),
+        QStringLiteral("bigpicture/real_boot"), false, {}));
     c.items.push_back(PrefChoice(Tr("Thème de couleur"),
                                  Tr("Les couleurs des modèles de GameCube."),
                                  QStringLiteral("bigpicture/theme"),
@@ -418,7 +441,8 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Toggle(Tr("Compiler les shaders avant de démarrer"),
                              Tr("Démarrage plus long, moins de saccades ensuite."),
                              Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING));
-    c.items.push_back(Toggle(Tr("Afficher les FPS"), {}, Config::GFX_SHOW_FPS));
+    c.items.push_back(CrtFilter());
+  c.items.push_back(Toggle(Tr("Afficher les FPS"), {}, Config::GFX_SHOW_FPS));
     c.items.push_back(Toggle(Tr("Afficher la vitesse"), {}, Config::GFX_SHOW_SPEED));
     c.items.push_back(Toggle(Tr("Afficher la résolution interne"), {},
                              Config::GFX_SHOW_INTERNAL_RESOLUTION));
@@ -428,6 +452,7 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
   // ---- Enhancements
   {
     BigPictureSettingCategory c{Tr("Améliorations"), {}};
+    c.items.push_back(CrtFilter());
     c.items.push_back(Choice<int>(Tr("Résolution interne"),
                                   Tr("Plus c'est haut, plus l'image est nette et plus la carte "
                                     "graphique travaille."),
@@ -996,7 +1021,7 @@ bool ApplyStandardGamepadProfile(int port, const std::string& forced_device)
     return false;
   const auto is_gamepad = [](const std::string& d) {
     return d.rfind("SDL/", 0) == 0 || d.rfind("XInput/", 0) == 0 ||
-           d.rfind("WGInput/", 0) == 0 || d.rfind("evdev/", 0) == 0;
+           d.rfind("WGInput/", 0) == 0 || d.rfind("evdev/", 0) == 0 || d.rfind("Switch2/", 0) == 0;
   };
   std::string device = forced_device.empty() ? pad->GetDefaultDevice().ToString() : forced_device;
   if (forced_device.empty() &&

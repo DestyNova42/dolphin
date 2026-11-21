@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <variant>
 #include <numbers>
 
 #include <QDateTime>
@@ -27,6 +28,7 @@
 #include <QFontMetrics>
 #include <QImage>
 #include <QKeyEvent>
+#include <QLocale>
 #include <QPainter>
 #include <QPainterPath>
 #include <QRadialGradient>
@@ -44,6 +46,8 @@
 #include "Core/HW/EXI/EXI.h"
 #include "Core/HW/EXI/EXI_Device.h"
 #include "Core/HW/GCMemcard/GCMemcard.h"
+#include "Core/HW/GCMemcard/GCMemcardUtils.h"
+#include "Core/HW/Sram.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/GCPadEmu.h"
@@ -104,10 +108,10 @@ Palette PaletteFor(BigPicturePrefs::Theme theme)
     return {{38, 31, 96},     {52, 44, 122},    {44, 37, 108},    {66, 56, 146},
             {88, 77, 172},    {248, 246, 255},  {210, 204, 244},  {166, 158, 222},
             {160, 146, 255},  {222, 214, 255}};
-  case T::Spice:  // Spice Orange
-    return {{36, 16, 4},      {60, 28, 8},      {48, 22, 6},      {84, 40, 12},
-            {116, 56, 18},    {255, 247, 238},  {236, 200, 166},  {190, 148, 112},
-            {255, 138, 20},   {255, 194, 128}};
+  case T::Spice:  // Spice Orange, the colour of the console
+    return {{22, 11, 4},      {42, 23, 10},     {32, 17, 7},      {60, 33, 14},
+            {94, 55, 24},     {255, 246, 236},  {232, 200, 168},  {168, 132, 102},
+            {247, 134, 28},   {255, 177, 94}};
   case T::JetBlack:  // Jet Black
     return {{6, 6, 8},        {20, 20, 23},     {12, 12, 14},     {34, 34, 39},
             {52, 52, 60},     {242, 242, 246},  {172, 172, 182},  {122, 122, 134},
@@ -525,6 +529,8 @@ void BigPictureWindow::ApplyPreferences()
 void BigPictureWindow::Open()
 {
   unsetCursor();
+  m_resume_known.clear();
+  m_resume_shot_path.clear();
   static bool s_cleaned_up = false;
   if (!s_cleaned_up)
   {
@@ -747,6 +753,26 @@ void BigPictureWindow::ApplyTab()
     break;
   }
 
+  // Sorting (not the "Recent" tab, which is already by date)
+  const int sort = settings.value(QStringLiteral("bigpicture/sort"), 0).toInt();
+  if (m_tab != Tab::Recent && sort != 0)
+  {
+    static TimePlayed s_played;
+    s_played.Reload();
+    std::map<QString, qint64> key;
+    for (const Entry& e : m_entries)
+    {
+      key[e.path] = sort == 1 ?
+                        settings.value(LastPlayedKey(e.path), 0).toLongLong() :
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            s_played.GetTimePlayed(e.game->GetGameID()))
+                            .count();
+    }
+    std::stable_sort(m_entries.begin(), m_entries.end(), [&key](const Entry& a, const Entry& b) {
+      return key[a.path] > key[b.path];
+    });
+  }
+
   m_selected = 0;
   for (size_t i = 0; i < m_entries.size(); ++i)
   {
@@ -854,6 +880,8 @@ void BigPictureWindow::PollController()
     held |= Bit(int(Action::Favorite));
   if (pad.button & PAD_BUTTON_X)
     held |= Bit(int(Action::Options));
+  if (pad.button & PAD_TRIGGER_Z)
+    held |= Bit(int(Action::Sort));
 
   const qint64 now = m_clock.elapsed();
   for (int a = 0; a < int(Action::Count); ++a)
@@ -972,6 +1000,9 @@ void BigPictureWindow::keyPressEvent(QKeyEvent* event)
   case Qt::Key_F:
     once(Action::Favorite);
     break;
+  case Qt::Key_S:
+    once(Action::Sort);
+    break;
   default:
     QWidget::keyPressEvent(event);
   }
@@ -1044,6 +1075,30 @@ void BigPictureWindow::HandleAction(Action action)
       m_audio->Play(Sound::Erase);
     }
     break;
+  case Mode::ChooseDisc:
+  {
+    const int n = static_cast<int>(m_choose_entry.discs.size());
+    if (action == Action::Left || action == Action::Up)
+    {
+      m_choose_disc = std::max(0, m_choose_disc - 1);
+      m_audio->Play(Sound::Move);
+    }
+    else if (action == Action::Right || action == Action::Down)
+    {
+      m_choose_disc = std::min(n - 1, m_choose_disc + 1);
+      m_audio->Play(Sound::Move);
+    }
+    else if (action == Action::Accept)
+    {
+      Launch(m_choose_entry, m_choose_disc, false);
+    }
+    else if (action == Action::Back)
+    {
+      m_audio->Play(Sound::Cancel);
+      m_mode = Mode::Library;
+    }
+    break;
+  }
   case Mode::ConfirmDriver:
     if (action == Action::Accept && !m_driver_busy)
     {
@@ -1120,19 +1175,53 @@ void BigPictureWindow::HandleLibrary(Action action)
   switch (action)
   {
   case Action::Right:
-    if (list)
-      break;
-    SetSelected(m_selected + 1);
-    break;
   case Action::Left:
+  {
     if (list)
       break;
-    SetSelected(m_selected - 1);
+    const int dir = action == Action::Right ? 1 : -1;
+    if (m_hero_focus)
+    {
+      if (const Entry* sel = Selected())
+      {
+        const int n = static_cast<int>(HeroButtons(*sel).size());
+        const int next = std::clamp(m_hero_button + dir, 0, n - 1);
+        if (next != m_hero_button)
+        {
+          m_hero_button = next;
+          m_audio->Play(Sound::Move);
+        }
+      }
+      break;
+    }
+    SetSelected(m_selected + dir);
     break;
+  }
   case Action::Down:
+    if (!list)
+    {
+      // Back from the buttons to the covers
+      if (m_hero_focus)
+      {
+        m_hero_focus = false;
+        m_audio->Play(Sound::Move);
+      }
+      break;
+    }
     SetSelected(m_selected + 1);
     break;
   case Action::Up:
+    if (!list)
+    {
+      // Up: the game's buttons (Reprendre, Nouvelle partie, Réglages, Favori)
+      if (!m_hero_focus && Selected())
+      {
+        m_hero_focus = true;
+        m_hero_button = 0;
+        m_audio->Play(Sound::Move);
+      }
+      break;
+    }
     SetSelected(m_selected - 1);
     break;
   case Action::PageDown:
@@ -1143,30 +1232,34 @@ void BigPictureWindow::HandleLibrary(Action action)
     m_tab = static_cast<Tab>((static_cast<int>(m_tab) + 4 + dir) % 4);
     m_audio->Play(Sound::Page);
     m_settings_in_items = false;
+    m_hero_focus = false;
     ApplyTab();
     break;
   }
   case Action::Accept:
     if (const Entry* sel = Selected())
     {
-      m_audio->Play(Sound::Launch);
-      Settings::GetQSettings().setValue(LastPlayedKey(sel->path),
-                                        QDateTime::currentSecsSinceEpoch());
-      m_running_entry = *sel;
-      m_disc = 0;
-      setCursor(Qt::BlankCursor);
-      const QString path = sel->path;
-      m_audio->StopMusic();
-      BeginTransition(0);
-      m_mode = Mode::Launching;
-      m_fade_in = 1;
-      // Let the select sound play before the game takes over.
-      QTimer::singleShot(350, this, [this, path] { emit LaunchRequested(path); });
+      if (m_hero_focus)
+      {
+        const auto buttons = HeroButtons(*sel);
+        ActivateHero(buttons[std::clamp(m_hero_button, 0, int(buttons.size()) - 1)]);
+      }
+      else if (HasResume(*sel))
+      {
+        Launch(*sel, 0, true);
+      }
+      else
+      {
+        StartNewGame(*sel);
+      }
     }
     else
     {
       m_audio->Play(Sound::Error);
     }
+    break;
+  case Action::Sort:
+    CycleSort();
     break;
   case Action::Favorite:
     ToggleFavorite();
@@ -1546,6 +1639,7 @@ void BigPictureWindow::HandlePause(Action action)
       break;
     case PAUSE_QUIT:
       m_audio->Play(Sound::Back);
+      SaveResume();
       Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
       // Fade to black over the paused game, then stop: the menu comes back from black.
       m_mode = Mode::Closing;
@@ -1639,7 +1733,7 @@ void BigPictureWindow::Tick()
     m_fade_in = std::min<qreal>(1, m_fade_in + dt / 0.6);
   if (m_mode == Mode::Closing)
   {
-    m_close_t = std::min<qreal>(1, m_close_t + dt / 0.45);
+    m_close_t = std::min<qreal>(1, m_close_t + dt / 0.9);
     if (m_close_t >= 1 && !m_stop_sent)
     {
       m_stop_sent = true;
@@ -1872,21 +1966,37 @@ void BigPictureWindow::DrawHints(QPainter& painter,
 }
 
 qreal BigPictureWindow::DrawPillButton(QPainter& painter, qreal x, qreal y, const QString& icon,
-                                       const QString& label, bool primary, qreal alpha)
+                                       const QString& label, bool primary, qreal alpha,
+                                       qreal forced_width)
 {
   const qreal k = height() / 1080.0;
   const QFont font = Font(false, int((primary ? 24 : 22) * k), primary ? 600 : 500);
   const QFontMetricsF fm(font);
   const qreal icon_size = (primary ? 40 : 36) * k;
   const qreal h = 68 * k;
-  const qreal w = 16 * k + icon_size + 14 * k + fm.horizontalAdvance(label) + 32 * k;
+  const qreal w = forced_width > 0 ?
+                      forced_width :
+                      16 * k + icon_size + 14 * k + fm.horizontalAdvance(label) + 32 * k;
   const QRectF r(x, y, w, h);
   painter.save();
   painter.setOpacity(painter.opacity() * alpha);
   painter.setPen(Qt::NoPen);
-  painter.setBrush(primary ? TEXT : RAISED);
+  if (primary)
+  {
+    // soft glow under the main button
+    QColor glow = ACCENT;
+    for (int i = 3; i >= 1; --i)
+    {
+      glow.setAlphaF(0.07f);
+      painter.setBrush(glow);
+      painter.drawRoundedRect(r.adjusted(-i * 5 * k, -i * 4 * k + 6 * k, i * 5 * k, i * 6 * k),
+                              (16 + i * 5) * k, (16 + i * 5) * k);
+    }
+  }
+  painter.setBrush(primary ? ACCENT : RAISED);
   painter.drawRoundedRect(r, 16 * k, 16 * k);
-  DrawIcon(painter, icon, QRectF(x + 16 * k, y + (h - icon_size) / 2, icon_size, icon_size));
+  if (!icon.isEmpty())
+    DrawIcon(painter, icon, QRectF(x + 16 * k, y + (h - icon_size) / 2, icon_size, icon_size));
   painter.setFont(font);
   painter.setPen(primary ? BG : TEXT);
   painter.drawText(QRectF(x + 16 * k + icon_size + 14 * k, y, w, h), Qt::AlignVCenter, label);
@@ -2038,6 +2148,13 @@ void BigPictureWindow::DrawScene(QPainter& painter)
   {
     DrawBackground(painter);
     DrawPadTest(painter);
+    return;
+  }
+  if (m_mode == Mode::ChooseDisc)
+  {
+    DrawBackground(painter);
+    DrawTopBar(painter);
+    DrawChooseDisc(painter);
     return;
   }
   if (m_mode == Mode::ConfirmDriver)
@@ -2409,7 +2526,7 @@ void BigPictureWindow::DrawTopBar(QPainter& painter)
   s_hl_x += (target_x - s_hl_x) * 0.25;
   s_hl_w += (target_w - s_hl_w) * 0.25;
   const QRectF hl(s_hl_x, cy - pill_h / 2 + 6 * k, s_hl_w, pill_h - 12 * k);
-  painter.setBrush(TEXT);
+  painter.setBrush(ACCENT);
   painter.drawRoundedRect(hl, hl.height() / 2, hl.height() / 2);
 
   tx = pill_x + 6 * k;
@@ -2436,24 +2553,7 @@ void BigPictureWindow::DrawTopBar(QPainter& painter)
   const qreal clock_x = width() - 80 * k - clock_w;
   painter.drawText(QRectF(clock_x, cy - 30 * k, clock_w + 4, 60 * k), Qt::AlignVCenter, clock);
 
-  // Controller chip
-  const QString name = ControllerName();
-  const QString chip_label = name.isEmpty() ? tr("Manette non configurée") : name;
-  const QFont chip_font = Font(false, int(20 * k), 500);
-  const qreal chip_w =
-      44 * k + QFontMetricsF(chip_font).horizontalAdvance(chip_label) + 20 * k;
-  const QRectF chip(clock_x - 28 * k - chip_w, cy - 24 * k, chip_w, 48 * k);
-  painter.setPen(Qt::NoPen);
-  painter.setBrush(SURFACE);
-  painter.drawRoundedRect(chip, 24 * k, 24 * k);
-  QColor dot = name.isEmpty() ? WARN : OK_GREEN;
-  if (name.isEmpty())
-    dot.setAlphaF(static_cast<float>(0.55 + 0.45 * std::sin(m_time * 4)));
-  painter.setBrush(dot);
-  painter.drawEllipse(QPointF(chip.left() + 26 * k, cy), 6 * k, 6 * k);
-  painter.setFont(chip_font);
-  painter.setPen(TEXT);
-  painter.drawText(chip.adjusted(44 * k, 0, 0, 0), Qt::AlignVCenter, chip_label);
+  DrawControllerChips(painter, clock_x - 28 * k, cy);
 }
 
 void BigPictureWindow::DrawHero(QPainter& painter, const Entry& sel, qreal left, qreal top,
@@ -2511,11 +2611,71 @@ void BigPictureWindow::DrawHero(QPainter& painter, const Entry& sel, qreal left,
   y += 52 * k;
 
   qreal bx = left;
-  bx += DrawPillButton(painter, bx, y, QStringLiteral("A"), tr("Jouer"), true) + 16 * k;
-  bx += DrawPillButton(painter, bx, y, QStringLiteral("X"), tr("Réglages"), false) + 16 * k;
-  DrawPillButton(painter, bx, y, QStringLiteral("Y"),
-                 m_favorites.contains(sel.path) ? tr("Retirer des favoris") : tr("Favori"),
-                 false);
+  const auto buttons = HeroButtons(sel);
+  for (size_t i = 0; i < buttons.size(); ++i)
+  {
+    const int b = buttons[i];
+    qreal w = 0;
+    const qreal h = 68 * k;
+    if (b == HERO_RESUME)
+    {
+      // Main button with the picture of the saved moment
+      const QFont f1 = Font(false, int(22 * k), 600);
+      const QFont f2 = Font(false, int(14 * k), 500);
+      const QDateTime when = QFileInfo(ResumeStatePath(sel.game->GetGameID())).lastModified();
+      const QString sub = tr("Sauvegarde auto · %1").arg(QLocale().toString(when, QStringLiteral("d MMM, HH:mm")));
+      const qreal tw = std::max(QFontMetricsF(f1).horizontalAdvance(tr("Reprendre")),
+                                QFontMetricsF(f2).horizontalAdvance(sub));
+      w = 10 * k + 84 * k + 12 * k + 36 * k + 12 * k + tw + 26 * k;
+      const QRectF r(bx, y, w, h);
+      w = DrawPillButton(painter, bx, y, QString(), QString(), true, 1.0, w);
+      const QRectF thumb(bx + 10 * k, y + 10 * k, 84 * k, h - 20 * k);
+      painter.save();
+      QPainterPath clip;
+      clip.addRoundedRect(thumb, 10 * k, 10 * k);
+      painter.setClipPath(clip);
+      const QPixmap& shot = ResumeShot(sel);
+      if (!shot.isNull())
+        painter.drawPixmap(thumb, shot, QRectF(shot.rect()));
+      else
+        painter.fillRect(thumb, SURFACE);
+      painter.restore();
+      DrawIcon(painter, QStringLiteral("A"),
+               QRectF(thumb.right() + 12 * k, y + (h - 36 * k) / 2, 36 * k, 36 * k));
+      const qreal tx = thumb.right() + 12 * k + 36 * k + 12 * k;
+      painter.setPen(BG);
+      painter.setFont(f1);
+      painter.drawText(QRectF(tx, y + 8 * k, tw + 4, 30 * k), Qt::AlignVCenter, tr("Reprendre"));
+      painter.setFont(f2);
+      QColor sub_col = BG;
+      sub_col.setAlphaF(0.75f);
+      painter.setPen(sub_col);
+      painter.drawText(QRectF(tx, y + 36 * k, tw + 4, 22 * k), Qt::AlignVCenter, sub);
+      (void)r;
+    }
+    else
+    {
+      const bool primary = b == HERO_PLAY;
+      const QString icon = b == HERO_PLAY ? QStringLiteral("A") :
+                           b == HERO_NEW  ? QStringLiteral("Start-Pause") :
+                           b == HERO_SETTINGS ? QStringLiteral("X") :
+                                                QStringLiteral("Y");
+      const QString label = b == HERO_PLAY     ? tr("Jouer") :
+                            b == HERO_NEW      ? tr("Nouvelle partie") :
+                            b == HERO_SETTINGS ? tr("Réglages") :
+                            m_favorites.contains(sel.path) ? tr("Retirer des favoris") :
+                                                             tr("Favori");
+      w = DrawPillButton(painter, bx, y, icon, label, primary);
+    }
+    if (m_hero_focus && static_cast<int>(i) == m_hero_button)
+    {
+      painter.setPen(QPen(ACCENT_SOFT, 3 * k));
+      painter.setBrush(Qt::NoBrush);
+      painter.drawRoundedRect(QRectF(bx, y, w, h).adjusted(-6 * k, -6 * k, 6 * k, 6 * k), 21 * k,
+                              21 * k);
+    }
+    bx += w + 14 * k;
+  }
   painter.restore();
 }
 
@@ -2548,7 +2708,13 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
   if (!sel)
     return;
 
-  DrawHero(painter, *sel, left, 216 * k, 1150 * k);
+  const bool resume = HasResume(*sel);
+  DrawHero(painter, *sel, left, 216 * k, resume ? 1000 * k : 1150 * k);
+  if (resume)
+  {
+    const qreal cw = 690 * k, chh = 388 * k;
+    DrawResumeCard(painter, *sel, QRectF(width() - 80 * k - cw, 168 * k, cw, chh));
+  }
 
   // ---- Shelf
   const qreal label_y = 576 * k;
@@ -2564,6 +2730,34 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
   painter.setPen(TEXT_DIM);
   painter.drawText(QRectF(left + lw + 14 * k, label_y + 3 * k, 800 * k, 40 * k), Qt::AlignVCenter,
                    tr("%1 / %2").arg(m_selected + 1).arg(m_entries.size()));
+
+  // Sort order, on the right
+  if (m_tab != Tab::Recent)
+  {
+    const int sort = Settings::GetQSettings().value(QStringLiteral("bigpicture/sort"), 0).toInt();
+    const QString names[] = {tr("Nom"), tr("Dernière partie"), tr("Temps de jeu")};
+    const QString current = names[std::clamp(sort, 0, 2)];
+    const QFont bold = Font(false, int(18 * k), 600);
+    const qreal bw = QFontMetricsF(bold).horizontalAdvance(current) + 32 * k;
+    const qreal right = width() - 80 * k;
+    const QRectF chip(right - bw, label_y + 4 * k, bw, 34 * k);
+    painter.setPen(QPen(LINE, 1 * k));
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(chip, 14 * k, 14 * k);
+    painter.setFont(bold);
+    painter.setPen(TEXT);
+    painter.drawText(chip, Qt::AlignCenter, current);
+    const QFont normal = Font(false, int(18 * k), 500);
+    painter.setFont(normal);
+    painter.setPen(TEXT_SOFT);
+    const QString label = tr("Trier :");
+    const qreal lw2 = QFontMetricsF(normal).horizontalAdvance(label);
+    painter.drawText(QRectF(chip.left() - 12 * k - lw2, chip.top(), lw2 + 2, chip.height()),
+                     Qt::AlignVCenter, label);
+    DrawIcon(painter, QStringLiteral("Z"),
+             QRectF(chip.left() - 12 * k - lw2 - 46 * k, chip.center().y() - 17 * k, 36 * k,
+                    34 * k));
+  }
 
   const qreal cw = 220 * k, ch = 308 * k;
   const qreal extra_w = 30 * k, extra_h = 42 * k;
@@ -2645,9 +2839,13 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
 
   if (m_mode == Mode::Library)
   {
+    const bool resume = HasResume(*sel);
     DrawHints(painter, {{QStringLiteral("Control_Stick"), tr("Naviguer")}},
-              {{QStringLiteral("A"), tr("Jouer")},
+              {{QStringLiteral("A"), m_hero_focus ? tr("Valider") :
+                                     resume       ? tr("Reprendre") :
+                                                    tr("Jouer")},
                {QStringLiteral("Y"), tr("Favori")},
+               {QStringLiteral("Z"), tr("Trier")},
                {QStringLiteral("B"), tr("Quitter")},
                {QStringLiteral("Start-Pause"), tr("Menu")}});
   }
@@ -2803,8 +3001,9 @@ void BigPictureWindow::DrawList(QPainter& painter)
     DrawHints(painter,
               {{QStringLiteral("Control_Stick-U"), QString()},
                {QStringLiteral("Control_Stick-D"), tr("Naviguer")}},
-              {{QStringLiteral("A"), tr("Jouer")},
+              {{QStringLiteral("A"), HasResume(*sel) ? tr("Reprendre") : tr("Jouer")},
                {QStringLiteral("Y"), tr("Favori")},
+               {QStringLiteral("Z"), tr("Trier")},
                {QStringLiteral("B"), tr("Quitter")},
                {QStringLiteral("Start-Pause"), tr("Menu")}});
   }
@@ -3875,25 +4074,59 @@ void BigPictureWindow::LoadCard(int slot)
   view = CardView{};
   const auto exi_slot = slot == 0 ? ExpansionInterface::Slot::A : ExpansionInterface::Slot::B;
   const auto type = Config::Get(slot == 0 ? Config::MAIN_SLOT_A : Config::MAIN_SLOT_B);
-  if (type != ExpansionInterface::EXIDeviceType::MemoryCard)
+  if (type == ExpansionInterface::EXIDeviceType::MemoryCardFolder)
   {
-    view.error = type == ExpansionInterface::EXIDeviceType::MemoryCardFolder ?
-                     tr("Emplacement en mode dossier GCI") :
-                     tr("Pas de carte mémoire dans cet emplacement");
+    // GCI folder: one file per save. Build a card in memory to show them like the others.
+    const std::string folder =
+        Config::GetGCIFolderPath(exi_slot, Config::Get(Config::MAIN_FALLBACK_REGION));
+    view.folder = true;
+    view.path = QString::fromStdString(folder);
+    File::CreateFullPath(folder + DIR_SEP);
+    auto card = Memcard::GCMemcard::Create(std::string(), CardFlashId{},
+                                           Memcard::MBIT_SIZE_MEMORY_CARD_2043, false, 0, 0, 0);
+    if (!card)
+    {
+      view.error = tr("Dossier GCI illisible");
+      return;
+    }
+    view.card = std::make_unique<Memcard::GCMemcard>(std::move(*card));
+    for (const QFileInfo& fi : QDir(view.path).entryInfoList({QStringLiteral("*.gci")}, QDir::Files,
+                                                             QDir::Name))
+    {
+      const std::string file = fi.absoluteFilePath().toStdString();
+      auto read = Memcard::ReadSavefile(file);
+      auto* save = std::get_if<Memcard::Savefile>(&read);
+      if (!save || view.card->ImportFile(*save) != Memcard::GCMemcardImportFileRetVal::SUCCESS)
+        continue;
+      for (u8 f = 0; f < view.card->GetNumFiles(); ++f)
+      {
+        const u8 index = view.card->GetFileIndex(f);
+        const auto entry = view.card->GetDEntry(index);
+        if (entry && Memcard::HasSameIdentity(*entry, save->dir_entry))
+          view.files[index] = file;
+      }
+    }
+  }
+  else if (type != ExpansionInterface::EXIDeviceType::MemoryCard)
+  {
+    view.error = tr("Pas de carte mémoire dans cet emplacement");
     return;
   }
-  const std::string path =
-      Config::GetMemcardPath(exi_slot, Config::Get(Config::MAIN_FALLBACK_REGION));
-  view.path = QString::fromStdString(path);
-  auto opened = Memcard::GCMemcard::Open(path);
-  auto& card = opened.second;
-  if (!card || !card->IsValid())
+  else
   {
-    view.error = QFileInfo::exists(view.path) ? tr("Carte mémoire illisible") :
-                                                tr("Carte mémoire vide (pas encore créée)");
-    return;
+    const std::string path =
+        Config::GetMemcardPath(exi_slot, Config::Get(Config::MAIN_FALLBACK_REGION));
+    view.path = QString::fromStdString(path);
+    auto opened = Memcard::GCMemcard::Open(path);
+    auto& card = opened.second;
+    if (!card || !card->IsValid())
+    {
+      view.error = QFileInfo::exists(view.path) ? tr("Carte mémoire illisible") :
+                                                  tr("Carte mémoire vide (pas encore créée)");
+      return;
+    }
+    view.card = std::make_unique<Memcard::GCMemcard>(std::move(*card));
   }
-  view.card = std::make_unique<Memcard::GCMemcard>(std::move(*card));
   view.free_blocks = view.card->GetFreeBlocks();
   const u8 n = view.card->GetNumFiles();
   for (u8 f = 0; f < n; ++f)
@@ -3963,8 +4196,7 @@ void BigPictureWindow::HandleMemcard(Action action)
       {
         if (m_mc_action == 0)
         {
-          (void)card.card->RemoveFile(save.index);
-          (void)card.card->Save();
+          RemoveSave(card, save.index);
           m_audio->Play(Sound::Erase);
           Toast(tr("Sauvegarde effacée"));
           LoadCard(m_mc_card);
@@ -3987,9 +4219,8 @@ void BigPictureWindow::HandleMemcard(Action action)
           m_mc_actions_open = false;
           break;
         }
-        const auto file = card.card->ExportFile(save.index);
-        const auto result = file ? other.card->ImportFile(*file) :
-                                   Memcard::GCMemcardImportFileRetVal::NOMEMCARD;
+        const auto result =
+            static_cast<Memcard::GCMemcardImportFileRetVal>(ImportSave(other, save.index, card));
         if (result != Memcard::GCMemcardImportFileRetVal::SUCCESS)
         {
           m_audio->Play(Sound::Error);
@@ -3999,11 +4230,9 @@ void BigPictureWindow::HandleMemcard(Action action)
           m_mc_actions_open = false;
           break;
         }
-        (void)other.card->Save();
         if (m_mc_action == 1)
         {
-          (void)card.card->RemoveFile(save.index);
-          (void)card.card->Save();
+          RemoveSave(card, save.index);
           m_audio->Play(Sound::LoadState);  // "Memory Card Move"
           Toast(tr("Sauvegarde déplacée"));
         }
@@ -4293,7 +4522,7 @@ int SourcePriority(const std::string& d)
 bool IsPressInput(const std::string& name)
 {
   for (const char* prefix : {"Button", "Pad ", "Shoulder", "Start", "Back", "Guide", "Thumb",
-                             "Trigger", "Home", "Select", "Plus", "Minus", "Misc"})
+                             "Trigger", "Home", "Select", "Plus", "Minus", "Misc", "Paddle"})
   {
     if (name.rfind(prefix, 0) == 0)
       return true;
@@ -4931,4 +5160,453 @@ void BigPictureWindow::InstallDrivers()
       Toast(tr("Pilote non installé"));
     }
   });
+}
+
+// ================================================================== launch, resume, sorting
+
+std::vector<int> BigPictureWindow::HeroButtons(const Entry& entry) const
+{
+  if (HasResume(entry))
+    return {HERO_RESUME, HERO_NEW, HERO_SETTINGS, HERO_FAVORITE};
+  return {HERO_PLAY, HERO_SETTINGS, HERO_FAVORITE};
+}
+
+void BigPictureWindow::ActivateHero(int button)
+{
+  const Entry* sel = Selected();
+  if (!sel)
+    return;
+  switch (button)
+  {
+  case HERO_RESUME:
+    Launch(*sel, 0, true);
+    break;
+  case HERO_PLAY:
+  case HERO_NEW:
+    StartNewGame(*sel);
+    break;
+  case HERO_SETTINGS:
+    m_audio->Play(Sound::Confirm);
+    OpenGameSettings();
+    break;
+  case HERO_FAVORITE:
+    ToggleFavorite();
+    break;
+  default:
+    break;
+  }
+}
+
+void BigPictureWindow::StartNewGame(const Entry& entry)
+{
+  if (entry.discs.size() > 1)
+  {
+    // Several discs: which one?
+    m_audio->Play(Sound::MenuOpen);
+    m_choose_entry = entry;
+    m_choose_disc = 0;
+    m_overlay_t = 0;
+    m_mode = Mode::ChooseDisc;
+    return;
+  }
+  Launch(entry, 0, false);
+}
+
+void BigPictureWindow::Launch(const Entry& entry, int disc, bool resume)
+{
+  const std::string id = entry.game->GetGameID();
+  if (resume)
+  {
+    disc = Settings::GetQSettings()
+               .value(QStringLiteral("bigpicture/resume_disc/") + QString::fromStdString(id), 0)
+               .toInt();
+  }
+  disc = std::clamp(disc, 0, std::max(0, static_cast<int>(entry.discs.size()) - 1));
+  const QString path = entry.discs.isEmpty() ? entry.path : entry.discs[disc];
+  const QString state = resume ? ResumeStatePath(id) : QString();
+
+  m_audio->Play(Sound::Launch);
+  Settings::GetQSettings().setValue(LastPlayedKey(entry.path), QDateTime::currentSecsSinceEpoch());
+  m_running_entry = entry;
+  m_disc = disc;
+  m_hero_focus = false;
+  setCursor(Qt::BlankCursor);
+  m_audio->StopMusic();
+  BeginTransition(0);
+  m_mode = Mode::Launching;
+  m_fade_in = 1;
+  // Let the select sound play before the game takes over.
+  QTimer::singleShot(350, this, [this, path, state] { emit LaunchRequested(path, state); });
+}
+
+QString BigPictureWindow::ResumeStatePath(const std::string& game_id) const
+{
+  return QString::fromStdString(File::GetUserPath(D_STATESAVES_IDX) + game_id) +
+         QStringLiteral(".manette-reprise.sav");
+}
+
+QString BigPictureWindow::ResumeShotPath(const std::string& game_id) const
+{
+  return QString::fromStdString(File::GetUserPath(D_STATESAVES_IDX) + game_id) +
+         QStringLiteral(".manette-reprise.png");
+}
+
+bool BigPictureWindow::HasResume(const Entry& entry) const
+{
+  if (!entry.game)
+    return false;
+  const QString id = QString::fromStdString(entry.game->GetGameID());
+  if (id.isEmpty())
+    return false;
+  auto it = m_resume_known.find(id);
+  if (it == m_resume_known.end())
+    it = m_resume_known.insert(id, QFileInfo::exists(ResumeStatePath(id.toStdString())));
+  return it.value();
+}
+
+const QPixmap& BigPictureWindow::ResumeShot(const Entry& entry)
+{
+  const QString path = ResumeShotPath(entry.game->GetGameID());
+  if (path != m_resume_shot_path)
+  {
+    m_resume_shot_path = path;
+    m_resume_shot = QPixmap(path);
+  }
+  return m_resume_shot;
+}
+
+void BigPictureWindow::SaveResume()
+{
+  const std::string id = SConfig::GetInstance().GetGameID();
+  if (id.empty())
+    return;
+  auto& system = Core::System::GetInstance();
+  // The game is paused: the state is taken now and written in the background.
+  State::SaveAs(system, ResumeStatePath(id).toStdString());
+  const QString shot = ResumeShotPath(id);
+  QFile::remove(shot);
+  QFile::copy(PauseShotPath(), shot);
+  Settings::GetQSettings().setValue(
+      QStringLiteral("bigpicture/resume_disc/") + QString::fromStdString(id), m_disc);
+  m_resume_known.clear();
+  m_resume_shot_path.clear();
+}
+
+void BigPictureWindow::CycleSort()
+{
+  if (m_tab == Tab::Recent || m_tab == Tab::Settings)
+  {
+    m_audio->Play(Sound::Error);
+    return;
+  }
+  auto& settings = Settings::GetQSettings();
+  const int sort = (settings.value(QStringLiteral("bigpicture/sort"), 0).toInt() + 1) % 3;
+  settings.setValue(QStringLiteral("bigpicture/sort"), sort);
+  m_audio->Play(Sound::Toggle);
+  BeginTransition(0);
+  ApplyTab();
+}
+
+void BigPictureWindow::DrawResumeCard(QPainter& painter, const Entry& sel, const QRectF& r)
+{
+  const qreal k = height() / 1080.0;
+  const qreal e = EaseOut(m_hero_t);
+  painter.save();
+  painter.setOpacity(e);
+  QPainterPath clip;
+  clip.addRoundedRect(r, 26 * k, 26 * k);
+
+  // shadow
+  painter.setPen(Qt::NoPen);
+  for (int i = 1; i <= 4; ++i)
+  {
+    painter.setBrush(QColor(0, 0, 0, 22));
+    painter.drawRoundedRect(r.adjusted(-i * 4 * k, -i * 2 * k + 10 * k, i * 4 * k, i * 6 * k),
+                            (26 + i * 4) * k, (26 + i * 4) * k);
+  }
+
+  painter.setClipPath(clip);
+  const QPixmap& shot = ResumeShot(sel);
+  if (!shot.isNull())
+  {
+    // fill the card, keep the picture's proportions
+    const QSizeF s = QSizeF(shot.size()).scaled(r.size(), Qt::KeepAspectRatioByExpanding);
+    painter.drawPixmap(QRectF(r.center().x() - s.width() / 2, r.center().y() - s.height() / 2,
+                              s.width(), s.height()),
+                       shot, QRectF(shot.rect()));
+  }
+  else
+  {
+    painter.fillRect(r, SURFACE);
+  }
+  const std::string shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
+  const bool crt = shader.find("crt") != std::string::npos;
+  if (crt)
+  {
+    // hint of the CRT filter on the picture
+    painter.setPen(QPen(QColor(0, 0, 0, 46), 1.4 * k));
+    for (qreal yy = r.top(); yy < r.bottom(); yy += 3.5 * k)
+      painter.drawLine(QPointF(r.left(), yy), QPointF(r.right(), yy));
+  }
+  QLinearGradient shade(r.left(), r.bottom() - 180 * k, r.left(), r.bottom());
+  shade.setColorAt(0, QColor(0, 0, 0, 0));
+  shade.setColorAt(1, QColor(8, 4, 2, 235));
+  painter.fillRect(r, shade);
+  painter.setClipping(false);
+  painter.setPen(QPen(LINE, 1.5 * k));
+  painter.setBrush(Qt::NoBrush);
+  painter.drawPath(clip);
+
+  const auto tag = [&](const QString& text, bool left, QColor color) {
+    const QFont f = Font(false, int(14 * k), 700);
+    QFont spaced = f;
+    spaced.setLetterSpacing(QFont::AbsoluteSpacing, 1 * k);
+    const qreal tw = QFontMetricsF(spaced).horizontalAdvance(text) + 28 * k;
+    const QRectF t(left ? r.left() + 20 * k : r.right() - 20 * k - tw, r.top() + 20 * k, tw,
+                   34 * k);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(10, 5, 2, 190));
+    painter.drawRoundedRect(t, 11 * k, 11 * k);
+    painter.setFont(spaced);
+    painter.setPen(color);
+    painter.drawText(t, Qt::AlignCenter, text);
+  };
+  tag(tr("●  REPRISE AUTOMATIQUE"), true, QColor(255, 246, 236));
+  if (crt)
+  {
+    QString name = QString::fromStdString(shader);
+    name.remove(QStringLiteral("crt_manette_"));
+    tag(tr("FILTRE CRT · %1").arg(name.toUpper()), false, ACCENT_SOFT);
+  }
+
+  painter.setFont(Font(true, int(28 * k), 700));
+  painter.setPen(QColor(255, 246, 236));
+  painter.drawText(QRectF(r.left() + 28 * k, r.bottom() - 92 * k, r.width() - 56 * k, 40 * k),
+                   Qt::AlignVCenter, tr("Reprends là où tu t'étais arrêté"));
+  const QDateTime when = QFileInfo(ResumeStatePath(sel.game->GetGameID())).lastModified();
+  const qint64 days = when.date().daysTo(QDate::currentDate());
+  const QString day = days == 0 ? tr("Aujourd'hui") :
+                      days == 1 ? tr("Hier") :
+                                  QLocale().toString(when.date(), QStringLiteral("d MMMM"));
+  painter.setFont(Font(false, int(17 * k), 500));
+  painter.setPen(QColor(232, 200, 168));
+  painter.drawText(QRectF(r.left() + 28 * k, r.bottom() - 52 * k, r.width() - 56 * k, 28 * k),
+                   Qt::AlignVCenter,
+                   tr("%1 à %2 · Sauvegarde automatique").arg(day, when.toString(QStringLiteral("HH:mm"))));
+  painter.restore();
+}
+
+void BigPictureWindow::DrawChooseDisc(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  const qreal e = EaseOut(m_overlay_t);
+  QColor shade(0, 0, 0);
+  shade.setAlphaF(static_cast<float>(0.6 * e));
+  painter.fillRect(rect(), shade);
+
+  painter.setOpacity(e);
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(0, 280 * k, width(), 30 * k), Qt::AlignCenter, tr("QUEL DISQUE ?"));
+  painter.setFont(Font(true, int(46 * k), 700));
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, 316 * k, width(), 70 * k), Qt::AlignCenter, m_choose_entry.title);
+
+  const int n = static_cast<int>(m_choose_entry.discs.size());
+  const qreal cw = 300 * k, ch = 340 * k, gap = 40 * k;
+  const qreal x0 = (width() - (n * cw + (n - 1) * gap)) / 2;
+  for (int i = 0; i < n; ++i)
+  {
+    const QRectF c(x0 + i * (cw + gap), 430 * k, cw, ch);
+    const bool on = i == m_choose_disc;
+    painter.setPen(on ? QPen(ACCENT, 4 * k) : QPen(LINE, 2 * k));
+    painter.setBrush(on ? RAISED : SURFACE);
+    painter.drawRoundedRect(c, 28 * k, 28 * k);
+    // a mini disc
+    const QPointF dc(c.center().x(), c.top() + 140 * k);
+    QRadialGradient g(dc, 95 * k);
+    g.setColorAt(0, QColor(250, 250, 255));
+    g.setColorAt(0.6, QColor(200, 205, 220));
+    g.setColorAt(1, on ? ACCENT_SOFT : QColor(150, 150, 170));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(g);
+    painter.drawEllipse(dc, 95 * k, 95 * k);
+    painter.setBrush(on ? RAISED : SURFACE);
+    painter.drawEllipse(dc, 16 * k, 16 * k);
+    painter.setFont(Font(true, int(30 * k), 700));
+    painter.setPen(on ? TEXT : TEXT_SOFT);
+    painter.drawText(QRectF(c.left(), c.bottom() - 90 * k, cw, 50 * k), Qt::AlignCenter,
+                     tr("Disque %1").arg(i + 1));
+  }
+  painter.setOpacity(1);
+  DrawHints(painter, {{QStringLiteral("Control_Stick"), tr("Choisir")}},
+            {{QStringLiteral("A"), tr("Lancer")}, {QStringLiteral("B"), tr("Retour")}});
+}
+
+void BigPictureWindow::DrawControllerChips(QPainter& painter, qreal right, qreal cy)
+{
+  const qreal k = height() / 1080.0;
+  struct Chip
+  {
+    QString player, name;
+    bool wireless = false;
+    qreal battery = -1;  // percent, -1 = unknown
+    bool missing = false;
+  };
+  std::vector<Chip> chips;
+  for (int port = 0; port < 4; ++port)
+  {
+    if (port > 0 && Config::Get(Config::GetInfoForSIDevice(port)) == SerialInterface::SIDEVICE_NONE)
+      continue;
+    auto* pad = PadController(port);
+    if (!pad)
+      continue;
+    Chip c;
+    c.player = QStringLiteral("J%1").arg(port + 1);
+    const auto& dq = pad->GetDefaultDevice();
+    const auto device = g_controller_interface.FindDevice(dq);
+    if (!device)
+    {
+      if (port > 0)
+        continue;
+      c.missing = true;
+      c.name = tr("Manette non configurée");
+      chips.push_back(c);
+      continue;
+    }
+    const QString n = QString::fromStdString(dq.name);
+    if (n.contains(QStringLiteral("GameCube"), Qt::CaseInsensitive))
+      c.name = tr("GameCube");
+    else if (n.contains(QStringLiteral("Pro Controller"), Qt::CaseInsensitive))
+      c.name = dq.source == "Switch2" ? tr("Pro 2") : tr("Pro");
+    else if (n.contains(QStringLiteral("Joy-Con"), Qt::CaseInsensitive))
+      c.name = n;
+    else if (n.contains(QStringLiteral("Xbox"), Qt::CaseInsensitive) || dq.source == "XInput")
+      c.name = tr("Xbox");
+    else if (n.contains(QStringLiteral("DualSense"), Qt::CaseInsensitive) ||
+             n.contains(QStringLiteral("PS5"), Qt::CaseInsensitive))
+      c.name = tr("DualSense");
+    else if (n.contains(QStringLiteral("Keyboard"), Qt::CaseInsensitive))
+      c.name = tr("Clavier");
+    else
+      c.name = n.size() > 18 ? n.left(16) + QStringLiteral("…") : n;
+    c.wireless = dq.source == "Switch2";
+    if (const auto* battery = device->FindInput("Battery"))
+    {
+      const ControlState level = battery->GetState();
+      if (level > 0 && (c.wireless || level < 99.5))
+        c.battery = level;
+    }
+    chips.push_back(c);
+  }
+
+  qreal x = right;
+  for (auto it = chips.rbegin(); it != chips.rend(); ++it)
+  {
+    const Chip& c = *it;
+    const QFont bold = Font(false, int(18 * k), 700);
+    const QFont normal = Font(false, int(18 * k), 500);
+    const qreal pw = c.missing ? 0 : QFontMetricsF(bold).horizontalAdvance(c.player) + 10 * k;
+    const qreal nw = QFontMetricsF(normal).horizontalAdvance(c.name);
+    const qreal extra = (c.wireless ? 20 * k : 0) + (c.battery >= 0 ? 44 * k : 0);
+    const qreal w = 22 * k + (c.missing ? 22 * k : 0) + pw + nw + extra + 22 * k;
+    const QRectF r(x - w, cy - 24 * k, w, 48 * k);
+    painter.setPen(QPen(LINE, 1 * k));
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(r, 24 * k, 24 * k);
+    qreal tx = r.left() + 22 * k;
+    if (c.missing)
+    {
+      QColor dot = WARN;
+      dot.setAlphaF(static_cast<float>(0.55 + 0.45 * std::sin(m_time * 4)));
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(dot);
+      painter.drawEllipse(QPointF(tx + 4 * k, cy), 6 * k, 6 * k);
+      tx += 22 * k;
+    }
+    else
+    {
+      painter.setFont(bold);
+      painter.setPen(TEXT);
+      painter.drawText(QRectF(tx, r.top(), pw, r.height()), Qt::AlignVCenter, c.player);
+      tx += pw;
+    }
+    painter.setFont(normal);
+    painter.setPen(TEXT_SOFT);
+    painter.drawText(QRectF(tx, r.top(), nw + 2, r.height()), Qt::AlignVCenter, c.name);
+    tx += nw + 8 * k;
+    if (c.wireless)
+    {
+      // Bluetooth rune
+      QPainterPath bt;
+      const qreal bx = tx + 4 * k, top = cy - 9 * k, bot = cy + 9 * k;
+      bt.moveTo(bx - 5 * k, cy - 4.5 * k);
+      bt.lineTo(bx + 5 * k, cy + 4.5 * k);
+      bt.lineTo(bx, bot);
+      bt.lineTo(bx, top);
+      bt.lineTo(bx + 5 * k, cy - 4.5 * k);
+      bt.lineTo(bx - 5 * k, cy + 4.5 * k);
+      painter.setPen(QPen(TEXT_SOFT, 1.6 * k));
+      painter.setBrush(Qt::NoBrush);
+      painter.drawPath(bt);
+      tx += 20 * k;
+    }
+    if (c.battery >= 0)
+    {
+      const QRectF body(tx + 4 * k, cy - 7.5 * k, 28 * k, 15 * k);
+      painter.setPen(QPen(TEXT_SOFT, 1.8 * k));
+      painter.setBrush(Qt::NoBrush);
+      painter.drawRoundedRect(body, 3.5 * k, 3.5 * k);
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(TEXT_SOFT);
+      painter.drawRect(QRectF(body.right() + 1 * k, cy - 3 * k, 2.5 * k, 6 * k));
+      const qreal level = std::clamp<qreal>(c.battery / 100.0, 0.08, 1.0);
+      painter.setBrush(c.battery <= 25 ? WARN : OK_GREEN);
+      painter.drawRoundedRect(QRectF(body.left() + 2.5 * k, body.top() + 2.5 * k,
+                                     (body.width() - 5 * k) * level, body.height() - 5 * k),
+                              1.5 * k, 1.5 * k);
+    }
+    x = r.left() - 12 * k;
+  }
+}
+
+// ================================================================== memory card writes
+
+void BigPictureWindow::RemoveSave(CardView& card, u8 index)
+{
+  if (card.folder)
+  {
+    if (const auto it = card.files.find(index); it != card.files.end())
+      File::Delete(it->second);
+    return;
+  }
+  (void)card.card->RemoveFile(index);
+  (void)card.card->Save();
+}
+
+int BigPictureWindow::ImportSave(CardView& card, u8 src_index, CardView& from)
+{
+  using Ret = Memcard::GCMemcardImportFileRetVal;
+  const auto file = from.card->ExportFile(src_index);
+  if (!file || !card.card)
+    return static_cast<int>(Ret::NOMEMCARD);
+  // Same checks as a real card (space, duplicate) on the in-memory copy
+  const Ret ret = card.card->ImportFile(*file);
+  if (ret != Ret::SUCCESS)
+    return static_cast<int>(ret);
+  if (card.folder)
+  {
+    const std::string path = card.path.toStdString() + DIR_SEP +
+                             Memcard::GenerateFilename(file->dir_entry) +
+                             Memcard::GetDefaultExtension(Memcard::SavefileFormat::GCI);
+    if (!Memcard::WriteSavefile(path, *file, Memcard::SavefileFormat::GCI))
+      return static_cast<int>(Ret::NOMEMCARD);
+  }
+  else
+  {
+    (void)card.card->Save();
+  }
+  return static_cast<int>(ret);
 }

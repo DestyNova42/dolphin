@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -75,7 +76,7 @@ public:
   void OnEmulationStateChanged(Core::State state);
 
 signals:
-  void LaunchRequested(const QString& path);
+  void LaunchRequested(const QString& path, const QString& savestate);
   void ClassicRequested();
   void QuitRequested();
   void StopRequested();    // "Quitter le jeu" in the pause menu
@@ -99,6 +100,7 @@ private:
     PageDown,
     Favorite,  // Y
     Options,   // X
+    Sort,      // Z
     Count,
   };
 
@@ -122,6 +124,7 @@ private:
     Closing,       // fading to black before stopping the game
     ConfirmUpdate, // an update is available
     ConfirmDriver, // USB driver of Switch 2 controllers
+    ChooseDisc,    // multi-disc game: which disc to start
   };
 
   struct SaveIcon
@@ -142,7 +145,12 @@ private:
     std::unique_ptr<Memcard::GCMemcard> card;
     std::vector<SaveIcon> saves;
     u16 free_blocks = 0;
+    // GCI folder mode: the card is built in memory from the .gci files
+    bool folder = false;
+    std::map<u8, std::string> files;  // save index -> .gci file
   };
+  void RemoveSave(CardView& card, u8 index);
+  int ImportSave(CardView& card, u8 src_index, CardView& from);  // GCMemcardImportFileRetVal
 
   enum class Tab
   {
@@ -225,6 +233,29 @@ private:
   // ---- updates
   void CheckUpdates(bool silent);
 
+  // ---- launching, resume, sorting
+  enum HeroButton
+  {
+    HERO_PLAY,
+    HERO_RESUME,
+    HERO_NEW,
+    HERO_SETTINGS,
+    HERO_FAVORITE,
+  };
+  std::vector<int> HeroButtons(const Entry& entry) const;
+  void ActivateHero(int button);
+  void Launch(const Entry& entry, int disc, bool resume);
+  void StartNewGame(const Entry& entry);  // asks for the disc if needed
+  bool HasResume(const Entry& entry) const;
+  QString ResumeStatePath(const std::string& game_id) const;
+  QString ResumeShotPath(const std::string& game_id) const;
+  const QPixmap& ResumeShot(const Entry& entry);
+  void SaveResume();
+  void CycleSort();
+  void DrawResumeCard(QPainter& painter, const Entry& sel, const QRectF& rect);
+  void DrawChooseDisc(QPainter& painter);
+  void DrawControllerChips(QPainter& painter, qreal right, qreal cy);
+
   // ---- USB driver (instead of Zadig)
   void CheckDrivers();
   void InstallDrivers();
@@ -251,7 +282,7 @@ private:
   void DrawHints(QPainter& painter, const std::vector<std::pair<QString, QString>>& left,
                  const std::vector<std::pair<QString, QString>>& right);
   qreal DrawPillButton(QPainter& painter, qreal x, qreal y, const QString& icon,
-                       const QString& label, bool primary, qreal alpha = 1.0);
+                       const QString& label, bool primary, qreal alpha = 1.0, qreal forced_width = 0);
   void DrawScene(QPainter& painter);
   void DrawBackground(QPainter& painter);
   void DrawIntro(QPainter& painter);
@@ -413,6 +444,15 @@ private:
   QString m_update_url;
   QString m_update_version;
   bool m_update_busy = false;
+
+  // hero buttons / resume / discs
+  bool m_hero_focus = false;
+  mutable QHash<QString, bool> m_resume_known;
+  int m_hero_button = 0;
+  QString m_resume_shot_path;
+  QPixmap m_resume_shot;
+  int m_choose_disc = 0;
+  Entry m_choose_entry;
 
   // USB driver
   QStringList m_driver_asked;

@@ -410,7 +410,7 @@ void MainWindow::ShowBigPicture()
   }
 }
 
-void MainWindow::LaunchFromBigPicture(const QString& path)
+void MainWindow::LaunchFromBigPicture(const QString& path, const QString& savestate)
 {
   if (!Core::IsUninitialized(m_system))
     return;
@@ -421,7 +421,28 @@ void MainWindow::LaunchFromBigPicture(const QString& path)
   Config::SetCurrent(Config::MAIN_SHOW_CURSOR, Config::ShowCursor::Never);
   emit Settings::Instance().CursorVisibilityChanged();
   m_bp_stage->setCursor(Qt::BlankCursor);
-  StartGame(path, ScanForSecondDisc::Yes);
+
+  // Real GameCube boot animation, when the console's BIOS is there (not when resuming).
+  bool use_ipl = false;
+  if (savestate.isEmpty() &&
+      Settings::GetQSettings().value(QStringLiteral("bigpicture/real_boot"), false).toBool())
+  {
+    const auto game = m_game_list->FindGame(path.toStdString());
+    if (game && game->GetPlatform() == DiscIO::Platform::GameCubeDisc)
+    {
+      use_ipl = File::Exists(
+          Config::GetBootROMPath(Config::GetDirectoryForRegion(game->GetRegion())));
+    }
+  }
+  Config::SetCurrent(Config::MAIN_SKIP_IPL, !use_ipl);
+
+  std::unique_ptr<BootSessionData> session;
+  if (!savestate.isEmpty())
+  {
+    session = std::make_unique<BootSessionData>(savestate.toStdString(),
+                                                DeleteSavestateAfterBoot::No);
+  }
+  StartGame(path, ScanForSecondDisc::Yes, std::move(session));
   m_fullscreen_requested = false;
 }
 

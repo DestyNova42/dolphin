@@ -173,7 +173,7 @@ private:
   void ShowAudioWindow();
   void ShowControllersWindow();
   void ShowBigPicture();
-  void LaunchFromBigPicture(const QString& path);
+  void LaunchFromBigPicture(const QString& path, const QString& savestate);
   void ShowGraphicsWindow();
   void ShowFreeLookWindow();
   void ShowAboutDialog();
