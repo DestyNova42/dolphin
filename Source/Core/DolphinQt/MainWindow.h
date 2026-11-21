@@ -246,6 +246,8 @@ private:
   SearchBar* m_search_bar;
   GameList* m_game_list;
   BigPictureWindow* m_big_picture = nullptr;
+  QWidget* m_bp_stage = nullptr;  // black fullscreen window hosting the game in controller mode
+  bool m_rendering_to_stage = false;
   GameCount* m_game_count;
   RenderWidget* m_render_widget = nullptr;
   bool m_rendering_to_main;

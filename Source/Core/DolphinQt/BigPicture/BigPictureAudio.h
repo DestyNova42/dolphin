@@ -36,6 +36,7 @@ public:
     Error,
     SaveState,
     LoadState,
+    Erase,
     Count,
   };
 

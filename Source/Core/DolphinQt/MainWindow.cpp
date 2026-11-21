@@ -241,6 +241,20 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
 
   // Controller mode ("Mode manette"): shown instead of the classic window at startup.
   m_big_picture = new BigPictureWindow(m_game_list->GetGameListModel());
+  // The game is shown inside a black fullscreen "stage" that stays open between the menu and the
+  // game, so there is never a window closing / opening in between (seamless).
+  m_bp_stage = new QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint);
+  m_bp_stage->setWindowTitle(QStringLiteral("Dolphin"));
+  m_bp_stage->setAutoFillBackground(true);
+  {
+    QPalette pal = m_bp_stage->palette();
+    pal.setColor(QPalette::Window, Qt::black);
+    m_bp_stage->setPalette(pal);
+    auto* stage_layout = new QVBoxLayout(m_bp_stage);
+    stage_layout->setContentsMargins(0, 0, 0, 0);
+    stage_layout->setSpacing(0);
+  }
+  m_bp_stage->setCursor(Qt::BlankCursor);
   connect(m_big_picture, &BigPictureWindow::LaunchRequested, this,
           &MainWindow::LaunchFromBigPicture);
   connect(m_big_picture, &BigPictureWindow::ClassicRequested, this, [this] {
@@ -256,7 +270,14 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
   });
   connect(m_big_picture, &BigPictureWindow::StopRequested, this, [this] { RequestStop(); });
   connect(m_big_picture, &BigPictureWindow::ResumeRequested, this, [this] {
-    if (m_render_widget)
+    if (m_rendering_to_stage)
+    {
+      m_bp_stage->raise();
+      m_bp_stage->activateWindow();
+      m_render_widget->setFocus();
+      Host::GetInstance()->SetRenderFocus(true);
+    }
+    else if (m_render_widget)
     {
       m_render_widget->raise();
       m_render_widget->activateWindow();
@@ -392,16 +413,17 @@ void MainWindow::LaunchFromBigPicture(const QString& path)
 {
   if (!Core::IsUninitialized(m_system))
     return;
-  // Games started from the controller mode always run fullscreen, without exclusive mode so the
-  // pause menu can be drawn over the game.
-  m_fullscreen_requested = true;
+  // Games started from the controller mode are shown in the fullscreen stage (see ShowRenderWidget):
+  // no exclusive fullscreen, so the pause menu can be drawn over the game.
   Config::SetCurrent(Config::GFX_BORDERLESS_FULLSCREEN, true);
   StartGame(path, ScanForSecondDisc::Yes);
+  m_fullscreen_requested = false;
 }
 
 MainWindow::~MainWindow()
 {
   delete m_big_picture;
+  delete m_bp_stage;
   // Shut down NetPlay first to avoid race condition segfault
   Settings::Instance().ResetNetPlayClient();
   Settings::Instance().ResetNetPlayServer();
@@ -1160,6 +1182,9 @@ void MainWindow::FrameAdvance()
 
 void MainWindow::FullScreen()
 {
+  if (m_rendering_to_stage)
+    return;  // the stage is already fullscreen
+
   // If the render widget is fullscreen we want to reset it to whatever is in
   // settings. If it's set to be fullscreen then it just remakes the window,
   // which probably isn't ideal.
@@ -1336,6 +1361,21 @@ void MainWindow::ShowRenderWidget()
   SetFullScreenResolution(false);
   Host::GetInstance()->SetRenderFullscreen(false);
 
+  if (m_big_picture && m_big_picture->IsActive())
+  {
+    // Controller mode: the game goes inside the black stage, under the controller-mode window
+    // which fades away once the game runs.
+    m_rendering_to_stage = true;
+    m_rendering_to_main = false;
+    m_bp_stage->layout()->addWidget(m_render_widget);
+    m_render_widget->show();
+    m_bp_stage->showFullScreen();
+    m_big_picture->raise();
+    m_big_picture->activateWindow();
+    Host::GetInstance()->SetRenderFocus(true);
+    return;
+  }
+
   if (Config::Get(Config::MAIN_RENDER_TO_MAIN))
   {
     // If we're rendering to main, add it to the stack and update our title when necessary.
@@ -1360,6 +1400,15 @@ void MainWindow::ShowRenderWidget()
 
 void MainWindow::HideRenderWidget(bool reinit, bool is_exit)
 {
+  if (m_rendering_to_stage)
+  {
+    m_bp_stage->layout()->removeWidget(m_render_widget);
+    m_render_widget->setParent(nullptr);
+    m_render_widget->hide();
+    m_rendering_to_stage = false;
+    // Keep the black stage a moment, until the controller mode is back on top.
+    QTimer::singleShot(700, m_bp_stage, [stage = m_bp_stage] { stage->hide(); });
+  }
   if (m_rendering_to_main)
   {
     // Remove the widget from the stack and reparent it to nullptr, so that it can draw

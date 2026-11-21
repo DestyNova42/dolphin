@@ -36,7 +36,7 @@ constexpr unsigned int OUTPUT_RATE = 48000;
 constexpr const char* SOUND_KEYS[] = {
     "startup",          // Startup
     "option move 1",    // Move
-    "menu turn side",   // Page
+    "option move 3",    // Page (tabs)
     "option confirm",   // Confirm
     "menu back",        // Back
     "option cancel",    // Cancel
@@ -46,6 +46,7 @@ constexpr const char* SOUND_KEYS[] = {
     "error",            // Error
     "memory card copy", // SaveState
     "memory card move", // LoadState
+    "memory card erase",// Erase
 };
 constexpr const char* MUSIC_KEY = "main menu";
 

@@ -13,6 +13,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QFile>
 #include <QFont>
 #include <QFontDatabase>
 #include <QFontMetrics>
@@ -26,8 +27,15 @@
 #include <QTimer>
 
 #include "Common/Config/Config.h"
+#include "Common/Config/Layer.h"
 #include "Common/FileUtil.h"
+#include "Core/Config/MainSettings.h"
+#include "Core/ConfigLoaders/GameConfigLoader.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
+#include "Core/HW/EXI/EXI.h"
+#include "Core/HW/EXI/EXI_Device.h"
+#include "Core/HW/GCMemcard/GCMemcard.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/GCPadEmu.h"
@@ -44,6 +52,7 @@
 #include "InputCommon/ControllerEmu/Control/Control.h"
 #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
 #include "InputCommon/ControllerEmu/ControllerEmu.h"
+#include "InputCommon/ControllerEmu/StickGate.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/ControllerInterface/CoreDevice.h"
 #include "InputCommon/ControllerInterface/DualShockUDPClient/DualShockUDPClient.h"
@@ -290,6 +299,14 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
     QTimer::singleShot(0, this, [this, port] { StartSetup(port); });
   };
   host.open_classic = [this] { QTimer::singleShot(0, this, [this] { emit ClassicRequested(); }); };
+  host.remap_control = [this](int port, int group, int index, int mirror, bool flip,
+                              const QString& prompt) {
+    QTimer::singleShot(0, this, [=, this] { StartRemap(port, group, index, mirror, flip, prompt); });
+  };
+  host.calibrate_stick = [this](int port, int group) {
+    QTimer::singleShot(0, this, [this, port, group] { StartCalibration(port, group); });
+  };
+  host.open_memory_cards = [this] { QTimer::singleShot(0, this, [this] { OpenMemcards(); }); };
   host.interface_changed = [this] { ApplyPreferences(); };
   m_settings = BuildBigPictureSettings(host);
 
@@ -416,7 +433,20 @@ void BigPictureWindow::OnEmulationStateChanged(Core::State state)
   switch (state)
   {
   case Core::State::Starting:
+    if (m_mode == Mode::Launching)
+      break;  // keep the loading screen until the first frames
+    [[fallthrough]];
   case Core::State::Running:
+    if (m_mode == Mode::Launching)
+    {
+      // Reveal the game smoothly: the menu fades away over the running game.
+      m_mode = Mode::FadingOut;
+      m_fade_out = 0;
+      m_home_was_down = true;
+      break;
+    }
+    if (m_mode == Mode::FadingOut)
+      break;
     if (m_mode == Mode::Pause)
     {
       // Resumed from elsewhere (hotkey, menu): close the pause menu.
@@ -435,14 +465,16 @@ void BigPictureWindow::OnEmulationStateChanged(Core::State state)
     break;
   case Core::State::Uninitialized:
     m_game_timer->stop();
-    if (m_mode == Mode::InGame || m_mode == Mode::Pause)
+    if (m_mode == Mode::InGame || m_mode == Mode::Pause || m_mode == Mode::Launching ||
+        m_mode == Mode::FadingOut)
     {
       m_pause_settings = false;
       QTimer::singleShot(0, this, [this] {
         if (m_active)
         {
+          setWindowOpacity(1.0);
           Open();
-          BeginTransition(0);
+          m_fade_in = 0;  // fade in from black: no flash of the desktop
         }
       });
     }
@@ -603,7 +635,8 @@ void BigPictureWindow::PollController()
 {
   if (!m_active || !isVisible() || !isActiveWindow())
     return;
-  if (m_mode == Mode::Setup || m_mode == Mode::InGame)
+  if (m_mode == Mode::Setup || m_mode == Mode::InGame || m_mode == Mode::Remap ||
+      m_mode == Mode::Launching || m_mode == Mode::FadingOut)
     return;
 
   const GCPadStatus pad = Pad::GetStatus(0);
@@ -691,6 +724,12 @@ void BigPictureWindow::keyPressEvent(QKeyEvent* event)
   {
     if (event->key() == Qt::Key_Escape && !event->isAutoRepeat())
       FinishSetup(false);
+    return;
+  }
+  if (m_mode == Mode::Remap)
+  {
+    if (event->key() == Qt::Key_Escape && !event->isAutoRepeat())
+      FinishRemap(false);
     return;
   }
   const bool repeat = event->isAutoRepeat();
@@ -785,6 +824,18 @@ void BigPictureWindow::HandleAction(Action action)
   case Mode::Menu:
     HandleMenu(action);
     break;
+  case Mode::GameSettings:
+    HandleSettings(action);
+    break;
+  case Mode::Memcard:
+    HandleMemcard(action);
+    break;
+  case Mode::Calibrate:
+    if (action == Action::Accept)
+      FinishCalibration(true);
+    else if (action == Action::Back)
+      FinishCalibration(false);
+    break;
   case Mode::Pause:
     if (m_pause_settings)
       HandleSettings(action);
@@ -851,8 +902,12 @@ void BigPictureWindow::HandleLibrary(Action action)
       m_running_entry = *sel;
       m_disc = 0;
       const QString path = sel->path;
+      m_audio->StopMusic();
+      BeginTransition(0);
+      m_mode = Mode::Launching;
+      m_fade_in = 1;
       // Let the select sound play before the game takes over.
-      QTimer::singleShot(380, this, [this, path] { emit LaunchRequested(path); });
+      QTimer::singleShot(350, this, [this, path] { emit LaunchRequested(path); });
     }
     else
     {
@@ -863,11 +918,8 @@ void BigPictureWindow::HandleLibrary(Action action)
     ToggleFavorite();
     break;
   case Action::Options:
-    m_audio->Play(Sound::Page);
-    BeginTransition(1);
-    m_tab = Tab::Settings;
-    m_settings_cat = 1;  // General
-    m_settings_in_items = false;
+    if (Selected())
+      OpenGameSettings();
     break;
   case Action::Back:
     m_audio->Play(Sound::Back);
@@ -885,12 +937,14 @@ void BigPictureWindow::HandleLibrary(Action action)
 
 void BigPictureWindow::HandleSettings(Action action)
 {
-  const int cats = static_cast<int>(m_settings.size());
-  auto& items = m_settings[m_settings_cat].items;
+  const int cats = static_cast<int>(Cats().size());
+  m_settings_cat = std::clamp(m_settings_cat, 0, std::max(0, cats - 1));
+  auto& items = Cats()[m_settings_cat].items;
   const int count = static_cast<int>(items.size());
 
   // L / R still switch tabs in the library.
-  if ((action == Action::PageUp || action == Action::PageDown) && !m_pause_settings)
+  if ((action == Action::PageUp || action == Action::PageDown) && !m_pause_settings &&
+      m_mode != Mode::GameSettings)
   {
     SaveBigPictureSettings();
     HandleLibrary(action);
@@ -929,7 +983,17 @@ void BigPictureWindow::HandleSettings(Action action)
       SaveBigPictureSettings();
       m_audio->Play(Sound::Back);
       BeginTransition(-1);
-      if (m_pause_settings)
+      if (m_mode == Mode::GameSettings)
+      {
+        if (m_game_layer)
+          m_game_layer->Save();
+        m_game_layer.reset();
+        m_game_settings.clear();
+        m_settings_cat = 0;
+        m_mode = Mode::Library;
+        Toast(tr("Réglages du jeu enregistrés"));
+      }
+      else if (m_pause_settings)
       {
         m_pause_settings = false;
       }
@@ -995,6 +1059,13 @@ void BigPictureWindow::HandleSettings(Action action)
     m_audio->Play(Sound::Back);
     SaveBigPictureSettings();
     break;
+  case Action::Options:
+    if (item.clear)
+    {
+      item.clear();
+      m_audio->Play(Sound::Erase);
+    }
+    break;
   default:
     break;
   }
@@ -1002,7 +1073,7 @@ void BigPictureWindow::HandleSettings(Action action)
 
 void BigPictureWindow::HandleMenu(Action action)
 {
-  constexpr int ITEMS = 5;
+  constexpr int ITEMS = 6;
   switch (action)
   {
   case Action::Down:
@@ -1030,12 +1101,15 @@ void BigPictureWindow::HandleMenu(Action action)
       m_settings_in_items = false;
       break;
     case 2:
-      StartSetup(0);
+      OpenMemcards();
       break;
     case 3:
-      emit ClassicRequested();
+      StartSetup(0);
       break;
     case 4:
+      emit ClassicRequested();
+      break;
+    case 5:
       SetMode(Mode::ConfirmQuit);
       break;
     default:
@@ -1059,10 +1133,37 @@ std::vector<int> BigPictureWindow::PauseItems() const
   return items;
 }
 
+QString BigPictureWindow::PauseShotPath() const
+{
+  return QString::fromStdString(File::GetUserPath(D_SCREENSHOTS_IDX) +
+                                SConfig::GetInstance().GetGameID() + "/bigpicture_pause.png");
+}
+
+QString BigPictureWindow::SlotThumbPath(int slot) const
+{
+  return QString::fromStdString(File::GetUserPath(D_STATESAVES_IDX) +
+                                SConfig::GetInstance().GetGameID()) +
+         QStringLiteral(".s%1.png").arg(slot, 2, 10, QLatin1Char('0'));
+}
+
+void BigPictureWindow::LoadSlotThumbs()
+{
+  for (int s = 1; s <= SLOT_COUNT; ++s)
+    m_slot_thumbs[s] = QPixmap(SlotThumbPath(s));
+}
+
 void BigPictureWindow::OpenPause()
 {
   auto& system = Core::System::GetInstance();
-  Core::SetState(system, Core::State::Paused);
+  // Capture the current image for the save-state thumbnails, then pause.
+  QFile::remove(PauseShotPath());
+  Core::SaveScreenShot("bigpicture_pause");
+  QTimer::singleShot(150, this, [this] {
+    if (m_mode == Mode::Pause)
+      Core::SetState(Core::System::GetInstance(), Core::State::Paused);
+  });
+  (void)system;
+  LoadSlotThumbs();
   m_mode = Mode::Pause;
   m_overlay_t = 0;
   m_pause_index = 0;
@@ -1131,6 +1232,12 @@ void BigPictureWindow::HandlePause(Action action)
       break;
     case PAUSE_SAVE:
       State::Save(system, static_cast<u32>(m_slot));
+      {
+        const QString thumb = SlotThumbPath(m_slot);
+        QFile::remove(thumb);
+        QFile::copy(PauseShotPath(), thumb);
+        m_slot_thumbs[m_slot] = QPixmap(thumb);
+      }
       m_audio->Play(Sound::SaveState);
       Toast(tr("État sauvegardé dans l'emplacement %1").arg(m_slot));
       break;
@@ -1171,6 +1278,7 @@ void BigPictureWindow::HandlePause(Action action)
       break;
     case PAUSE_QUIT:
       m_audio->Play(Sound::Back);
+      Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
       m_mode = Mode::InGame;
       m_poll_timer->stop();
       hide();
@@ -1224,6 +1332,30 @@ void BigPictureWindow::Tick()
       m_setup_check_timer->start();
     }
   }
+
+  if (m_mode == Mode::FadingOut)
+  {
+    m_fade_out = std::min<qreal>(1, m_fade_out + dt / 0.45);
+    setWindowOpacity(1.0 - EaseInOut(m_fade_out));
+    if (m_fade_out >= 1)
+    {
+      m_mode = Mode::InGame;
+      Suspend();
+      setWindowOpacity(1.0);
+      m_game_timer->start();
+      emit ResumeRequested();
+      return;
+    }
+  }
+  if (m_mode == Mode::Remap && now - m_remap_started > 8000)
+  {
+    Toast(tr("Aucune touche détectée"));
+    FinishRemap(false);
+  }
+  if (m_mode == Mode::Calibrate)
+    UpdateCalibration();
+  if (m_fade_in < 1)
+    m_fade_in = std::min<qreal>(1, m_fade_in + dt / 0.6);
 
   for (size_t i = 0; i < m_focus.size(); ++i)
     approach(m_focus[i], static_cast<int>(i) == m_selected ? 1.0 : 0.0, 14);
@@ -1582,6 +1714,72 @@ void BigPictureWindow::DrawScene(QPainter& painter)
     DrawSetup(painter);
     return;
   }
+  if (m_mode == Mode::Remap)
+  {
+    DrawBackground(painter);
+    DrawRemap(painter);
+    return;
+  }
+  if (m_mode == Mode::Calibrate)
+  {
+    DrawBackground(painter);
+    DrawCalibration(painter);
+    return;
+  }
+  if (m_mode == Mode::Memcard)
+  {
+    DrawBackground(painter);
+    DrawMemcards(painter);
+    DrawToast(painter);
+    return;
+  }
+  if (m_mode == Mode::GameSettings)
+  {
+    DrawBackground(painter);
+    DrawSettings(painter, 190 * height() / 1080.0);
+    DrawToast(painter);
+    return;
+  }
+  if (m_mode == Mode::Launching || m_mode == Mode::FadingOut)
+  {
+    // Loading screen: the cover in the middle, a spinner, then the game fades in behind.
+    const qreal k = height() / 1080.0;
+    DrawBackground(painter);
+    const QSizeF cs(330 * k, 462 * k);
+    const QRectF cr((width() - cs.width()) / 2, height() / 2.0 - cs.height() / 2 - 60 * k,
+                    cs.width(), cs.height());
+    const QPixmap cover =
+        m_running_entry.game ? CoverFor(m_running_entry, cs.toSize()) : QPixmap();
+    QPainterPath clip;
+    clip.addRoundedRect(cr, 20 * k, 20 * k);
+    if (!cover.isNull())
+    {
+      painter.save();
+      painter.setClipPath(clip, Qt::IntersectClip);
+      painter.drawPixmap(cr, cover, QRectF(cover.rect()));
+      painter.restore();
+    }
+    else
+    {
+      painter.fillPath(clip, RAISED);
+    }
+    painter.setFont(Font(true, int(36 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(0, cr.bottom() + 30 * k, width(), 50 * k), Qt::AlignCenter,
+                     m_running_entry.title);
+    // spinner
+    const QPointF sc(width() / 2.0, cr.bottom() + 130 * k);
+    for (int i = 0; i < 12; ++i)
+    {
+      const qreal a = i * std::numbers::pi / 6 + m_time * 5;
+      QColor c = TEXT;
+      c.setAlphaF(static_cast<float>(0.15 + 0.85 * (i / 11.0)));
+      painter.setPen(QPen(c, 4 * k, Qt::SolidLine, Qt::RoundCap));
+      painter.drawLine(QPointF(sc.x() + std::cos(a) * 12 * k, sc.y() + std::sin(a) * 12 * k),
+                       QPointF(sc.x() + std::cos(a) * 22 * k, sc.y() + std::sin(a) * 22 * k));
+    }
+    return;
+  }
 
   DrawBackground(painter);
   DrawTopBar(painter);
@@ -1600,6 +1798,12 @@ void BigPictureWindow::DrawScene(QPainter& painter)
     DrawDialog(painter, tr("Quitter Dolphin ?"),
                {{QStringLiteral("A"), tr("Quitter")}, {QStringLiteral("B"), tr("Annuler")}});
   DrawToast(painter);
+  if (m_fade_in < 1)
+  {
+    QColor veil = Qt::black;
+    veil.setAlphaF(static_cast<float>(1 - EaseInOut(m_fade_in)));
+    painter.fillRect(rect(), veil);
+  }
 }
 
 // ================================================================== background effects
@@ -2271,16 +2475,25 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
   const qreal k = height() / 1080.0;
   const qreal left = 80 * k;
   const qreal cats_w = 420 * k;
-  const int ncat = static_cast<int>(m_settings.size());
+  const auto& all_cats = Cats();
+  const int ncat = static_cast<int>(all_cats.size());
   m_settings_cat = std::clamp(m_settings_cat, 0, ncat - 1);
 
-  if (m_pause_settings)
+  if (m_pause_settings || m_mode == Mode::GameSettings)
   {
     QFont title = Font(true, int(48 * k), 700);
     painter.setFont(title);
     painter.setPen(TEXT);
-    painter.drawText(QRectF(left, top - 110 * k, 800 * k, 70 * k), Qt::AlignVCenter,
-                     tr("Réglages"));
+    const QString text = m_mode == Mode::GameSettings ? m_game_settings_title : tr("Réglages");
+    painter.drawText(QRectF(left, top - 110 * k, width() - 2 * left, 70 * k), Qt::AlignVCenter,
+                     QFontMetricsF(title).elidedText(text, Qt::ElideRight, width() - 2 * left));
+    if (m_mode == Mode::GameSettings)
+    {
+      painter.setFont(Font(false, int(20 * k), 400));
+      painter.setPen(TEXT_SOFT);
+      painter.drawText(QRectF(left, top - 46 * k, width(), 30 * k), Qt::AlignVCenter,
+                       tr("« Global » suit les réglages généraux de Dolphin."));
+    }
   }
 
   // Categories
@@ -2297,11 +2510,11 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
     }
     painter.setFont(Font(false, int(23 * k), active ? 600 : 500));
     painter.setPen(active && !m_settings_in_items ? BG : (active ? TEXT : TEXT_SOFT));
-    painter.drawText(r.adjusted(24 * k, 0, 0, 0), Qt::AlignVCenter, m_settings[i].name);
+    painter.drawText(r.adjusted(24 * k, 0, 0, 0), Qt::AlignVCenter, all_cats[i].name);
   }
 
   // Items
-  const auto& items = m_settings[m_settings_cat].items;
+  const auto& items = all_cats[m_settings_cat].items;
   const int count = static_cast<int>(items.size());
   const qreal ix = left + cats_w + 60 * k;
   const qreal iw = width() - ix - 96 * k;
@@ -2366,6 +2579,13 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
     }
     case BigPictureSettingItem::Kind::Action:
     {
+      if (item.value)
+      {
+        painter.setFont(Font(false, int(21 * k), 500));
+        painter.setPen(focused ? BG : TEXT_SOFT);
+        painter.drawText(QRectF(r.right() - 400 * k, r.top(), 340 * k, r.height()),
+                         Qt::AlignVCenter | Qt::AlignRight, item.value());
+      }
       QPen arrow(fg, 2.5 * k);
       arrow.setCapStyle(Qt::RoundCap);
       painter.setPen(arrow);
@@ -2392,16 +2612,20 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
                      Qt::TextWordWrap | Qt::AlignLeft | Qt::AlignVCenter, help);
   }
 
-  if (m_mode == Mode::Library || m_mode == Mode::Pause)
+  if (m_mode == Mode::Library || m_mode == Mode::Pause || m_mode == Mode::GameSettings)
   {
     if (m_settings_in_items)
     {
+      std::vector<std::pair<QString, QString>> right = {
+          {QStringLiteral("D-Pad-L"), QString()},
+          {QStringLiteral("D-Pad-R"), tr("Modifier")},
+          {QStringLiteral("A"), tr("Valider")}};
+      if (m_settings_item < count && items[m_settings_item].clear)
+        right.push_back({QStringLiteral("X"), tr("Effacer")});
+      right.push_back({QStringLiteral("B"), tr("Catégories")});
       DrawHints(painter,
                 {{QStringLiteral("D-Pad-U"), QString()}, {QStringLiteral("D-Pad-D"), tr("Choisir")}},
-                {{QStringLiteral("D-Pad-L"), QString()},
-                 {QStringLiteral("D-Pad-R"), tr("Modifier")},
-                 {QStringLiteral("A"), tr("Valider")},
-                 {QStringLiteral("B"), tr("Catégories")}});
+                right);
     }
     else
     {
@@ -2440,12 +2664,12 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
                    QStringLiteral("Dolphin"));
 
   const QString items[] = {tr("Retour à la bibliothèque"), tr("Réglages"),
-                           tr("Configurer la manette"), tr("Interface classique"),
-                           tr("Quitter Dolphin")};
+                           tr("Cartes mémoire"),          tr("Configurer la manette"),
+                           tr("Interface classique"),     tr("Quitter Dolphin")};
   qreal y = 230 * k;
-  for (int i = 0; i < 5; ++i)
+  for (int i = 0; i < 6; ++i)
   {
-    if (i == 4)
+    if (i == 5)
     {
       painter.fillRect(QRectF(64 * k, y + 4 * k, 572 * k, 1 * k), LINE);
       y += 20 * k;
@@ -2464,9 +2688,9 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
                QRectF(r.right() - 28 * k - 38 * k, r.center().y() - 19 * k, 38 * k, 38 * k));
     }
     painter.setFont(Font(false, int(26 * k), active ? 600 : 500));
-    painter.setPen(active ? BG : (i == 4 ? DANGER : TEXT));
+    painter.setPen(active ? BG : (i == 5 ? DANGER : TEXT));
     painter.drawText(r.adjusted(28 * k, 0, 0, 0), Qt::AlignVCenter, items[i]);
-    y += 88 * k;
+    y += 86 * k;
   }
   painter.setOpacity(e);
 
@@ -2642,7 +2866,7 @@ void BigPictureWindow::DrawPause(QPainter& painter)
   painter.drawText(QRectF(sx, 80 * k, sw, 44 * k), Qt::AlignVCenter, tr("États sauvegardés"));
   const qreal gap = 22 * k;
   const qreal cw = (sw - gap) / 2;
-  const qreal ch = 128 * k;
+  const qreal ch = 150 * k;
   for (int s = 1; s <= SLOT_COUNT; ++s)
   {
     const int col = (s - 1) % 2, row = (s - 1) / 2;
@@ -2660,17 +2884,36 @@ void BigPictureWindow::DrawPause(QPainter& painter)
       painter.drawRoundedRect(r.adjusted(-4 * k, -4 * k, 4 * k, 4 * k), 20 * k, 20 * k);
     }
     const u64 when = State::GetUnixTimeOfSlot(static_cast<u32>(s));
-    painter.setFont(Font(true, int(48 * k), 700));
-    painter.setPen(current ? TEXT : TEXT_DIM);
-    painter.drawText(QRectF(r.left() + 24 * k, r.top(), 70 * k, r.height()), Qt::AlignVCenter,
-                     QString::number(s));
+    // Thumbnail (16:9) on the left of the card
+    const QRectF tr_(r.left() + 12 * k, r.top() + 12 * k, (ch - 24 * k) * 16 / 9, ch - 24 * k);
+    QPainterPath tclip;
+    tclip.addRoundedRect(tr_, 10 * k, 10 * k);
+    painter.save();
+    painter.setClipPath(tclip, Qt::IntersectClip);
+    if (when != 0 && !m_slot_thumbs[s].isNull())
+    {
+      const QPixmap& th = m_slot_thumbs[s];
+      const QSizeF src = QSizeF(th.size()).scaled(tr_.size(), Qt::KeepAspectRatioByExpanding);
+      painter.drawPixmap(QRectF(tr_.center().x() - src.width() / 2,
+                                tr_.center().y() - src.height() / 2, src.width(), src.height()),
+                         th, QRectF(th.rect()));
+    }
+    else
+    {
+      painter.fillRect(tr_, SURFACE_DEEP);
+      painter.setFont(Font(true, int(40 * k), 700));
+      painter.setPen(current ? TEXT : TEXT_DIM);
+      painter.drawText(tr_, Qt::AlignCenter, QString::number(s));
+    }
+    painter.restore();
+    const qreal text_x = tr_.right() + 18 * k;
     painter.setFont(Font(false, int(22 * k), 600));
     painter.setPen(TEXT);
-    painter.drawText(QRectF(r.left() + 100 * k, r.top() + 26 * k, r.width() - 120 * k, 34 * k),
+    painter.drawText(QRectF(text_x, r.top() + 26 * k, r.right() - text_x - 10 * k, 34 * k),
                      Qt::AlignVCenter, tr("Emplacement %1").arg(s));
     painter.setFont(Font(false, int(19 * k), 400));
     painter.setPen(TEXT_SOFT);
-    painter.drawText(QRectF(r.left() + 100 * k, r.top() + 64 * k, r.width() - 120 * k, 34 * k),
+    painter.drawText(QRectF(text_x, r.top() + 64 * k, r.right() - text_x - 10 * k, 34 * k),
                      Qt::AlignVCenter,
                      when == 0 ? tr("Libre") :
                                  QDateTime::fromSecsSinceEpoch(static_cast<qint64>(when))
@@ -2907,4 +3150,723 @@ void BigPictureWindow::FinishSetup(bool save)
   if (save)
     Toast(tr("Manette configurée"));
   update();
+}
+
+// ================================================================== settings sources
+
+std::vector<BigPictureSettingCategory>& BigPictureWindow::Cats()
+{
+  return m_mode == Mode::GameSettings ? m_game_settings : m_settings;
+}
+
+void BigPictureWindow::OpenGameSettings()
+{
+  const Entry* sel = Selected();
+  if (!sel)
+    return;
+  m_game_layer = std::make_shared<Config::Layer>(ConfigLoaders::GenerateLocalGameConfigLoader(
+      sel->game->GetGameID(), sel->game->GetRevision()));
+  m_game_settings = BuildBigPictureGameSettings(m_game_layer);
+  m_game_settings_title = tr("Réglages de %1").arg(sel->title);
+  m_settings_cat = 0;
+  m_settings_item = 0;
+  m_settings_in_items = false;
+  m_audio->Play(Sound::Confirm);
+  BeginTransition(1);
+  m_mode = Mode::GameSettings;
+}
+
+// ================================================================== remap one control
+
+void BigPictureWindow::StartRemap(int port, int group, int index, int mirror, bool flip,
+                                  const QString& prompt)
+{
+  if (m_mode != Mode::Remap)
+    m_mode_before_remap = m_mode;
+  m_remap_port = port;
+  m_remap_group = group;
+  m_remap_index = index;
+  m_remap_mirror = mirror;
+  m_remap_flip = flip;
+  m_remap_prompt = prompt;
+  m_remap_started = m_clock.elapsed();
+  BeginTransition(0);
+  m_mode = Mode::Remap;
+  // Wait for every button to be released (the A used to get here).
+  QTimer::singleShot(300, this, [this] {
+    if (m_mode == Mode::Remap)
+      StartRemapDetection();
+  });
+  m_setup_timer->stop();
+}
+
+void BigPictureWindow::StartRemapDetection()
+{
+  std::vector<std::string> devices;
+  auto* pad = PadController(m_remap_port);
+  if (g_controller_interface.FindDevice(pad->GetDefaultDevice()))
+  {
+    devices.push_back(pad->GetDefaultDevice().ToString());
+  }
+  else
+  {
+    for (const std::string& dev : g_controller_interface.GetAllDeviceStrings())
+    {
+      if (dev.rfind("DSUClient", 0) != 0)
+        devices.push_back(dev);
+    }
+  }
+  m_detector = std::make_unique<ciface::Core::InputDetector>();
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    m_detector->Start(g_controller_interface, devices);
+  }
+  m_remap_started = m_clock.elapsed();
+  QTimer::singleShot(10, this, &BigPictureWindow::UpdateRemap);
+}
+
+void BigPictureWindow::UpdateRemap()
+{
+  if (m_mode != Mode::Remap || !m_detector)
+    return;
+  m_detector->Update(std::chrono::seconds(8), std::chrono::milliseconds(0),
+                     std::chrono::seconds(8));
+  if (!m_detector->IsComplete())
+  {
+    QTimer::singleShot(10, this, &BigPictureWindow::UpdateRemap);
+    return;
+  }
+  auto results = m_detector->TakeResults();
+  m_detector.reset();
+  if (!ciface::MappingCommon::ContainsCompleteDetection(results))
+  {
+    FinishRemap(false);
+    return;
+  }
+
+  auto* pad = PadController(m_remap_port);
+  if (!g_controller_interface.FindDevice(pad->GetDefaultDevice()))
+  {
+    ciface::Core::DeviceQualifier dq;
+    dq.FromDevice(results.front().device.get());
+    pad->SetDefaultDevice(dq);
+  }
+  ciface::MappingCommon::RemoveSpuriousTriggerCombinations(&results);
+  const std::string expr = ciface::MappingCommon::BuildExpression(
+      results, pad->GetDefaultDevice(), ciface::MappingCommon::Quote::On);
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    auto* group = Pad::GetGroup(m_remap_port, static_cast<PadGroup>(m_remap_group));
+    (void)group->controls[m_remap_index]->control_ref->SetExpression(expr);
+    if (m_remap_mirror >= 0)
+    {
+      (void)group->controls[m_remap_mirror]->control_ref->SetExpression(
+          m_remap_flip ? FlipAxis(expr) : expr);
+    }
+    pad->UpdateReferences(g_controller_interface);
+  }
+  Pad::GetConfig()->SaveConfig();
+  FinishRemap(true);
+}
+
+void BigPictureWindow::FinishRemap(bool ok)
+{
+  m_detector.reset();
+  m_audio->Play(ok ? Sound::Confirm : Sound::Cancel);
+  BeginTransition(0);
+  m_mode = m_mode_before_remap;
+  m_prev_held = ~0u;
+}
+
+void BigPictureWindow::DrawRemap(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(0, 200 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("MANETTE DU PORT %1").arg(m_remap_port + 1));
+
+  // Countdown ring
+  const QPointF c(width() / 2.0, 470 * k);
+  const qreal left = std::clamp(1.0 - (m_clock.elapsed() - m_remap_started) / 8000.0, 0.0, 1.0);
+  painter.setPen(QPen(LINE, 8 * k));
+  painter.setBrush(SURFACE);
+  painter.drawEllipse(c, 150 * k, 150 * k);
+  QPen ring(TEXT, 8 * k);
+  ring.setCapStyle(Qt::RoundCap);
+  painter.setPen(ring);
+  painter.setBrush(Qt::NoBrush);
+  painter.drawArc(QRectF(c.x() - 150 * k, c.y() - 150 * k, 300 * k, 300 * k), 90 * 16,
+                  static_cast<int>(360 * 16 * left));
+  const qreal pulse = 1 + 0.06 * std::sin(m_time * 6);
+  painter.setPen(Qt::NoPen);
+  QColor dot = ACCENT;
+  dot.setAlphaF(0.35f);
+  painter.setBrush(dot);
+  painter.drawEllipse(c, 60 * k * pulse, 60 * k * pulse);
+
+  QFont prompt = Font(true, int(56 * k), 700);
+  prompt.setLetterSpacing(QFont::AbsoluteSpacing, -1.5 * k);
+  painter.setFont(prompt);
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, 680 * k, width(), 80 * k), Qt::AlignCenter, m_remap_prompt);
+  painter.setFont(Font(false, int(22 * k), 400));
+  painter.setPen(TEXT_SOFT);
+  painter.drawText(QRectF(0, 770 * k, width(), 36 * k), Qt::AlignCenter,
+                   tr("Appuie sur la touche, le stick ou la gâchette à utiliser."));
+  painter.drawText(QRectF(0, height() - 70 * k, width() - 80 * k, 34 * k),
+                   Qt::AlignVCenter | Qt::AlignRight, tr("Échap (clavier) : annuler"));
+}
+
+// ================================================================== stick calibration
+
+void BigPictureWindow::StartCalibration(int port, int group)
+{
+  m_cal_port = port;
+  m_cal_group = group;
+  m_calibrator = std::make_unique<ciface::MappingCommon::CalibrationBuilder>();
+  m_mode_before_remap = m_mode;
+  BeginTransition(0);
+  m_mode = Mode::Calibrate;
+  m_prev_held = ~0u;
+}
+
+void BigPictureWindow::UpdateCalibration()
+{
+  if (!m_calibrator)
+    return;
+  auto* stick = static_cast<ControllerEmu::ReshapableInput*>(
+      Pad::GetGroup(m_cal_port, static_cast<PadGroup>(m_cal_group)));
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  const auto point = stick->GetReshapableState(false);
+  m_cal_x = point.x;
+  m_cal_y = point.y;
+  m_calibrator->Update(point);
+  if (m_calibrator->IsComplete())
+  {
+    m_calibrator->ApplyResults(stick);
+    Pad::GetConfig()->SaveConfig();
+    m_calibrator.reset();
+    m_audio->Play(Sound::Confirm);
+    Toast(tr("Stick étalonné"));
+    BeginTransition(0);
+    m_mode = m_mode_before_remap;
+  }
+}
+
+void BigPictureWindow::FinishCalibration(bool apply)
+{
+  if (!m_calibrator)
+    return;
+  if (apply && m_calibrator->IsCalibrationDataSensible())
+  {
+    auto* stick = static_cast<ControllerEmu::ReshapableInput*>(
+        Pad::GetGroup(m_cal_port, static_cast<PadGroup>(m_cal_group)));
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    m_calibrator->ApplyResults(stick);
+    Pad::GetConfig()->SaveConfig();
+    Toast(tr("Stick étalonné"));
+    m_audio->Play(Sound::Confirm);
+  }
+  else
+  {
+    m_audio->Play(apply ? Sound::Error : Sound::Cancel);
+    if (apply)
+    {
+      Toast(tr("Fais encore quelques tours complets"));
+      return;
+    }
+  }
+  m_calibrator.reset();
+  BeginTransition(0);
+  m_mode = m_mode_before_remap;
+  m_prev_held = ~0u;
+}
+
+void BigPictureWindow::DrawCalibration(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  const bool is_main = m_cal_group == static_cast<int>(PadGroup::MainStick);
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(0, 110 * k, width(), 30 * k), Qt::AlignCenter,
+                   is_main ? tr("ÉTALONNAGE DU STICK PRINCIPAL") : tr("ÉTALONNAGE DU STICK C"));
+
+  const QPointF c(width() / 2.0, 470 * k);
+  const qreal radius = 230 * k;
+  painter.setPen(QPen(LINE, 2 * k));
+  painter.setBrush(SURFACE);
+  painter.drawEllipse(c, radius, radius);
+  // Octagonal GameCube gate, for reference
+  QPolygonF gate;
+  for (int i = 0; i < 8; ++i)
+  {
+    const qreal a = i * std::numbers::pi / 4 + std::numbers::pi / 8;
+    gate << QPointF(c.x() + std::cos(a) * radius, c.y() + std::sin(a) * radius);
+  }
+  painter.setPen(QPen(TEXT_DIM, 2 * k, Qt::DashLine));
+  painter.setBrush(Qt::NoBrush);
+  painter.drawPolygon(gate);
+
+  if (m_calibrator)
+  {
+    QPolygonF shape;
+    for (int i = 0; i <= 64; ++i)
+    {
+      const qreal a = i * 2 * std::numbers::pi / 64;
+      const qreal r = m_calibrator->GetCalibrationRadiusAtAngle(a) * radius;
+      shape << QPointF(c.x() + std::cos(a) * r, c.y() - std::sin(a) * r);
+    }
+    QColor fill = ACCENT;
+    fill.setAlphaF(0.30f);
+    painter.setPen(QPen(ACCENT_SOFT, 3 * k));
+    painter.setBrush(fill);
+    painter.drawPolygon(shape);
+  }
+  // Current position
+  const QPointF p(c.x() + std::clamp<qreal>(m_cal_x, -1.2, 1.2) * radius,
+                  c.y() - std::clamp<qreal>(m_cal_y, -1.2, 1.2) * radius);
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(TEXT);
+  painter.drawEllipse(p, 12 * k, 12 * k);
+
+  const bool sensible = m_calibrator && m_calibrator->IsCalibrationDataSensible();
+  QFont prompt = Font(true, int(48 * k), 700);
+  painter.setFont(prompt);
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, 740 * k, width(), 70 * k), Qt::AlignCenter,
+                   sensible ? tr("Relâche le stick pour terminer") :
+                              tr("Fais tourner le stick le long du bord"));
+  painter.setFont(Font(false, int(22 * k), 400));
+  painter.setPen(TEXT_SOFT);
+  painter.drawText(QRectF(0, 820 * k, width(), 36 * k), Qt::AlignCenter,
+                   tr("Plusieurs tours complets, lentement, en poussant à fond."));
+  DrawHints(painter, {}, {{QStringLiteral("A"), tr("Terminer")}, {QStringLiteral("B"), tr("Annuler")}});
+}
+
+// ================================================================== memory card manager
+
+void BigPictureWindow::OpenMemcards()
+{
+  if (!Core::IsUninitialized(Core::System::GetInstance()))
+  {
+    m_audio->Play(Sound::Error);
+    Toast(tr("Quitte le jeu pour gérer les cartes mémoire"));
+    return;
+  }
+  LoadCard(0);
+  LoadCard(1);
+  m_mc_card = 0;
+  m_mc_index = 0;
+  m_mc_actions_open = false;
+  m_mc_confirm_erase = false;
+  if (m_mode != Mode::Memcard)
+    m_mode_before_memcard = m_mode == Mode::Menu ? Mode::Library : m_mode;
+  m_audio->Play(Sound::Confirm);
+  BeginTransition(1);
+  m_mode = Mode::Memcard;
+}
+
+void BigPictureWindow::LoadCard(int slot)
+{
+  CardView& view = m_cards[slot];
+  view = CardView{};
+  const auto exi_slot = slot == 0 ? ExpansionInterface::Slot::A : ExpansionInterface::Slot::B;
+  const auto type = Config::Get(slot == 0 ? Config::MAIN_SLOT_A : Config::MAIN_SLOT_B);
+  if (type != ExpansionInterface::EXIDeviceType::MemoryCard)
+  {
+    view.error = type == ExpansionInterface::EXIDeviceType::MemoryCardFolder ?
+                     tr("Emplacement en mode dossier GCI") :
+                     tr("Pas de carte mémoire dans cet emplacement");
+    return;
+  }
+  const std::string path =
+      Config::GetMemcardPath(exi_slot, Config::Get(Config::MAIN_FALLBACK_REGION));
+  view.path = QString::fromStdString(path);
+  auto opened = Memcard::GCMemcard::Open(path);
+  auto& card = opened.second;
+  if (!card || !card->IsValid())
+  {
+    view.error = QFileInfo::exists(view.path) ? tr("Carte mémoire illisible") :
+                                                tr("Carte mémoire vide (pas encore créée)");
+    return;
+  }
+  view.card = std::make_unique<Memcard::GCMemcard>(std::move(*card));
+  view.free_blocks = view.card->GetFreeBlocks();
+  const u8 n = view.card->GetNumFiles();
+  for (u8 f = 0; f < n; ++f)
+  {
+    const u8 index = view.card->GetFileIndex(f);
+    SaveIcon icon;
+    icon.index = index;
+    icon.blocks = view.card->DEntry_BlockCount(index);
+    if (const auto comments = view.card->GetSaveComments(index))
+    {
+      icon.title = QString::fromStdString(comments->first).trimmed();
+      icon.comment = QString::fromStdString(comments->second).trimmed();
+    }
+    if (auto banner = view.card->ReadBannerRGBA8(index))
+    {
+      const QImage img(reinterpret_cast<const uchar*>(banner->data()),
+                       Memcard::MEMORY_CARD_BANNER_WIDTH, Memcard::MEMORY_CARD_BANNER_HEIGHT,
+                       QImage::Format_ARGB32);
+      icon.banner = QPixmap::fromImage(img.copy());
+    }
+    if (auto frames = view.card->ReadAnimRGBA8(index))
+    {
+      for (const auto& frame : *frames)
+      {
+        const QImage img(reinterpret_cast<const uchar*>(frame.image_data.data()),
+                         Memcard::MEMORY_CARD_ICON_WIDTH, Memcard::MEMORY_CARD_ICON_HEIGHT,
+                         QImage::Format_ARGB32);
+        icon.frames.push_back(QPixmap::fromImage(img.copy()));
+        icon.delays.push_back(std::max<int>(1, frame.delay) * 4);
+      }
+    }
+    view.saves.push_back(std::move(icon));
+  }
+}
+
+void BigPictureWindow::HandleMemcard(Action action)
+{
+  constexpr int COLS = 5;
+  CardView& card = m_cards[m_mc_card];
+  const int count = static_cast<int>(card.saves.size());
+
+  if (m_mc_actions_open)
+  {
+    const int items = m_mc_confirm_erase ? 2 : 4;
+    switch (action)
+    {
+    case Action::Down:
+      m_mc_action = (m_mc_action + 1) % items;
+      m_audio->Play(Sound::Move);
+      break;
+    case Action::Up:
+      m_mc_action = (m_mc_action + items - 1) % items;
+      m_audio->Play(Sound::Move);
+      break;
+    case Action::Back:
+      m_mc_actions_open = false;
+      m_mc_confirm_erase = false;
+      m_audio->Play(Sound::Cancel);
+      break;
+    case Action::Accept:
+    {
+      if (count == 0)
+        break;
+      const SaveIcon& save = card.saves[std::clamp(m_mc_index, 0, count - 1)];
+      CardView& other = m_cards[1 - m_mc_card];
+      if (m_mc_confirm_erase)
+      {
+        if (m_mc_action == 0)
+        {
+          (void)card.card->RemoveFile(save.index);
+          (void)card.card->Save();
+          m_audio->Play(Sound::Erase);
+          Toast(tr("Sauvegarde effacée"));
+          LoadCard(m_mc_card);
+          m_mc_index = std::max(0, m_mc_index - 1);
+        }
+        else
+        {
+          m_audio->Play(Sound::Cancel);
+        }
+        m_mc_actions_open = false;
+        m_mc_confirm_erase = false;
+        break;
+      }
+      if (m_mc_action == 0 || m_mc_action == 1)  // copy / move
+      {
+        if (!other.card)
+        {
+          m_audio->Play(Sound::Error);
+          Toast(tr("L'autre emplacement n'a pas de carte mémoire utilisable"));
+          m_mc_actions_open = false;
+          break;
+        }
+        const auto file = card.card->ExportFile(save.index);
+        const auto result = file ? other.card->ImportFile(*file) :
+                                   Memcard::GCMemcardImportFileRetVal::NOMEMCARD;
+        if (result != Memcard::GCMemcardImportFileRetVal::SUCCESS)
+        {
+          m_audio->Play(Sound::Error);
+          Toast(result == Memcard::GCMemcardImportFileRetVal::TITLEPRESENT ?
+                    tr("Cette sauvegarde existe déjà sur l'autre carte") :
+                    tr("Pas assez de place sur l'autre carte"));
+          m_mc_actions_open = false;
+          break;
+        }
+        (void)other.card->Save();
+        if (m_mc_action == 1)
+        {
+          (void)card.card->RemoveFile(save.index);
+          (void)card.card->Save();
+          m_audio->Play(Sound::LoadState);  // "Memory Card Move"
+          Toast(tr("Sauvegarde déplacée"));
+        }
+        else
+        {
+          m_audio->Play(Sound::SaveState);  // "Memory Card Copy"
+          Toast(tr("Sauvegarde copiée"));
+        }
+        LoadCard(0);
+        LoadCard(1);
+        m_mc_index = std::clamp(m_mc_index, 0,
+                                std::max(0, static_cast<int>(m_cards[m_mc_card].saves.size()) - 1));
+        m_mc_actions_open = false;
+      }
+      else if (m_mc_action == 2)  // erase -> confirm
+      {
+        m_mc_confirm_erase = true;
+        m_mc_action = 1;  // "Annuler" by default
+        m_audio->Play(Sound::Toggle);
+      }
+      else
+      {
+        m_mc_actions_open = false;
+        m_audio->Play(Sound::Cancel);
+      }
+      break;
+    }
+    default:
+      break;
+    }
+    return;
+  }
+
+  switch (action)
+  {
+  case Action::Right:
+    if (count > 0 && m_mc_index % COLS < COLS - 1 && m_mc_index + 1 < count)
+    {
+      m_mc_index++;
+      m_audio->Play(Sound::Move);
+    }
+    else if (m_mc_card == 0)
+    {
+      m_mc_card = 1;
+      m_mc_index = 0;
+      m_audio->Play(Sound::Page);
+    }
+    break;
+  case Action::Left:
+    if (count > 0 && m_mc_index % COLS > 0)
+    {
+      m_mc_index--;
+      m_audio->Play(Sound::Move);
+    }
+    else if (m_mc_card == 1)
+    {
+      m_mc_card = 0;
+      m_mc_index = std::min<int>(COLS - 1, std::max(0, static_cast<int>(m_cards[0].saves.size()) - 1));
+      m_audio->Play(Sound::Page);
+    }
+    break;
+  case Action::Down:
+    if (m_mc_index + COLS < count)
+    {
+      m_mc_index += COLS;
+      m_audio->Play(Sound::Move);
+    }
+    break;
+  case Action::Up:
+    if (m_mc_index - COLS >= 0)
+    {
+      m_mc_index -= COLS;
+      m_audio->Play(Sound::Move);
+    }
+    break;
+  case Action::PageUp:
+  case Action::PageDown:
+    m_mc_card = action == Action::PageDown ? 1 : 0;
+    m_mc_index = 0;
+    m_audio->Play(Sound::Page);
+    break;
+  case Action::Accept:
+    if (count > 0 && card.card)
+    {
+      m_mc_actions_open = true;
+      m_mc_confirm_erase = false;
+      m_mc_action = 0;
+      m_audio->Play(Sound::Confirm);
+    }
+    else
+    {
+      m_audio->Play(Sound::Error);
+    }
+    break;
+  case Action::Back:
+    m_audio->Play(Sound::Back);
+    BeginTransition(-1);
+    m_mode = m_mode_before_memcard;
+    break;
+  default:
+    break;
+  }
+}
+
+void BigPictureWindow::DrawMemcards(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  constexpr int COLS = 5;
+  const qreal top = 120 * k;
+
+  painter.setFont(Font(true, int(48 * k), 700));
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(80 * k, 40 * k, width(), 70 * k), Qt::AlignVCenter,
+                   tr("Cartes mémoire"));
+
+  const qreal gap = 60 * k;
+  const qreal pw = (width() - 160 * k - gap) / 2;
+  for (int slot = 0; slot < 2; ++slot)
+  {
+    const CardView& view = m_cards[slot];
+    const bool active = slot == m_mc_card;
+    const QRectF panel(80 * k + slot * (pw + gap), top + 20 * k, pw, 640 * k);
+    painter.setPen(active ? QPen(TEXT, 3 * k) : Qt::NoPen);
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(panel, 26 * k, 26 * k);
+
+    painter.setFont(Font(true, int(28 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(panel.left() + 30 * k, panel.top() + 22 * k, pw, 40 * k),
+                     Qt::AlignVCenter, slot == 0 ? tr("Emplacement A") : tr("Emplacement B"));
+    painter.setFont(Font(false, int(19 * k), 400));
+    painter.setPen(TEXT_SOFT);
+    painter.drawText(QRectF(panel.left(), panel.top() + 22 * k, pw - 30 * k, 40 * k),
+                     Qt::AlignVCenter | Qt::AlignRight,
+                     view.card ? tr("%1 blocs libres").arg(view.free_blocks) : QString());
+
+    if (!view.card)
+    {
+      painter.setFont(Font(false, int(22 * k), 500));
+      painter.setPen(TEXT_SOFT);
+      painter.drawText(panel, Qt::AlignCenter, view.error);
+      continue;
+    }
+    if (view.saves.empty())
+    {
+      painter.setFont(Font(false, int(22 * k), 500));
+      painter.setPen(TEXT_SOFT);
+      painter.drawText(panel, Qt::AlignCenter, tr("Aucune sauvegarde"));
+      continue;
+    }
+
+    // Grid of animated save icons, like the GameCube's memory card screen
+    const qreal cell = (pw - 60 * k) / COLS;
+    const qreal icon = std::min<qreal>(cell - 24 * k, 96 * k);
+    const qreal grid_top = panel.top() + 90 * k;
+    const int rows_visible = int((panel.height() - 110 * k) / cell);
+    const int sel_row = active ? m_mc_index / COLS : 0;
+    const int first_row = std::max(0, sel_row - rows_visible + 1);
+    for (int i = 0; i < static_cast<int>(view.saves.size()); ++i)
+    {
+      const int row = i / COLS - first_row;
+      if (row < 0 || row >= rows_visible)
+        continue;
+      const SaveIcon& save = view.saves[i];
+      const QRectF cellr(panel.left() + 30 * k + (i % COLS) * cell, grid_top + row * cell, cell,
+                         cell);
+      const bool focused = active && i == m_mc_index;
+      if (focused)
+      {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(RAISED);
+        painter.drawRoundedRect(cellr.adjusted(6 * k, 6 * k, -6 * k, -6 * k), 16 * k, 16 * k);
+        const qreal pulse = 0.75 + 0.25 * std::sin(m_time * 3.2);
+        QColor ring = TEXT;
+        ring.setAlphaF(static_cast<float>(pulse));
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(ring, 3 * k));
+        painter.drawRoundedRect(cellr.adjusted(6 * k, 6 * k, -6 * k, -6 * k), 16 * k, 16 * k);
+      }
+      if (!save.frames.empty())
+      {
+        int total = 0;
+        for (int d : save.delays)
+          total += d;
+        int tick = static_cast<int>(m_time * 60) % std::max(1, total);
+        size_t f = 0;
+        while (f + 1 < save.frames.size() && tick >= save.delays[f])
+          tick -= save.delays[f++];
+        const qreal sz = focused ? icon * 1.12 : icon;
+        painter.drawPixmap(QRectF(cellr.center().x() - sz / 2, cellr.center().y() - sz / 2, sz, sz),
+                           save.frames[f], QRectF(save.frames[f].rect()));
+      }
+    }
+
+    // Details of the focused save
+    if (active)
+    {
+      const SaveIcon& save =
+          view.saves[std::clamp(m_mc_index, 0, static_cast<int>(view.saves.size()) - 1)];
+      const QRectF info(panel.left(), panel.bottom() + 24 * k, pw, 180 * k);
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(SURFACE);
+      painter.drawRoundedRect(info, 22 * k, 22 * k);
+      const QRectF br(info.left() + 24 * k, info.top() + 24 * k, 288 * k, 96 * k);
+      if (!save.banner.isNull())
+        painter.drawPixmap(br, save.banner, QRectF(save.banner.rect()));
+      const qreal tx = br.right() + 24 * k;
+      painter.setFont(Font(true, int(24 * k), 700));
+      painter.setPen(TEXT);
+      painter.drawText(QRectF(tx, info.top() + 24 * k, info.right() - tx - 20 * k, 36 * k),
+                       Qt::AlignVCenter, save.title);
+      painter.setFont(Font(false, int(19 * k), 400));
+      painter.setPen(TEXT_SOFT);
+      painter.drawText(QRectF(tx, info.top() + 64 * k, info.right() - tx - 20 * k, 32 * k),
+                       Qt::AlignVCenter, save.comment);
+      painter.drawText(QRectF(tx, info.top() + 100 * k, info.right() - tx - 20 * k, 32 * k),
+                       Qt::AlignVCenter, tr("%n bloc(s)", "", save.blocks));
+    }
+  }
+
+  // Action list
+  if (m_mc_actions_open)
+  {
+    painter.fillRect(rect(), QColor(9, 7, 20, 170));
+    const QString other = m_mc_card == 0 ? tr("B") : tr("A");
+    std::vector<QString> items;
+    if (m_mc_confirm_erase)
+      items = {tr("Effacer définitivement"), tr("Annuler")};
+    else
+      items = {tr("Copier vers l'emplacement %1").arg(other),
+               tr("Déplacer vers l'emplacement %1").arg(other), tr("Effacer"), tr("Annuler")};
+    const qreal bw = 640 * k;
+    const qreal bh = 90 * k + items.size() * 84 * k;
+    const QRectF box((width() - bw) / 2, (height() - bh) / 2, bw, bh);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(box, 26 * k, 26 * k);
+    painter.setFont(Font(true, int(28 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(box.left(), box.top() + 20 * k, bw, 50 * k), Qt::AlignCenter,
+                     m_mc_confirm_erase ? tr("Effacer cette sauvegarde ?") : tr("Sauvegarde"));
+    qreal y = box.top() + 84 * k;
+    for (int i = 0; i < static_cast<int>(items.size()); ++i)
+    {
+      const QRectF r(box.left() + 28 * k, y, bw - 56 * k, 72 * k);
+      const bool sel = i == m_mc_action;
+      if (sel)
+      {
+        painter.setBrush(TEXT);
+        painter.setPen(Qt::NoPen);
+        painter.drawRoundedRect(r, 14 * k, 14 * k);
+      }
+      painter.setFont(Font(false, int(23 * k), sel ? 600 : 500));
+      const bool danger = (m_mc_confirm_erase && i == 0) || (!m_mc_confirm_erase && i == 2);
+      painter.setPen(sel ? BG : (danger ? DANGER : TEXT));
+      painter.drawText(r.adjusted(24 * k, 0, 0, 0), Qt::AlignVCenter, items[i]);
+      y += 84 * k;
+    }
+  }
+
+  DrawHints(painter,
+            {{QStringLiteral("L"), QString()}, {QStringLiteral("R"), tr("Emplacement")}},
+            {{QStringLiteral("A"), tr("Choisir")}, {QStringLiteral("B"), tr("Retour")}});
 }

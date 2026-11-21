@@ -14,6 +14,17 @@
 
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
+#include "Common/Config/Layer.h"
+#include "Core/HW/GCPad.h"
+#include "Core/HW/GCPadEmu.h"
+#include "InputCommon/ControlReference/ControlReference.h"
+#include "InputCommon/ControllerEmu/Control/Control.h"
+#include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
+#include "InputCommon/ControllerEmu/ControllerEmu.h"
+#include "InputCommon/ControllerEmu/Setting/NumericSetting.h"
+#include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "InputCommon/ControllerInterface/CoreDevice.h"
+#include "InputCommon/InputConfig.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/SYSCONFSettings.h"
@@ -221,6 +232,7 @@ int SfxVolume()
 void SaveBigPictureSettings()
 {
   Config::Save();
+  Pad::GetConfig()->SaveConfig();
   Settings::GetQSettings().sync();
 }
 
@@ -520,6 +532,10 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Choice<EXI>(Tr("Emplacement B"), {}, Config::MAIN_SLOT_B, exi_slots));
     c.items.push_back(Toggle(Tr("Lecture rapide du disque"), Tr("Chargements plus courts."),
                              Config::MAIN_FAST_DISC_SPEED));
+    const auto memcards = host.open_memory_cards;
+    c.items.push_back(Action(Tr("Gestionnaire des cartes mémoire"),
+                             Tr("Copier, déplacer ou effacer les sauvegardes."),
+                             [memcards] { memcards(); }));
     cats.push_back(std::move(c));
   }
 
@@ -559,28 +575,255 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
   // ---- Controllers
   {
     BigPictureSettingCategory c{Tr("Manettes"), {}};
-    using SI = SerialInterface::SIDevices;
-    for (int port = 0; port < 4; ++port)
+    auto port = std::make_shared<int>(0);
+    const auto pad = [port] { return Pad::GetConfig()->GetController(*port); };
+
     {
-      c.items.push_back(Choice<SI>(Tr("Port GameCube %1").arg(port + 1), {},
-                                   Config::GetInfoForSIDevice(port),
-                                   {{SI::SIDEVICE_NONE, Tr("Aucun")},
-                                    {SI::SIDEVICE_GC_CONTROLLER, Tr("Manette standard")},
-                                    {SI::SIDEVICE_WIIU_ADAPTER, Tr("Adaptateur GameCube")},
-                                    {SI::SIDEVICE_GC_KEYBOARD, Tr("Clavier GameCube")},
-                                    {SI::SIDEVICE_GC_GBA_EMULATED, Tr("Game Boy Advance")}}));
-      const auto configure = host.configure_controller;
-      c.items.push_back(Action(Tr("Configurer la manette du port %1").arg(port + 1),
-                               Tr("Appuie sur chaque bouton demandé."),
-                               [configure, port] { configure(port); }));
+      Item item;
+      item.label = Tr("Manette à régler");
+      item.help = Tr("Les réglages ci-dessous s'appliquent à ce port GameCube.");
+      item.kind = Item::Kind::Choice;
+      item.value = [port] { return Tr("Port %1").arg(*port + 1); };
+      item.change = [port](int dir) { *port = (*port + dir + 4) % 4; };
+      item.activate = [port] { *port = (*port + 1) % 4; };
+      c.items.push_back(std::move(item));
     }
-    for (int i = 0; i < 4; ++i)
     {
-      c.items.push_back(Choice<WiimoteSource>(Tr("Wiimote %1").arg(i + 1), {},
-                                              Config::GetInfoForWiimoteSource(i),
-                                              {{WiimoteSource::None, Tr("Aucune")},
-                                               {WiimoteSource::Emulated, Tr("Émulée")},
-                                               {WiimoteSource::Real, Tr("Vraie Wiimote")}}));
+      using SI = SerialInterface::SIDevices;
+      const std::vector<std::pair<SI, QString>> types = {
+          {SI::SIDEVICE_NONE, Tr("Aucun")},
+          {SI::SIDEVICE_GC_CONTROLLER, Tr("Manette standard")},
+          {SI::SIDEVICE_WIIU_ADAPTER, Tr("Adaptateur GameCube")},
+          {SI::SIDEVICE_GC_KEYBOARD, Tr("Clavier GameCube")},
+          {SI::SIDEVICE_GC_GBA_EMULATED, Tr("Game Boy Advance")}};
+      Item item;
+      item.label = Tr("Type d'appareil branché");
+      item.kind = Item::Kind::Choice;
+      item.value = [port, types] {
+        const SI cur = Config::Get(Config::GetInfoForSIDevice(*port));
+        for (const auto& [v, n] : types)
+        {
+          if (v == cur)
+            return n;
+        }
+        return Tr("Autre");
+      };
+      item.change = [port, types](int dir) {
+        const SI cur = Config::Get(Config::GetInfoForSIDevice(*port));
+        int i = 0;
+        for (size_t j = 0; j < types.size(); ++j)
+        {
+          if (types[j].first == cur)
+            i = static_cast<int>(j);
+        }
+        const int n = static_cast<int>(types.size());
+        Config::SetBaseOrCurrent(Config::GetInfoForSIDevice(*port), types[(i + dir + n) % n].first);
+      };
+      item.activate = [change = item.change] { change(1); };
+      c.items.push_back(std::move(item));
+    }
+    {
+      Item item;
+      item.label = Tr("Manette utilisée");
+      item.help = Tr("Choisis parmi les manettes connectées (USB, Bluetooth, XInput, SDL…).");
+      item.kind = Item::Kind::Choice;
+      item.value = [pad] {
+        const auto& dq = pad()->GetDefaultDevice();
+        QString name = QString::fromStdString(dq.name);
+        if (name.size() > 26)
+          name = name.left(24) + QStringLiteral("…");
+        return name.isEmpty() ? Tr("Aucune") : name;
+      };
+      item.change = [pad](int dir) {
+        std::vector<std::string> devices = g_controller_interface.GetAllDeviceStrings();
+        std::erase_if(devices, [](const std::string& d) { return d.rfind("DSUClient", 0) == 0; });
+        if (devices.empty())
+          return;
+        const std::string current = pad()->GetDefaultDevice().ToString();
+        int i = -1;
+        for (size_t j = 0; j < devices.size(); ++j)
+        {
+          if (devices[j] == current)
+            i = static_cast<int>(j);
+        }
+        const int n = static_cast<int>(devices.size());
+        i = i < 0 ? 0 : (i + dir + n) % n;
+        const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+        pad()->SetDefaultDevice(devices[i]);
+        pad()->UpdateReferences(g_controller_interface);
+      };
+      item.activate = [change = item.change] { change(1); };
+      c.items.push_back(std::move(item));
+    }
+    c.items.push_back(Action(Tr("Profil automatique (manette standard)"),
+                             Tr("Xbox, PlayStation, Switch Pro… : A, B, X, Y, gâchettes, sticks "
+                                "et croix réglés d'un coup."),
+                             [port] { ApplyStandardGamepadProfile(*port); }));
+    const auto configure = host.configure_controller;
+    c.items.push_back(Action(Tr("Assistant bouton par bouton"),
+                             Tr("Indispensable pour la manette GameCube Switch 2 et les "
+                                "manettes peu courantes."),
+                             [configure, port] { configure(*port); }));
+
+    // Individual controls
+    struct Ctl
+    {
+      PadGroup group;
+      int index;
+      int mirror;
+      bool flip;
+      const char* label;
+    };
+    static constexpr Ctl controls[] = {
+        {PadGroup::Buttons, 0, -1, false, "Bouton A"},
+        {PadGroup::Buttons, 1, -1, false, "Bouton B"},
+        {PadGroup::Buttons, 2, -1, false, "Bouton X"},
+        {PadGroup::Buttons, 3, -1, false, "Bouton Y"},
+        {PadGroup::Buttons, 4, -1, false, "Bouton Z"},
+        {PadGroup::Buttons, 5, -1, false, "START"},
+        {PadGroup::MainStick, 0, 1, true, "Stick principal : haut / bas"},
+        {PadGroup::MainStick, 3, 2, true, "Stick principal : droite / gauche"},
+        {PadGroup::CStick, 0, 1, true, "Stick C : haut / bas"},
+        {PadGroup::CStick, 3, 2, true, "Stick C : droite / gauche"},
+        {PadGroup::Triggers, 2, 0, false, "Gâchette L"},
+        {PadGroup::Triggers, 3, 1, false, "Gâchette R"},
+        {PadGroup::DPad, 0, -1, false, "Croix : haut"},
+        {PadGroup::DPad, 1, -1, false, "Croix : bas"},
+        {PadGroup::DPad, 2, -1, false, "Croix : gauche"},
+        {PadGroup::DPad, 3, -1, false, "Croix : droite"},
+    };
+    const auto remap = host.remap_control;
+    for (const Ctl& ctl : controls)
+    {
+      Item item;
+      item.label = Tr(ctl.label);
+      item.help = Tr("A : appuie ensuite sur la touche voulue. X : effacer.");
+      item.kind = Item::Kind::Action;
+      item.value = [port, ctl] {
+        std::string expr =
+            Pad::GetGroup(*port, ctl.group)->controls[ctl.index]->control_ref->GetExpression();
+        std::erase(expr, '`');
+        QString q = QString::fromStdString(expr);
+        if (q.size() > 22)
+          q = q.left(20) + QStringLiteral("…");
+        return q.isEmpty() ? Tr("—") : q;
+      };
+      item.activate = [remap, port, ctl] {
+        remap(*port, static_cast<int>(ctl.group), ctl.index, ctl.mirror, ctl.flip,
+              Tr(ctl.label));
+      };
+      item.change = [](int) {};
+      item.clear = [port, ctl] {
+        const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+        auto* group = Pad::GetGroup(*port, ctl.group);
+        (void)group->controls[ctl.index]->control_ref->SetExpression("");
+        if (ctl.mirror >= 0)
+          (void)group->controls[ctl.mirror]->control_ref->SetExpression("");
+        Pad::GetConfig()->GetController(*port)->UpdateReferences(g_controller_interface);
+      };
+      c.items.push_back(std::move(item));
+    }
+
+    // Calibration and dead zones
+    const auto calibrate = host.calibrate_stick;
+    c.items.push_back(Action(Tr("Étalonner le stick principal"),
+                             Tr("Fais tourner le stick doucement le long du bord, plusieurs fois."),
+                             [calibrate, port] {
+                               calibrate(*port, static_cast<int>(PadGroup::MainStick));
+                             }));
+    c.items.push_back(Action(Tr("Étalonner le stick C"),
+                             Tr("Fais tourner le stick doucement le long du bord, plusieurs fois."),
+                             [calibrate, port] {
+                               calibrate(*port, static_cast<int>(PadGroup::CStick));
+                             }));
+    const auto numeric = [port](PadGroup group, const char* ini_name, const QString& label,
+                                const QString& help) {
+      Item item;
+      item.label = label;
+      item.help = help;
+      item.kind = Item::Kind::Choice;
+      const auto find = [port, group, ini_name]() -> ControllerEmu::NumericSetting<double>* {
+        for (auto& setting : Pad::GetGroup(*port, group)->numeric_settings)
+        {
+          if (std::string_view(setting->GetININame()) == ini_name &&
+              setting->GetType() == ControllerEmu::SettingType::Double)
+          {
+            return static_cast<ControllerEmu::NumericSetting<double>*>(setting.get());
+          }
+        }
+        return nullptr;
+      };
+      item.value = [find] {
+        const auto* s = find();
+        return s ? QStringLiteral("%1 %").arg(static_cast<int>(std::lround(s->GetValue()))) :
+                   Tr("—");
+      };
+      item.change = [find](int dir) {
+        if (auto* s = find())
+        {
+          const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+          s->SetValue(std::clamp(std::round(s->GetValue()) + dir * 1.0, 0.0, 50.0));
+        }
+      };
+      item.activate = [] {};
+      return item;
+    };
+    c.items.push_back(numeric(PadGroup::MainStick, "Dead Zone", Tr("Zone morte du stick principal"),
+                              Tr("Ignore les petits mouvements autour du centre (stick qui "
+                                 "dérive).")));
+    c.items.push_back(numeric(PadGroup::CStick, "Dead Zone", Tr("Zone morte du stick C"), {}));
+    c.items.push_back(numeric(PadGroup::Triggers, "Dead Zone", Tr("Zone morte des gâchettes"),
+                              {}));
+    {
+      Item item;
+      item.label = Tr("Seuil des gâchettes (clic L/R)");
+      item.help = Tr("À partir de quelle pression les gâchettes analogiques comptent comme "
+                     "un clic complet.");
+      item.kind = Item::Kind::Choice;
+      const auto find = [port]() -> ControllerEmu::NumericSetting<double>* {
+        for (auto& setting : Pad::GetGroup(*port, PadGroup::Triggers)->numeric_settings)
+        {
+          if (std::string_view(setting->GetININame()) == "Threshold" &&
+              setting->GetType() == ControllerEmu::SettingType::Double)
+          {
+            return static_cast<ControllerEmu::NumericSetting<double>*>(setting.get());
+          }
+        }
+        return nullptr;
+      };
+      item.value = [find] {
+        const auto* st = find();
+        return st ? QStringLiteral("%1 %").arg(static_cast<int>(std::lround(st->GetValue()))) :
+                    Tr("—");
+      };
+      item.change = [find](int dir) {
+        if (auto* st = find())
+        {
+          const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+          st->SetValue(std::clamp(std::round(st->GetValue()) + dir * 5.0, 50.0, 100.0));
+        }
+      };
+      item.activate = [] {};
+      c.items.push_back(std::move(item));
+    }
+    {
+      Item item;
+      item.label = Tr("Vibrations");
+      item.kind = Item::Kind::Toggle;
+      item.is_on = [port] {
+        return !Pad::GetGroup(*port, PadGroup::Rumble)
+                    ->controls[0]
+                    ->control_ref->GetExpression()
+                    .empty();
+      };
+      item.change = [port](int) {
+        auto& ref = Pad::GetGroup(*port, PadGroup::Rumble)->controls[0]->control_ref;
+        const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+        (void)ref->SetExpression(ref->GetExpression().empty() ? "`Motor`" : "");
+        Pad::GetConfig()->GetController(*port)->UpdateReferences(g_controller_interface);
+      };
+      item.activate = [change = item.change] { change(1); };
+      c.items.push_back(std::move(item));
     }
     cats.push_back(std::move(c));
   }
@@ -633,5 +876,229 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     cats.push_back(std::move(c));
   }
 
+  return cats;
+}
+
+// ---------------------------------------------------------------- standard gamepad profile
+
+bool ApplyStandardGamepadProfile(int port)
+{
+  auto* pad = Pad::GetConfig()->GetController(port);
+  if (!pad)
+    return false;
+  const auto is_gamepad = [](const std::string& d) {
+    return d.rfind("SDL/", 0) == 0 || d.rfind("XInput/", 0) == 0 ||
+           d.rfind("WGInput/", 0) == 0 || d.rfind("evdev/", 0) == 0;
+  };
+  std::string device = pad->GetDefaultDevice().ToString();
+  if (!is_gamepad(device) || !g_controller_interface.FindDevice(pad->GetDefaultDevice()))
+  {
+    device.clear();
+    for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+    {
+      if (is_gamepad(d))
+      {
+        device = d;
+        break;
+      }
+    }
+  }
+  if (device.empty())
+    return false;
+
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  pad->SetDefaultDevice(device);
+  const auto set = [port](PadGroup group, int index, const char* expr) {
+    (void)Pad::GetGroup(port, group)->controls[index]->control_ref->SetExpression(expr);
+  };
+  set(PadGroup::Buttons, 0, "`Button A`");
+  set(PadGroup::Buttons, 1, "`Button B`");
+  set(PadGroup::Buttons, 2, "`Button X`");
+  set(PadGroup::Buttons, 3, "`Button Y`");
+  set(PadGroup::Buttons, 4, "`Shoulder R`");
+  set(PadGroup::Buttons, 5, "`Start`");
+  set(PadGroup::MainStick, 0, "`Left Y+`");
+  set(PadGroup::MainStick, 1, "`Left Y-`");
+  set(PadGroup::MainStick, 2, "`Left X-`");
+  set(PadGroup::MainStick, 3, "`Left X+`");
+  set(PadGroup::CStick, 0, "`Right Y+`");
+  set(PadGroup::CStick, 1, "`Right Y-`");
+  set(PadGroup::CStick, 2, "`Right X-`");
+  set(PadGroup::CStick, 3, "`Right X+`");
+  set(PadGroup::Triggers, 0, "`Trigger L`");
+  set(PadGroup::Triggers, 1, "`Trigger R`");
+  set(PadGroup::Triggers, 2, "`Trigger L`");
+  set(PadGroup::Triggers, 3, "`Trigger R`");
+  set(PadGroup::DPad, 0, "`Pad N`");
+  set(PadGroup::DPad, 1, "`Pad S`");
+  set(PadGroup::DPad, 2, "`Pad W`");
+  set(PadGroup::DPad, 3, "`Pad E`");
+  set(PadGroup::Rumble, 0, device.rfind("XInput/", 0) == 0 ? "`Motor L`" : "`Motor`");
+  pad->UpdateReferences(g_controller_interface);
+  Pad::GetConfig()->SaveConfig();
+  return true;
+}
+
+// ---------------------------------------------------------------- per-game settings
+
+namespace
+{
+template <typename T>
+Item GameChoice(const std::shared_ptr<Config::Layer>& layer, const QString& label,
+                const QString& help, const Config::Info<T>& info,
+                std::vector<std::pair<T, QString>> options)
+{
+  Item item;
+  item.label = label;
+  item.help = help;
+  item.kind = Item::Kind::Choice;
+  const auto* p = &info;
+  auto opts = std::make_shared<std::vector<std::pair<T, QString>>>(std::move(options));
+  const auto name_of = [opts](const T& v) {
+    for (const auto& [value, name] : *opts)
+    {
+      if (value == v)
+        return name;
+    }
+    return Tr("Personnalisé");
+  };
+  // -1 = follows the global setting
+  const auto index = [layer, p, opts]() -> int {
+    const std::optional<T> v = layer->Get<T>(p->GetLocation());
+    if (!v)
+      return -1;
+    for (size_t i = 0; i < opts->size(); ++i)
+    {
+      if ((*opts)[i].first == *v)
+        return static_cast<int>(i);
+    }
+    return 0;
+  };
+  item.value = [layer, p, name_of, index] {
+    const int i = index();
+    if (i < 0)
+      return Tr("Global (%1)").arg(name_of(Config::Get(*p)));
+    return name_of(*layer->Get<T>(p->GetLocation()));
+  };
+  item.change = [layer, p, opts, index](int dir) {
+    const int n = static_cast<int>(opts->size()) + 1;
+    const int i = (index() + 1 + dir + n) % n - 1;
+    if (i < 0)
+      (void)layer->DeleteKey(p->GetLocation());
+    else
+      (void)layer->Set(*p, (*opts)[i].first);
+  };
+  item.activate = [change = item.change] { change(1); };
+  return item;
+}
+
+Item GameBool(const std::shared_ptr<Config::Layer>& layer, const QString& label,
+              const QString& help, const Config::Info<bool>& info, bool inverted = false)
+{
+  return GameChoice<bool>(layer, label, help, info,
+                          {{!inverted, Tr("Activé")}, {inverted, Tr("Désactivé")}});
+}
+}  // namespace
+
+std::vector<BigPictureSettingCategory>
+BuildBigPictureGameSettings(const std::shared_ptr<Config::Layer>& layer)
+{
+  std::vector<BigPictureSettingCategory> cats;
+  {
+    BigPictureSettingCategory c{Tr("Graphismes"), {}};
+    c.items.push_back(GameChoice<int>(layer, Tr("Résolution interne"), {}, Config::GFX_EFB_SCALE,
+                                      {{0, Tr("Auto (fenêtre)")},
+                                       {1, Tr("Native (480p)")},
+                                       {2, Tr("2× (720p)")},
+                                       {3, Tr("3× (1080p)")},
+                                       {4, Tr("4× (1440p)")},
+                                       {5, Tr("5× (1800p)")},
+                                       {6, Tr("6× (4K)")},
+                                       {8, Tr("8× (5K)")}}));
+    c.items.push_back(GameChoice<u32>(layer, Tr("Anticrénelage (MSAA)"), {}, Config::GFX_MSAA,
+                                      {{1, Tr("Aucun")},
+                                       {2, Tr("2×")},
+                                       {4, Tr("4×")},
+                                       {8, Tr("8×")}}));
+    c.items.push_back(GameBool(layer, Tr("Suréchantillonnage (SSAA)"),
+                               Tr("Avec l'anticrénelage : bien plus beau, bien plus lourd."),
+                               Config::GFX_SSAA));
+    c.items.push_back(GameChoice<AnisotropicFilteringMode>(
+        layer, Tr("Filtrage anisotrope"), {}, Config::GFX_ENHANCE_MAX_ANISOTROPY,
+        {{AnisotropicFilteringMode::Default, Tr("Par défaut du jeu")},
+         {AnisotropicFilteringMode::Force2x, Tr("2×")},
+         {AnisotropicFilteringMode::Force4x, Tr("4×")},
+         {AnisotropicFilteringMode::Force8x, Tr("8×")},
+         {AnisotropicFilteringMode::Force16x, Tr("16×")}}));
+    c.items.push_back(GameChoice<AspectMode>(layer, Tr("Format d'image"), {},
+                                             Config::GFX_ASPECT_RATIO,
+                                             {{AspectMode::Auto, Tr("Auto")},
+                                              {AspectMode::ForceWide, Tr("16:9 forcé")},
+                                              {AspectMode::ForceStandard, Tr("4:3 forcé")},
+                                              {AspectMode::Stretch, Tr("Étirer")}}));
+    c.items.push_back(GameBool(layer, Tr("Écran large forcé (hack)"), {},
+                               Config::GFX_WIDESCREEN_HACK));
+    c.items.push_back(GameChoice<ShaderCompilationMode>(
+        layer, Tr("Compilation des shaders"), {}, Config::GFX_SHADER_COMPILATION_MODE,
+        {{ShaderCompilationMode::Synchronous, Tr("Synchrone")},
+         {ShaderCompilationMode::SynchronousUberShaders, Tr("Ubershaders (synchrone)")},
+         {ShaderCompilationMode::AsynchronousUberShaders, Tr("Ubershaders (asynchrone)")},
+         {ShaderCompilationMode::AsynchronousSkipRendering, Tr("Asynchrone")}}));
+    c.items.push_back(GameChoice<TextureFilteringMode>(
+        layer, Tr("Filtrage des textures"), {}, Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING,
+        {{TextureFilteringMode::Default, Tr("Par défaut")},
+         {TextureFilteringMode::Nearest, Tr("Plus proche")},
+         {TextureFilteringMode::Linear, Tr("Linéaire")}}));
+    c.items.push_back(GameBool(layer, Tr("Éclairage par pixel"), {},
+                               Config::GFX_ENABLE_PIXEL_LIGHTING));
+    c.items.push_back(GameBool(layer, Tr("Couleurs 24 bits forcées"), {},
+                               Config::GFX_ENHANCE_FORCE_TRUE_COLOR));
+    c.items.push_back(GameBool(layer, Tr("Désactiver le filtre de copie"), {},
+                               Config::GFX_ENHANCE_DISABLE_COPY_FILTER));
+    c.items.push_back(GameBool(layer, Tr("Désactiver le brouillard"), {}, Config::GFX_DISABLE_FOG));
+    c.items.push_back(GameBool(layer, Tr("Textures HD personnalisées"), {},
+                               Config::GFX_HIRES_TEXTURES));
+    cats.push_back(std::move(c));
+  }
+  {
+    BigPictureSettingCategory c{Tr("Hacks graphiques"), {}};
+    c.items.push_back(GameChoice<int>(layer, Tr("Précision du cache de textures"), {},
+                                      Config::GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES,
+                                      {{0, Tr("Sûr")}, {512, Tr("Moyen")}, {128, Tr("Rapide")}}));
+    c.items.push_back(GameBool(layer, Tr("Ignorer l'accès EFB depuis le CPU"), {},
+                               Config::GFX_HACK_EFB_ACCESS_ENABLE, true));
+    c.items.push_back(GameBool(layer, Tr("Ignorer les changements de format"), {},
+                               Config::GFX_HACK_EFB_EMULATE_FORMAT_CHANGES, true));
+    c.items.push_back(GameBool(layer, Tr("Copies EFB vers texture uniquement"), {},
+                               Config::GFX_HACK_SKIP_EFB_COPY_TO_RAM));
+    c.items.push_back(GameBool(layer, Tr("Copies XFB vers texture uniquement"), {},
+                               Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM));
+    c.items.push_back(GameBool(layer, Tr("Mode XFB immédiat"), {}, Config::GFX_HACK_IMMEDIATE_XFB));
+    c.items.push_back(GameBool(layer, Tr("Copies EFB à l'échelle"), {},
+                               Config::GFX_HACK_COPY_EFB_SCALED));
+    c.items.push_back(GameBool(layer, Tr("Arrondi des sommets"), {},
+                               Config::GFX_HACK_VERTEX_ROUNDING));
+    c.items.push_back(GameBool(layer, Tr("Boîte englobante (bounding box)"), {},
+                               Config::GFX_HACK_BBOX_ENABLE));
+    cats.push_back(std::move(c));
+  }
+  {
+    BigPictureSettingCategory c{Tr("Émulation"), {}};
+    c.items.push_back(GameBool(layer, Tr("Double cœur"), {}, Config::MAIN_CPU_THREAD));
+    c.items.push_back(GameBool(layer, Tr("MMU"), {}, Config::MAIN_MMU));
+    c.items.push_back(GameBool(layer, Tr("Synchroniser le GPU"), {}, Config::MAIN_SYNC_GPU));
+    c.items.push_back(GameBool(layer, Tr("Émulation DSP rapide (HLE)"), {}, Config::MAIN_DSP_HLE));
+    c.items.push_back(GameBool(layer, Tr("Lecture rapide du disque"), {},
+                               Config::MAIN_FAST_DISC_SPEED));
+    c.items.push_back(GameBool(layer, Tr("Overclock du processeur"), {},
+                               Config::MAIN_OVERCLOCK_ENABLE));
+    c.items.push_back(GameChoice<float>(layer, Tr("Niveau d'overclock"), {}, Config::MAIN_OVERCLOCK,
+                                        {{0.5f, Percent(0.5f)},
+                                         {1.0f, Percent(1.0f)},
+                                         {1.5f, Percent(1.5f)},
+                                         {2.0f, Percent(2.0f)},
+                                         {3.0f, Percent(3.0f)}}));
+    cats.push_back(std::move(c));
+  }
   return cats;
 }

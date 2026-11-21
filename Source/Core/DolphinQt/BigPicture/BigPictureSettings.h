@@ -6,6 +6,8 @@
 #pragma once
 
 #include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <QString>
@@ -26,6 +28,7 @@ struct BigPictureSettingItem
   std::function<bool()> is_on;      // Toggle: current state
   std::function<void(int)> change;  // Left/Right (-1/+1). Toggles flip.
   std::function<void()> activate;   // A button (actions; toggles flip; choices step forward)
+  std::function<void()> clear;      // X button (optional), e.g. unmap a control
 };
 
 struct BigPictureSettingCategory
@@ -38,9 +41,20 @@ struct BigPictureSettingCategory
 struct BigPictureSettingsHost
 {
   std::function<void(int port)> configure_controller;
+  // Map one control: group is a PadGroup, mirror_index/flip as in the setup wizard.
+  std::function<void(int port, int group, int index, int mirror_index, bool flip,
+                     const QString& prompt)>
+      remap_control;
+  std::function<void(int port, int group)> calibrate_stick;
+  std::function<void()> open_memory_cards;
   std::function<void()> open_classic;
   std::function<void()> interface_changed;  // a controller-mode preference changed
 };
+
+namespace Config
+{
+class Layer;
+}
 
 // Controller-mode preferences (stored in Qt settings, "bigpicture/...").
 namespace BigPicturePrefs
@@ -77,5 +91,12 @@ int SfxVolume();    // 0-100
 
 std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureSettingsHost& host);
 
+// Per-game settings, written to the game's INI in GameSettings (layer kept alive by the caller).
+std::vector<BigPictureSettingCategory>
+BuildBigPictureGameSettings(const std::shared_ptr<Config::Layer>& layer);
+
 // Writes changed settings to disk.
 void SaveBigPictureSettings();
+
+// Applies a standard gamepad layout (Xbox / PlayStation / Switch Pro…) to a GameCube port.
+bool ApplyStandardGamepadProfile(int port);

@@ -5,7 +5,9 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <QColor>
@@ -37,6 +39,21 @@ class GameFile;
 namespace ciface::Core
 {
 class InputDetector;
+}
+
+namespace ciface::MappingCommon
+{
+class CalibrationBuilder;
+}
+
+namespace Memcard
+{
+class GCMemcard;
+}
+
+namespace Config
+{
+class Layer;
 }
 
 class BigPictureWindow final : public QWidget
@@ -93,6 +110,32 @@ private:
     Setup,
     InGame,  // hidden, a game is running
     Pause,
+    Launching,     // loading screen while the game boots
+    FadingOut,     // the menu fades away, revealing the game
+    Remap,         // waiting for one control
+    Calibrate,     // stick calibration
+    Memcard,       // memory card manager
+    GameSettings,  // per-game settings
+  };
+
+  struct SaveIcon
+  {
+    u8 index = 0;
+    QString title;
+    QString comment;
+    u16 blocks = 0;
+    QPixmap banner;
+    std::vector<QPixmap> frames;
+    std::vector<int> delays;  // in 1/60 s
+  };
+
+  struct CardView
+  {
+    QString path;
+    QString error;
+    std::unique_ptr<Memcard::GCMemcard> card;
+    std::vector<SaveIcon> saves;
+    u16 free_blocks = 0;
   };
 
   enum class Tab
@@ -142,6 +185,32 @@ private:
   void UpdateSetup();
   void FinishSetup(bool save);
   bool NeedsSetup() const;
+
+  // ---- remap / calibration
+  void StartRemap(int port, int group, int index, int mirror, bool flip, const QString& prompt);
+  void StartRemapDetection();
+  void UpdateRemap();
+  void FinishRemap(bool ok);
+  void StartCalibration(int port, int group);
+  void UpdateCalibration();
+  void FinishCalibration(bool apply);
+  void DrawRemap(QPainter& painter);
+  void DrawCalibration(QPainter& painter);
+
+  // ---- memory cards
+  void OpenMemcards();
+  void LoadCard(int slot);
+  void HandleMemcard(Action action);
+  void DrawMemcards(QPainter& painter);
+
+  // ---- per-game settings
+  void OpenGameSettings();
+  std::vector<BigPictureSettingCategory>& Cats();
+
+  // ---- pause screenshots
+  QString PauseShotPath() const;
+  QString SlotThumbPath(int slot) const;
+  void LoadSlotThumbs();
 
   // ---- animation
   void Tick();
@@ -257,4 +326,36 @@ private:
   QHash<QString, QPixmap> m_banner_cache;
   QHash<QString, QColor> m_ambient_cache;
   QHash<QString, QPixmap> m_icons;
+
+  // remap
+  int m_remap_port = 0, m_remap_group = 0, m_remap_index = 0, m_remap_mirror = -1;
+  bool m_remap_flip = false;
+  QString m_remap_prompt;
+  Mode m_mode_before_remap = Mode::Library;
+  qint64 m_remap_started = 0;
+
+  // calibration
+  int m_cal_port = 0, m_cal_group = 0;
+  std::unique_ptr<ciface::MappingCommon::CalibrationBuilder> m_calibrator;
+  qreal m_cal_x = 0, m_cal_y = 0;
+
+  // memory cards
+  std::array<CardView, 2> m_cards;
+  int m_mc_card = 0;
+  int m_mc_index = 0;
+  bool m_mc_actions_open = false;
+  bool m_mc_confirm_erase = false;
+  int m_mc_action = 0;
+  Mode m_mode_before_memcard = Mode::Library;
+
+  // per-game settings
+  std::shared_ptr<Config::Layer> m_game_layer;
+  std::vector<BigPictureSettingCategory> m_game_settings;
+  QString m_game_settings_title;
+
+  // loading / fading
+  qreal m_fade_out = 0;  // FadingOut progress
+  qreal m_fade_in = 1;   // black veil after returning from a game (1 = done)
+  qreal m_window_opacity = 1;
+  std::array<QPixmap, 9> m_slot_thumbs;
 };
