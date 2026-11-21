@@ -52,13 +52,19 @@ public:
 
   static std::string SoundDirectory();
 
-private:
-  using Clip = std::vector<float>;  // interleaved stereo, 48 kHz
+  struct Clip
+  {
+    std::vector<s16> samples;  // interleaved stereo, at the file's own rate
+    double step = 1.0;         // source frames per output frame
+    size_t Frames() const { return samples.size() / 2; }
+    bool empty() const { return samples.empty(); }
+  };
 
+private:
   struct Voice
   {
     const Clip* clip;
-    size_t pos;
+    double pos;
   };
 
   void LoadAll();
@@ -74,7 +80,7 @@ private:
 
   std::mutex m_mutex;
   std::vector<Voice> m_voices;
-  size_t m_music_pos = 0;
+  double m_music_pos = 0;
   bool m_music_on = false;
   float m_music_gain = 0.0f;
 

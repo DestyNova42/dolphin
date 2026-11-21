@@ -57,46 +57,51 @@ std::string Lower(std::string s)
   return s;
 }
 
-// Decodes a FLAC file to interleaved stereo at OUTPUT_RATE.
-std::vector<float> DecodeFlac(const std::filesystem::path& path)
+// Decodes a FLAC file to interleaved stereo 16-bit at its own rate (resampled while mixing).
+BigPictureAudio::Clip DecodeFlac(const std::filesystem::path& path)
 {
-  unsigned int channels = 0;
-  unsigned int rate = 0;
-  drflac_uint64 frames = 0;
 #ifdef _WIN32
-  float* data = drflac_open_file_and_read_pcm_frames_f32_w(path.wstring().c_str(), &channels,
-                                                           &rate, &frames, nullptr);
+  drflac* flac = drflac_open_file_w(path.wstring().c_str(), nullptr);
 #else
-  float* data = drflac_open_file_and_read_pcm_frames_f32(path.string().c_str(), &channels, &rate,
-                                                         &frames, nullptr);
+  drflac* flac = drflac_open_file(path.string().c_str(), nullptr);
 #endif
-  std::vector<float> out;
-  if (!data || channels == 0 || rate == 0 || frames == 0)
+  BigPictureAudio::Clip clip;
+  if (!flac)
+    return clip;
+  const unsigned int channels = flac->channels;
+  const unsigned int rate = flac->sampleRate;
+  const drflac_uint64 total = flac->totalPCMFrameCount;
+  if (channels == 0 || rate == 0 || total == 0)
   {
-    if (data)
-      drflac_free(data, nullptr);
-    return out;
+    drflac_close(flac);
+    return clip;
   }
+  std::vector<drflac_int16> data(static_cast<size_t>(total) * channels);
+  const drflac_uint64 frames = drflac_read_pcm_frames_s16(flac, total, data.data());
+  drflac_close(flac);
 
-  const double step = static_cast<double>(rate) / OUTPUT_RATE;
-  const size_t out_frames = static_cast<size_t>(frames / step);
-  out.resize(out_frames * 2);
-  for (size_t i = 0; i < out_frames; ++i)
+  clip.step = static_cast<double>(rate) / OUTPUT_RATE;
+  clip.samples.resize(static_cast<size_t>(frames) * 2);
+  for (size_t i = 0; i < frames; ++i)
   {
-    const double src = i * step;
-    const size_t a = static_cast<size_t>(src);
-    const size_t b = std::min<size_t>(a + 1, frames - 1);
-    const float t = static_cast<float>(src - a);
-    for (int c = 0; c < 2; ++c)
-    {
-      const unsigned int sc = std::min<unsigned int>(c, channels - 1);
-      const float va = data[a * channels + sc];
-      const float vb = data[b * channels + sc];
-      out[i * 2 + c] = va + (vb - va) * t;
-    }
+    clip.samples[i * 2] = data[i * channels];
+    clip.samples[i * 2 + 1] = data[i * channels + (channels > 1 ? 1 : 0)];
   }
-  drflac_free(data, nullptr);
-  return out;
+  return clip;
+}
+
+// Linear interpolation of a stereo frame at a fractional position.
+inline void Sample(const BigPictureAudio::Clip& clip, double pos, float* l, float* r)
+{
+  const size_t frames = clip.Frames();
+  const size_t a = static_cast<size_t>(pos);
+  const size_t b = a + 1 < frames ? a + 1 : a;
+  const float t = static_cast<float>(pos - static_cast<double>(a));
+  constexpr float scale = 1.0f / 32768.0f;
+  const float la = clip.samples[a * 2] * scale, lb = clip.samples[b * 2] * scale;
+  const float ra = clip.samples[a * 2 + 1] * scale, rb = clip.samples[b * 2 + 1] * scale;
+  *l = la + (lb - la) * t;
+  *r = ra + (rb - ra) * t;
 }
 }  // namespace
 
@@ -168,7 +173,7 @@ void BigPictureAudio::Play(Sound sound)
   std::lock_guard lk(m_mutex);
   // Navigation sounds cut the previous instance instead of piling up.
   std::erase_if(m_voices, [&](const Voice& v) { return v.clip == &clip; });
-  m_voices.push_back({&clip, 0});
+  m_voices.push_back({&clip, 0.0});
 }
 
 void BigPictureAudio::StartMusic()
@@ -191,10 +196,10 @@ long BigPictureAudio::Mix(float* out, long frames)
 
   if (!m_music.empty() && (m_music_on || m_music_gain > 0.0f))
   {
-    const size_t music_frames = m_music.size() / 2;
+    const double music_frames = static_cast<double>(m_music.Frames());
     for (long i = 0; i < frames; ++i)
     {
-      // ~0.5 s fades in and out
+      // short fades in and out
       const float target = m_music_on ? 1.0f : 0.0f;
       m_music_gain += (target - m_music_gain) * 0.0001f;
       if (!m_music_on && m_music_gain < 0.001f)
@@ -202,24 +207,31 @@ long BigPictureAudio::Mix(float* out, long frames)
         m_music_gain = 0.0f;
         break;
       }
+      float l, r;
+      Sample(m_music, m_music_pos, &l, &r);
       const float g = m_music_gain * MUSIC_VOLUME;
-      out[i * 2] += m_music[m_music_pos * 2] * g;
-      out[i * 2 + 1] += m_music[m_music_pos * 2 + 1] * g;
-      if (++m_music_pos >= music_frames)
+      out[i * 2] += l * g;
+      out[i * 2 + 1] += r * g;
+      m_music_pos += m_music.step;
+      if (m_music_pos >= music_frames - 1)
         m_music_pos = 0;
     }
   }
 
   for (Voice& v : m_voices)
   {
-    const size_t clip_frames = v.clip->size() / 2;
-    for (long i = 0; i < frames && v.pos < clip_frames; ++i, ++v.pos)
+    const double clip_frames = static_cast<double>(v.clip->Frames()) - 1;
+    for (long i = 0; i < frames && v.pos < clip_frames; ++i, v.pos += v.clip->step)
     {
-      out[i * 2] += (*v.clip)[v.pos * 2] * SFX_VOLUME;
-      out[i * 2 + 1] += (*v.clip)[v.pos * 2 + 1] * SFX_VOLUME;
+      float l, r;
+      Sample(*v.clip, v.pos, &l, &r);
+      out[i * 2] += l * SFX_VOLUME;
+      out[i * 2 + 1] += r * SFX_VOLUME;
     }
   }
-  std::erase_if(m_voices, [](const Voice& v) { return v.pos >= v.clip->size() / 2; });
+  std::erase_if(m_voices, [](const Voice& v) {
+    return v.pos >= static_cast<double>(v.clip->Frames()) - 1;
+  });
 
   for (long i = 0; i < frames * 2; ++i)
     out[i] = std::clamp(out[i], -1.0f, 1.0f);
