@@ -9,6 +9,8 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 180
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,11 +26,19 @@ jobs:
         with:
           arch: x64
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Configure
-        run: cmake --preset ninja-release-x64 -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+        run: >
+          cmake --preset ninja-release-x64 -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build
         run: cmake --build --preset ninja-build-release-x64 --target dolphin-emu
+
+      - name: sccache stats
+        run: sccache --show-stats
 
       - name: Package
         shell: pwsh

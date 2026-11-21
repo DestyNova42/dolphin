@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <map>
 
 #include <QFont>
@@ -19,10 +20,23 @@
 #include "Common/FileUtil.h"
 #include "Core/Core.h"
 #include "Core/HW/GCPad.h"
+#include "Core/HW/GCPadEmu.h"
+#include "Core/HotkeyManager.h"
+#include "Common/Config/Config.h"
+#include "InputCommon/ControllerInterface/DualShockUDPClient/DualShockUDPClient.h"
 #include "Core/System.h"
 #include "DiscIO/Enums.h"
 #include "DolphinQt/GameList/GameListModel.h"
+#include "DolphinQt/Settings.h"
+#include "InputCommon/ControlReference/ControlReference.h"
+#include "InputCommon/ControllerEmu/Control/Control.h"
+#include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
+#include "InputCommon/ControllerEmu/ControllerEmu.h"
+#include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "InputCommon/ControllerInterface/CoreDevice.h"
+#include "InputCommon/ControllerInterface/MappingCommon.h"
 #include "InputCommon/GCPadStatus.h"
+#include "InputCommon/InputConfig.h"
 #include "UICommon/GameFile.h"
 
 namespace
@@ -44,6 +58,80 @@ constexpr u32 Bit(int action)
 {
   return 1u << action;
 }
+
+struct SetupStep
+{
+  PadGroup group;
+  int index;
+  const char* prompt;
+  const char* icon;
+  int mirror_index;  // opposite direction for sticks, digital twin for triggers (-1 = none)
+  bool flip;         // mirror by flipping the axis sign
+};
+
+constexpr SetupStep SETUP_STEPS[] = {
+    {PadGroup::Buttons, 0, "Appuie sur A", "A", -1, false},
+    {PadGroup::Buttons, 1, "Appuie sur B", "B", -1, false},
+    {PadGroup::Buttons, 2, "Appuie sur X", "X", -1, false},
+    {PadGroup::Buttons, 3, "Appuie sur Y", "Y", -1, false},
+    {PadGroup::Buttons, 4, "Appuie sur Z", "Z", -1, false},
+    {PadGroup::Buttons, 5, "Appuie sur START", "Start-Pause", -1, false},
+    {PadGroup::MainStick, 0, "Pousse le stick principal vers le HAUT", "Control_Stick", 1, true},
+    {PadGroup::MainStick, 3, "Pousse le stick principal vers la DROITE", "Control_Stick", 2, true},
+    {PadGroup::CStick, 0, "Pousse le stick C vers le HAUT", "C-Stick", 1, true},
+    {PadGroup::CStick, 3, "Pousse le stick C vers la DROITE", "C-Stick", 2, true},
+    {PadGroup::Triggers, 2, "Enfonce la gâchette L à fond", "L", 0, false},
+    {PadGroup::Triggers, 3, "Enfonce la gâchette R à fond", "R", 1, false},
+    {PadGroup::DPad, 0, "Croix directionnelle : HAUT", "D-Pad", -1, false},
+    {PadGroup::DPad, 1, "Croix directionnelle : BAS", "D-Pad", -1, false},
+    {PadGroup::DPad, 2, "Croix directionnelle : GAUCHE", "D-Pad", -1, false},
+    {PadGroup::DPad, 3, "Croix directionnelle : DROITE", "D-Pad", -1, false},
+};
+constexpr int SETUP_STEP_COUNT = static_cast<int>(std::size(SETUP_STEPS));
+
+// "`Left Y-`" -> "`Left Y+`"
+std::string FlipAxis(std::string expr)
+{
+  for (size_t i = expr.size(); i-- > 0;)
+  {
+    if (expr[i] == '+' || expr[i] == '-')
+    {
+      expr[i] = expr[i] == '+' ? '-' : '+';
+      break;
+    }
+  }
+  return expr;
+}
+
+ControllerEmu::EmulatedController* Port1()
+{
+  return Pad::GetConfig()->GetController(0);
+}
+
+// The external frontend tried before this mode existed routed hotkeys through a DSU server
+// ("DSUClient/1/GC"). Without that program, those hotkeys are dead: restore the defaults.
+void CleanupLegacyFrontendConfig()
+{
+  namespace DSU = ciface::DualShockUDPClient::Settings;
+  const std::string legacy_entry = "GC:127.0.0.1:26760;";
+  std::string servers = Config::Get(DSU::SERVERS);
+  if (const size_t pos = servers.find(legacy_entry); pos != std::string::npos)
+  {
+    servers.erase(pos, legacy_entry.size());
+    Config::SetBase(DSU::SERVERS, servers);
+    if (servers.empty())
+      Config::SetBase(DSU::SERVERS_ENABLED, false);
+  }
+
+  auto* hotkeys = HotkeyManagerEmu::GetConfig()->GetController(0);
+  if (hotkeys && hotkeys->GetDefaultDevice().source == "DSUClient")
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    hotkeys->LoadDefaults(g_controller_interface);
+    hotkeys->UpdateReferences(g_controller_interface);
+    HotkeyManagerEmu::GetConfig()->SaveConfig();
+  }
+}
 }  // namespace
 
 BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
@@ -60,7 +148,8 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
   for (const QString& name : {QStringLiteral("A"), QStringLiteral("B"), QStringLiteral("X"),
                               QStringLiteral("Y"), QStringLiteral("Z"), QStringLiteral("L"),
                               QStringLiteral("R"), QStringLiteral("Start-Pause"),
-                              QStringLiteral("D-Pad"), QStringLiteral("Control_Stick")})
+                              QStringLiteral("D-Pad"), QStringLiteral("Control_Stick"),
+                              QStringLiteral("C-Stick")})
   {
     auto* renderer = new QSvgRenderer(icon_dir + name + QStringLiteral(".svg"), this);
     if (renderer->isValid())
@@ -76,6 +165,19 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
   m_anim_timer = new QTimer(this);
   m_anim_timer->setInterval(16);
   connect(m_anim_timer, &QTimer::timeout, this, &BigPictureWindow::Tick);
+
+  m_setup_timer = new QTimer(this);
+  m_setup_timer->setInterval(10);
+  connect(m_setup_timer, &QTimer::timeout, this, &BigPictureWindow::UpdateSetup);
+
+  // Devices are enumerated asynchronously at startup: check a bit later whether port 1 works.
+  m_setup_check_timer = new QTimer(this);
+  m_setup_check_timer->setSingleShot(true);
+  m_setup_check_timer->setInterval(2500);
+  connect(m_setup_check_timer, &QTimer::timeout, this, [this] {
+    if (m_active && isVisible() && m_mode == Mode::Library && NeedsSetup())
+      StartSetup();
+  });
 
   m_rebuild_timer = new QTimer(this);
   m_rebuild_timer->setSingleShot(true);
@@ -98,6 +200,12 @@ BigPictureWindow::~BigPictureWindow() = default;
 
 void BigPictureWindow::Open()
 {
+  static bool s_cleaned_up = false;
+  if (!s_cleaned_up)
+  {
+    s_cleaned_up = true;
+    CleanupLegacyFrontendConfig();
+  }
   m_active = true;
   m_mode = Mode::Library;
   // Ignore buttons that are still held (e.g. the one used to quit the game).
@@ -108,10 +216,13 @@ void BigPictureWindow::Open()
   setFocus();
   m_poll_timer->start();
   m_anim_timer->start();
+  m_setup_check_timer->start();
 }
 
 void BigPictureWindow::Suspend()
 {
+  if (m_mode == Mode::Setup)
+    FinishSetup(false);
   m_poll_timer->stop();
   m_anim_timer->stop();
   hide();
@@ -199,6 +310,9 @@ void BigPictureWindow::PollController()
   if (!Core::IsUninitialized(Core::System::GetInstance()))
     return;
 
+  if (m_mode == Mode::Setup)
+    return;
+
   const GCPadStatus pad = Pad::GetStatus(0);
 
   u32 held = m_key_held;
@@ -251,6 +365,12 @@ void BigPictureWindow::keyPressEvent(QKeyEvent* event)
 {
   if (event->isAutoRepeat())
     return;
+  if (m_mode == Mode::Setup)
+  {
+    if (event->key() == Qt::Key_Escape)
+      FinishSetup(false);
+    return;
+  }
   switch (event->key())
   {
   case Qt::Key_Up:
@@ -350,7 +470,7 @@ void BigPictureWindow::HandleAction(Action action)
 
   case Mode::Menu:
   {
-    constexpr int ITEMS = 3;
+    constexpr int ITEMS = 4;
     switch (action)
     {
     case Action::Down:
@@ -366,8 +486,10 @@ void BigPictureWindow::HandleAction(Action action)
     case Action::Accept:
       m_mode = Mode::Library;
       if (m_menu_index == 1)
-        emit ClassicRequested();
+        StartSetup();
       else if (m_menu_index == 2)
+        emit ClassicRequested();
+      else if (m_menu_index == 3)
         emit QuitRequested();
       break;
     default:
@@ -375,6 +497,9 @@ void BigPictureWindow::HandleAction(Action action)
     }
     break;
   }
+
+  case Mode::Setup:
+    break;
 
   case Mode::ConfirmQuit:
     if (action == Action::Accept)
@@ -465,6 +590,12 @@ void BigPictureWindow::paintEvent(QPaintEvent*)
   bg.setColorAt(0, BG_TOP);
   bg.setColorAt(1, BG_BOTTOM);
   painter.fillRect(rect(), bg);
+
+  if (m_mode == Mode::Setup)
+  {
+    DrawSetup(painter);
+    return;
+  }
 
   DrawLibrary(painter);
 
@@ -600,15 +731,15 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
   const qreal k = height() / 1080.0;
   painter.fillRect(rect(), QColor(0, 0, 0, 190));
 
-  const QString items[] = {tr("Retour à la bibliothèque"), tr("Interface classique"),
-                           tr("Quitter Dolphin")};
+  const QString items[] = {tr("Retour à la bibliothèque"), tr("Configurer la manette"),
+                           tr("Interface classique"), tr("Quitter Dolphin")};
   QFont font = painter.font();
   font.setPixelSize(int(34 * k));
   painter.setFont(font);
   const qreal w = 760 * k;
   const qreal item_h = 76 * k;
-  qreal y = height() / 2.0 - item_h * 1.5;
-  for (int i = 0; i < 3; ++i)
+  qreal y = height() / 2.0 - item_h * 2;
+  for (int i = 0; i < 4; ++i)
   {
     const QRectF r((width() - w) / 2, y, w, item_h - 12 * k);
     if (i == m_menu_index)
@@ -654,4 +785,182 @@ void BigPictureWindow::DrawDialog(QPainter& painter, const QString& title,
                      Qt::AlignVCenter | Qt::AlignLeft, label);
     x += 200 * k;
   }
+}
+
+// ------------------------------------------------------------------ controller setup
+
+bool BigPictureWindow::NeedsSetup() const
+{
+  auto* pad = Port1();
+  if (!pad)
+    return false;
+  const auto& dq = pad->GetDefaultDevice();
+  if (dq.source == "DSUClient")
+    return true;
+  return g_controller_interface.FindDevice(dq) == nullptr;
+}
+
+void BigPictureWindow::StartSetup()
+{
+  auto* pad = Port1();
+  if (!pad)
+    return;
+  m_mode = Mode::Setup;
+  m_setup_step = 0;
+  m_setup_device_chosen = false;
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    for (PadGroup group :
+         {PadGroup::Buttons, PadGroup::MainStick, PadGroup::CStick, PadGroup::Triggers,
+          PadGroup::DPad})
+    {
+      for (auto& control : Pad::GetGroup(0, group)->controls)
+        (void)control->control_ref->SetExpression("");
+    }
+  }
+  StartSetupStep();
+  m_setup_timer->start();
+  update();
+}
+
+void BigPictureWindow::StartSetupStep()
+{
+  std::vector<std::string> devices;
+  if (m_setup_device_chosen)
+  {
+    devices.push_back(Port1()->GetDefaultDevice().ToString());
+  }
+  else
+  {
+    // First button: listen to every controller except the keyboard and DSU clients.
+    for (const std::string& dev : g_controller_interface.GetAllDeviceStrings())
+    {
+      if (dev.find("Keyboard") != std::string::npos || dev.rfind("DSUClient", 0) == 0)
+        continue;
+      devices.push_back(dev);
+    }
+  }
+  m_detector = std::make_unique<ciface::Core::InputDetector>();
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  m_detector->Start(g_controller_interface, devices);
+}
+
+void BigPictureWindow::UpdateSetup()
+{
+  if (m_mode != Mode::Setup || !m_detector)
+    return;
+
+  m_detector->Update(std::chrono::seconds(10), std::chrono::milliseconds(0),
+                     std::chrono::seconds(10));
+  if (!m_detector->IsComplete())
+    return;
+
+  auto results = m_detector->TakeResults();
+  m_detector.reset();
+
+  if (!ciface::MappingCommon::ContainsCompleteDetection(results))
+  {
+    // Nothing pressed (or no controller yet): keep waiting.
+    StartSetupStep();
+    update();
+    return;
+  }
+
+  auto* pad = Port1();
+  if (!m_setup_device_chosen)
+  {
+    ciface::Core::DeviceQualifier dq;
+    dq.FromDevice(results.front().device.get());
+    pad->SetDefaultDevice(dq);
+    m_setup_device_chosen = true;
+  }
+
+  ciface::MappingCommon::RemoveSpuriousTriggerCombinations(&results);
+  const std::string expr = ciface::MappingCommon::BuildExpression(
+      results, pad->GetDefaultDevice(), ciface::MappingCommon::Quote::On);
+
+  const SetupStep& step = SETUP_STEPS[m_setup_step];
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    auto* group = Pad::GetGroup(0, step.group);
+    (void)group->controls[step.index]->control_ref->SetExpression(expr);
+    if (step.mirror_index >= 0)
+    {
+      (void)group->controls[step.mirror_index]->control_ref->SetExpression(
+          step.flip ? FlipAxis(expr) : expr);
+    }
+  }
+
+  if (++m_setup_step >= SETUP_STEP_COUNT)
+  {
+    FinishSetup(true);
+    return;
+  }
+  // Short pause so the same press isn't detected twice.
+  QTimer::singleShot(250, this, [this] {
+    if (m_mode == Mode::Setup)
+      StartSetupStep();
+  });
+  update();
+}
+
+void BigPictureWindow::FinishSetup(bool save)
+{
+  m_setup_timer->stop();
+  m_detector.reset();
+  auto* pad = Port1();
+  if (save && pad)
+  {
+    pad->UpdateReferences(g_controller_interface);
+    Pad::GetConfig()->SaveConfig();
+  }
+  else if (pad)
+  {
+    // Cancelled: reload what was saved before.
+    Pad::LoadConfig();
+  }
+  m_mode = Mode::Library;
+  m_prev_held = ~0u;
+  update();
+}
+
+void BigPictureWindow::DrawSetup(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  QFont font = painter.font();
+
+  font.setPixelSize(int(54 * k));
+  font.setBold(true);
+  painter.setFont(font);
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, 120 * k, width(), 80 * k), Qt::AlignCenter,
+                   tr("Configuration de la manette"));
+  font.setBold(false);
+
+  const SetupStep& step = SETUP_STEPS[std::min(m_setup_step, SETUP_STEP_COUNT - 1)];
+  const qreal icon = 220 * k;
+  DrawIcon(painter, QString::fromLatin1(step.icon),
+           QRectF((width() - icon) / 2, height() / 2.0 - icon / 2 - 60 * k, icon, icon));
+
+  font.setPixelSize(int(44 * k));
+  painter.setFont(font);
+  painter.drawText(QRectF(0, height() / 2.0 + 90 * k, width(), 70 * k), Qt::AlignCenter,
+                   QString::fromUtf8(step.prompt));
+
+  font.setPixelSize(int(26 * k));
+  painter.setFont(font);
+  painter.setPen(DIM);
+  painter.drawText(QRectF(0, height() / 2.0 + 170 * k, width(), 40 * k), Qt::AlignCenter,
+                   tr("Étape %1 sur %2").arg(m_setup_step + 1).arg(SETUP_STEP_COUNT));
+  if (!m_setup_device_chosen)
+  {
+    painter.drawText(
+        QRectF(100 * k, height() - 220 * k, width() - 200 * k, 90 * k),
+        Qt::AlignCenter | Qt::TextWordWrap,
+        tr("Manette GameCube Switch 2 en USB : si rien ne se passe, installe une fois le pilote "
+           "WinUSB avec Zadig sur « Nintendo GameCube Controller (Interface 1) »."));
+  }
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, height() - 90 * k, width() - 60 * k, 40 * k),
+                   Qt::AlignVCenter | Qt::AlignRight, tr("Échap (clavier) : annuler"));
 }

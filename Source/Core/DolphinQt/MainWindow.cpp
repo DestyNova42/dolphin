@@ -380,7 +380,10 @@ void MainWindow::ShowBigPicture()
   Settings::GetQSettings().setValue(QStringLiteral("bigpicture/onstart"), true);
   // Game covers make the controller mode much nicer.
   if (!Config::Get(Config::MAIN_USE_GAME_COVERS))
+  {
     Config::SetBase(Config::MAIN_USE_GAME_COVERS, true);
+    emit Settings::Instance().MetadataRefreshRequested();
+  }
   if (Core::IsUninitialized(m_system))
   {
     hide();

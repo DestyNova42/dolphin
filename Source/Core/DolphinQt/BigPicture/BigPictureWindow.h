@@ -25,6 +25,11 @@ namespace UICommon
 class GameFile;
 }
 
+namespace ciface::Core
+{
+class InputDetector;
+}
+
 class BigPictureWindow final : public QWidget
 {
   Q_OBJECT
@@ -71,6 +76,7 @@ private:
     Library,
     Menu,
     ConfirmQuit,
+    Setup,
   };
 
   struct Entry
@@ -79,6 +85,14 @@ private:
     QString title;
     int disc_count = 1;
   };
+
+  // Controller setup wizard (maps GameCube port 1 by asking for each button).
+  void StartSetup();
+  void StartSetupStep();
+  void UpdateSetup();
+  void FinishSetup(bool save);
+  bool NeedsSetup() const;
+  void DrawSetup(QPainter& painter);
 
   void ScheduleRebuild();
   void RebuildList();
@@ -116,6 +130,12 @@ private:
   QElapsedTimer m_clock;
   qint64 m_held_since[16] = {};
   qint64 m_last_repeat[16] = {};
+
+  int m_setup_step = 0;
+  bool m_setup_device_chosen = false;
+  std::unique_ptr<ciface::Core::InputDetector> m_detector;
+  QTimer* m_setup_timer = nullptr;
+  QTimer* m_setup_check_timer = nullptr;
 
   QHash<QString, QPixmap> m_cover_cache;
   QHash<QString, QSvgRenderer*> m_icons;
