@@ -472,6 +472,7 @@ target_link_libraries(dolphin-emu
 PRIVATE
   core
   Qt6::Widgets
+  Qt6::Svg
   uicommon
   imgui
   implot
