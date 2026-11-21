@@ -1,3 +1,4 @@
 Button icons (*.svg): by Toomai Glittershine for SmashWiki, used unmodified.
 Fonts: Inter and Space Grotesk, SIL Open Font License 1.1 (see Fonts/*-OFL.txt).
 Menu music and sounds are NOT included: put your own FLAC files in <User>/BigPicture/Sounds/.
+png/*.png: the same icons rendered from the SVG files with librsvg (Qt's SVG renderer does not support their clip paths).

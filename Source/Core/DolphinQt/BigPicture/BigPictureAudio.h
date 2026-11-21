@@ -48,6 +48,8 @@ public:
   void Play(Sound sound);
   void StartMusic();
   void StopMusic();
+  // 0..1 each; music 0 disables it.
+  void SetVolumes(float music, float sfx);
   bool HasMusic() const { return m_loaded && !m_music.empty(); }
 
   static std::string SoundDirectory();
@@ -83,6 +85,8 @@ private:
   double m_music_pos = 0;
   bool m_music_on = false;
   float m_music_gain = 0.0f;
+  float m_music_volume = 0.45f;
+  float m_sfx_volume = 0.9f;
 
   std::atomic<bool> m_loaded{false};
   std::thread m_loader;

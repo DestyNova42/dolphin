@@ -14,14 +14,20 @@
 #include <QPixmap>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QWidget>
 
 #include "Common/CommonTypes.h"
+#include "DolphinQt/BigPicture/BigPictureSettings.h"
 
 class BigPictureAudio;
 class GameListModel;
-class QSvgRenderer;
 class QTimer;
+
+namespace Core
+{
+enum class State;
+}
 
 namespace UICommon
 {
@@ -43,17 +49,19 @@ public:
 
   // Shows the interface fullscreen and starts listening to the controller.
   void Open();
-  // Hides the interface (e.g. while a game is running) but keeps it "active".
-  void Suspend();
   // Leaves the controller mode entirely.
   void Close();
-
   bool IsActive() const { return m_active; }
+
+  // Called by the main window for every emulation state change.
+  void OnEmulationStateChanged(Core::State state);
 
 signals:
   void LaunchRequested(const QString& path);
   void ClassicRequested();
   void QuitRequested();
+  void StopRequested();    // "Quitter le jeu" in the pause menu
+  void ResumeRequested();  // the game gets the focus back
 
 protected:
   void paintEvent(QPaintEvent* event) override;
@@ -73,14 +81,18 @@ private:
     PageDown,
     Favorite,  // Y
     Options,   // X
+    Count,
   };
 
   enum class Mode
   {
+    Intro,
     Library,
     Menu,
     ConfirmQuit,
     Setup,
+    InGame,  // hidden, a game is running
+    Pause,
   };
 
   enum class Tab
@@ -96,73 +108,142 @@ private:
     std::shared_ptr<const UICommon::GameFile> game;
     QString path;
     QString title;
-    int disc_count = 1;
+    QStringList discs;  // every disc of the game, in order
   };
 
-  // Controller setup wizard (maps GameCube port 1 by asking for each button).
-  void StartSetup();
+  // ---- lifecycle / data
+  void Suspend();
+  void ScheduleRebuild();
+  void RebuildList();
+  void ApplyTab();
+  void ApplyPreferences();
+  const Entry* Selected() const;
+
+  // ---- input
+  void PollController();
+  void PollInGame();
+  void Press(Action action);
+  void HandleAction(Action action);
+  void HandleLibrary(Action action);
+  void HandleSettings(Action action);
+  void HandlePause(Action action);
+  void HandleMenu(Action action);
+  void ToggleFavorite();
+  void SetSelected(int index);
+
+  // ---- pause menu
+  void OpenPause();
+  void Resume();
+  std::vector<int> PauseItems() const;
+
+  // ---- controller setup wizard
+  void StartSetup(int port);
   void StartSetupStep();
   void UpdateSetup();
   void FinishSetup(bool save);
   bool NeedsSetup() const;
 
-  void ScheduleRebuild();
-  void RebuildList();
-  void ApplyTab();
-  void PollController();
-  void Press(Action action);
-  void HandleAction(Action action);
+  // ---- animation
   void Tick();
-  void ToggleFavorite();
+  void BeginTransition(int direction);
+  void SetMode(Mode mode);
+  void Toast(const QString& text);
 
-  const Entry* Selected() const;
-  QPixmap CoverFor(const Entry& entry, const QSize& size);
-  QColor AmbientFor(const Entry& entry);
-  QString PlayInfo(const Entry& entry) const;
-  QString ControllerName() const;
-
+  // ---- drawing
   QFont Font(bool display, int px, int weight) const;
   void DrawIcon(QPainter& painter, const QString& name, const QRectF& rect);
   void DrawHints(QPainter& painter, const std::vector<std::pair<QString, QString>>& left,
                  const std::vector<std::pair<QString, QString>>& right);
   qreal DrawPillButton(QPainter& painter, qreal x, qreal y, const QString& icon,
-                       const QString& label, bool primary);
+                       const QString& label, bool primary, qreal alpha = 1.0);
+  void DrawScene(QPainter& painter);
+  void DrawBackground(QPainter& painter);
+  void DrawIntro(QPainter& painter);
   void DrawTopBar(QPainter& painter);
-  void DrawLibrary(QPainter& painter);
-  void DrawSettingsTab(QPainter& painter);
+  void DrawHero(QPainter& painter, const Entry& sel, qreal left, qreal top, qreal max_width);
+  void DrawCoverShelf(QPainter& painter);
+  void DrawList(QPainter& painter);
+  void DrawEmpty(QPainter& painter);
+  void DrawSettings(QPainter& painter, qreal top);
   void DrawMenu(QPainter& painter);
   void DrawDialog(QPainter& painter, const QString& title,
                   const std::vector<std::pair<QString, QString>>& hints);
   void DrawSetup(QPainter& painter);
+  void DrawPause(QPainter& painter);
+  void DrawToast(QPainter& painter);
+
+  QPixmap CoverFor(const Entry& entry, const QSize& size);
+  QPixmap BannerFor(const Entry& entry, const QSize& size);
+  QColor AmbientFor(const Entry& entry);
+  QString PlayInfo(const Entry& entry) const;
+  QString ControllerName() const;
 
   const GameListModel& m_model;
   std::vector<Entry> m_all;      // every game
   std::vector<Entry> m_entries;  // games of the current tab
 
   std::unique_ptr<BigPictureAudio> m_audio;
-  bool m_played_startup = false;
 
   bool m_active = false;
+  bool m_intro_done = false;
   Mode m_mode = Mode::Library;
+  Mode m_mode_before_setup = Mode::Library;
   Tab m_tab = Tab::All;
   int m_selected = 0;
   int m_menu_index = 0;
-  qreal m_scroll = 0;
-  qreal m_scroll_target = 0;
-  QColor m_ambient;
-
   QSet<QString> m_favorites;
 
+  // settings screen
+  std::vector<BigPictureSettingCategory> m_settings;
+  int m_settings_cat = 0;
+  int m_settings_item = 0;
+  bool m_settings_in_items = false;
+  bool m_pause_settings = false;  // settings opened from the pause menu
+  qreal m_settings_scroll = 0;
+
+  // pause menu
+  const Entry* m_running = nullptr;
+  Entry m_running_entry;
+  int m_pause_index = 0;
+  int m_slot = 1;
+  int m_disc = 0;
+  bool m_home_was_down = true;
+
+  // preferences
+  BigPicturePrefs::View m_view = BigPicturePrefs::View::Covers;
+  BigPicturePrefs::Effect m_effect = BigPicturePrefs::Effect::Halo;
+  BigPicturePrefs::Transition m_transition = BigPicturePrefs::Transition::Fade;
+
+  // animation state
+  QElapsedTimer m_clock;
+  qint64 m_last_tick = 0;
+  qreal m_time = 0;              // seconds, for ambient effects
+  qreal m_scroll = 0;            // cover shelf (px at 1080p)
+  qreal m_list_scroll = 0;       // list view (rows)
+  qreal m_hero_t = 1;            // hero fade-in after a selection change
+  qreal m_overlay_t = 0;         // menu / dialog / pause opening
+  qreal m_intro_t = 0;
+  qreal m_trans_t = 1;           // screen transition
+  int m_trans_dir = 0;
+  QPixmap m_frame;               // last composed frame
+  QPixmap m_trans_from;          // frame before the transition
+  std::vector<qreal> m_focus;    // per entry: 0 = normal, 1 = selected
+  QColor m_ambient;
+  QString m_toast;
+  qreal m_toast_t = 0;
+
   QTimer* m_poll_timer = nullptr;
+  QTimer* m_game_timer = nullptr;
   QTimer* m_anim_timer = nullptr;
   QTimer* m_rebuild_timer = nullptr;
 
   // Controller edge detection / auto-repeat
   u32 m_prev_held = 0;
-  QElapsedTimer m_clock;
   qint64 m_held_since[16] = {};
   qint64 m_last_repeat[16] = {};
 
+  // setup wizard
+  int m_setup_port = 0;
   int m_setup_step = 0;
   bool m_setup_device_chosen = false;
   std::unique_ptr<ciface::Core::InputDetector> m_detector;
@@ -173,6 +254,7 @@ private:
   QString m_text_family;
 
   QHash<QString, QPixmap> m_cover_cache;
+  QHash<QString, QPixmap> m_banner_cache;
   QHash<QString, QColor> m_ambient_cache;
-  QHash<QString, QSvgRenderer*> m_icons;
+  QHash<QString, QPixmap> m_icons;
 };

@@ -47,6 +47,7 @@
 #include "Core/BootManager.h"
 #include "Core/CommonTitles.h"
 #include "Core/Config/AchievementSettings.h"
+#include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/NetplaySettings.h"
 #include "Core/Config/UISettings.h"
@@ -244,7 +245,6 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
           &MainWindow::LaunchFromBigPicture);
   connect(m_big_picture, &BigPictureWindow::ClassicRequested, this, [this] {
     m_big_picture->Close();
-    Settings::GetQSettings().setValue(QStringLiteral("bigpicture/onstart"), false);
     show();
     raise();
     activateWindow();
@@ -254,23 +254,21 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
     if (RequestStop())
       m_exit_requested = true;
   });
+  connect(m_big_picture, &BigPictureWindow::StopRequested, this, [this] { RequestStop(); });
+  connect(m_big_picture, &BigPictureWindow::ResumeRequested, this, [this] {
+    if (m_render_widget)
+    {
+      m_render_widget->raise();
+      m_render_widget->activateWindow();
+      m_render_widget->setFocus();
+    }
+  });
   connect(&Settings::Instance(), &Settings::EmulationStateChanged, this, [this](Core::State state) {
-    if (!m_big_picture->IsActive())
+    if (!m_big_picture->IsActive() || m_exit_requested)
       return;
     if (state == Core::State::Uninitialized)
-    {
-      if (m_exit_requested)
-        return;
-      QTimer::singleShot(0, this, [this] {
-        hide();
-        if (m_big_picture->IsActive())
-          m_big_picture->Open();
-      });
-    }
-    else
-    {
-      m_big_picture->Suspend();
-    }
+      QTimer::singleShot(0, this, [this] { hide(); });
+    m_big_picture->OnEmulationStateChanged(state);
   });
 
   const bool start_big_picture =
@@ -377,7 +375,6 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
 
 void MainWindow::ShowBigPicture()
 {
-  Settings::GetQSettings().setValue(QStringLiteral("bigpicture/onstart"), true);
   // Game covers make the controller mode much nicer.
   if (!Config::Get(Config::MAIN_USE_GAME_COVERS))
   {
@@ -395,8 +392,10 @@ void MainWindow::LaunchFromBigPicture(const QString& path)
 {
   if (!Core::IsUninitialized(m_system))
     return;
-  // Games started from the controller mode always run fullscreen.
+  // Games started from the controller mode always run fullscreen, without exclusive mode so the
+  // pause menu can be drawn over the game.
   m_fullscreen_requested = true;
+  Config::SetCurrent(Config::GFX_BORDERLESS_FULLSCREEN, true);
   StartGame(path, ScanForSecondDisc::Yes);
 }
 

@@ -39,6 +39,8 @@ add_executable(dolphin-emu
   AboutDialog.h
   BigPicture/BigPictureAudio.cpp
   BigPicture/BigPictureAudio.h
+  BigPicture/BigPictureSettings.cpp
+  BigPicture/BigPictureSettings.h
   BigPicture/BigPictureWindow.cpp
   BigPicture/BigPictureWindow.h
   CheatSearchFactoryWidget.cpp

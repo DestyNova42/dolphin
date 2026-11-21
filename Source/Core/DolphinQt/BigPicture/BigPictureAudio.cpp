@@ -31,8 +31,6 @@
 namespace
 {
 constexpr unsigned int OUTPUT_RATE = 48000;
-constexpr float MUSIC_VOLUME = 0.45f;
-constexpr float SFX_VOLUME = 0.9f;
 
 // Part of the file name (lower case) that identifies each sound.
 constexpr const char* SOUND_KEYS[] = {
@@ -182,6 +180,14 @@ void BigPictureAudio::StartMusic()
   m_music_on = true;
 }
 
+void BigPictureAudio::SetVolumes(float music, float sfx)
+{
+  std::lock_guard lk(m_mutex);
+  // Perceptual curve: 50 % on the slider sounds like half as loud.
+  m_music_volume = 0.7f * music * music;
+  m_sfx_volume = sfx * sfx;
+}
+
 void BigPictureAudio::StopMusic()
 {
   std::lock_guard lk(m_mutex);
@@ -209,7 +215,7 @@ long BigPictureAudio::Mix(float* out, long frames)
       }
       float l, r;
       Sample(m_music, m_music_pos, &l, &r);
-      const float g = m_music_gain * MUSIC_VOLUME;
+      const float g = m_music_gain * m_music_volume;
       out[i * 2] += l * g;
       out[i * 2 + 1] += r * g;
       m_music_pos += m_music.step;
@@ -225,8 +231,8 @@ long BigPictureAudio::Mix(float* out, long frames)
     {
       float l, r;
       Sample(*v.clip, v.pos, &l, &r);
-      out[i * 2] += l * SFX_VOLUME;
-      out[i * 2 + 1] += r * SFX_VOLUME;
+      out[i * 2] += l * m_sfx_volume;
+      out[i * 2 + 1] += r * m_sfx_volume;
     }
   }
   std::erase_if(m_voices, [](const Voice& v) {
