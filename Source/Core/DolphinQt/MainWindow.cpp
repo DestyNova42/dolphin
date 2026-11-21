@@ -245,6 +245,7 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
   // game, so there is never a window closing / opening in between (seamless).
   m_bp_stage = new QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint);
   m_bp_stage->setWindowTitle(QStringLiteral("Dolphin"));
+  m_bp_stage->setCursor(Qt::BlankCursor);
   m_bp_stage->setAutoFillBackground(true);
   {
     QPalette pal = m_bp_stage->palette();
@@ -416,6 +417,10 @@ void MainWindow::LaunchFromBigPicture(const QString& path)
   // Games started from the controller mode are shown in the fullscreen stage (see ShowRenderWidget):
   // no exclusive fullscreen, so the pause menu can be drawn over the game.
   Config::SetCurrent(Config::GFX_BORDERLESS_FULLSCREEN, true);
+  // No mouse cursor over the game (this session only; the classic setting is kept).
+  Config::SetCurrent(Config::MAIN_SHOW_CURSOR, Config::ShowCursor::Never);
+  emit Settings::Instance().CursorVisibilityChanged();
+  m_bp_stage->setCursor(Qt::BlankCursor);
   StartGame(path, ScanForSecondDisc::Yes);
   m_fullscreen_requested = false;
 }

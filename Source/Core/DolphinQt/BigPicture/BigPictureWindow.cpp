@@ -4,9 +4,14 @@
 #include "DolphinQt/BigPicture/BigPictureWindow.h"
 
 #include <algorithm>
+#include <cctype>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <iterator>
+#include <numbers>
+#include <string>
+#include <vector>
 #include <map>
 #include <numbers>
 
@@ -14,6 +19,8 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QFile>
+#include <QGuiApplication>
+#include <QScreen>
 #include <QFont>
 #include <QFontDatabase>
 #include <QFontMetrics>
@@ -39,12 +46,14 @@
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/GCPadEmu.h"
+#include "Core/HW/SI/SI_Device.h"
 #include "Core/HotkeyManager.h"
 #include "Core/State.h"
 #include "Core/System.h"
 #include "Core/TimePlayed.h"
 #include "DiscIO/Enums.h"
 #include "DolphinQt/BigPicture/BigPictureAudio.h"
+#include "DolphinQt/BigPicture/BigPictureUpdater.h"
 #include "DolphinQt/GameList/GameListModel.h"
 #include "DolphinQt/QtUtils/ImageConverter.h"
 #include "DolphinQt/Settings.h"
@@ -67,16 +76,50 @@ namespace Prefs = BigPicturePrefs;
 namespace
 {
 // Theme (validated mock-up "Mode manette")
-const QColor BG(13, 11, 26);
-const QColor SURFACE(23, 20, 43);
-const QColor SURFACE_DEEP(18, 15, 36);
-const QColor RAISED(34, 29, 61);
-const QColor LINE(46, 40, 80);
-const QColor TEXT(244, 241, 255);
-const QColor TEXT_SOFT(185, 178, 214);
-const QColor TEXT_DIM(141, 133, 179);
-const QColor ACCENT(139, 108, 255);
-const QColor ACCENT_SOFT(201, 185, 255);
+// Theme colours (changed by ApplyTheme)
+QColor BG(13, 11, 26);
+QColor SURFACE(23, 20, 43);
+QColor SURFACE_DEEP(18, 15, 36);
+QColor RAISED(34, 29, 61);
+QColor LINE(46, 40, 80);
+QColor TEXT(244, 241, 255);
+QColor TEXT_SOFT(185, 178, 214);
+QColor TEXT_DIM(141, 133, 179);
+QColor ACCENT(139, 108, 255);
+QColor ACCENT_SOFT(201, 185, 255);
+
+struct Palette
+{
+  QColor bg, surface, deep, raised, line, text, soft, dim, accent, accent_soft;
+};
+
+Palette PaletteFor(BigPicturePrefs::Theme theme)
+{
+  using T = BigPicturePrefs::Theme;
+  switch (theme)
+  {
+  case T::IndigoGameCube:
+    return {{27, 22, 66},     {41, 34, 96},     {33, 27, 80},     {56, 47, 124},
+            {74, 64, 150},    {246, 244, 255},  {196, 190, 232},  {150, 142, 200},
+            {124, 104, 238},  {214, 204, 255}};
+  case T::Spice:
+    return {{24, 13, 6},      {44, 26, 13},     {34, 19, 9},      {66, 39, 18},
+            {92, 56, 26},     {255, 246, 236},  {226, 196, 168},  {178, 146, 118},
+            {255, 140, 40},   {255, 196, 140}};
+  case T::Oled:
+    return {{0, 0, 0},        {16, 16, 18},     {8, 8, 10},       {30, 30, 34},
+            {46, 46, 52},     {245, 245, 247},  {176, 176, 184},  {128, 128, 138},
+            {200, 200, 210},  {225, 225, 232}};
+  case T::Platinum:
+    return {{230, 231, 236},  {214, 216, 224},  {222, 223, 230},  {198, 200, 210},
+            {178, 180, 192},  {22, 22, 30},     {70, 72, 88},     {108, 110, 126},
+            {96, 74, 210},    {86, 66, 190}};
+  default:
+    return {{13, 11, 26},     {23, 20, 43},     {18, 15, 36},     {34, 29, 61},
+            {46, 40, 80},     {244, 241, 255},  {185, 178, 214},  {141, 133, 179},
+            {139, 108, 255},  {201, 185, 255}};
+  }
+}
 const QColor OK_GREEN(91, 214, 154);
 const QColor WARN(255, 180, 71);
 const QColor DANGER(255, 180, 163);
@@ -249,12 +292,40 @@ enum PauseItem
   PAUSE_RESUME,
   PAUSE_SAVE,
   PAUSE_LOAD,
+  PAUSE_QUICK,
+  PAUSE_CHEATS,
   PAUSE_SETTINGS,
   PAUSE_DISC,
   PAUSE_SCREENSHOT,
   PAUSE_QUIT,
 };
 }  // namespace
+
+// Small click-through window used to show notifications over a running game.
+class NotifierWidget final : public QWidget
+{
+public:
+  explicit NotifierWidget(std::function<void(QPainter&)> paint)
+      : QWidget(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
+                             Qt::WindowTransparentForInput | Qt::WindowDoesNotAcceptFocus),
+        m_paint(std::move(paint))
+  {
+    setAttribute(Qt::WA_TranslucentBackground);
+    setAttribute(Qt::WA_ShowWithoutActivating);
+  }
+
+protected:
+  void paintEvent(QPaintEvent*) override
+  {
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    m_paint(painter);
+  }
+
+private:
+  std::function<void(QPainter&)> m_paint;
+};
 
 // ================================================================== lifecycle
 
@@ -307,8 +378,47 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
     QTimer::singleShot(0, this, [this, port, group] { StartCalibration(port, group); });
   };
   host.open_memory_cards = [this] { QTimer::singleShot(0, this, [this] { OpenMemcards(); }); };
+  host.test_controller = [this](int port) {
+    QTimer::singleShot(0, this, [this, port] {
+      m_test_port = port;
+      m_test_start_since = -1;
+      m_mode_before_players = m_mode;
+      BeginTransition(0);
+      m_mode = Mode::PadTest;
+    });
+  };
+  host.check_updates = [this] { QTimer::singleShot(0, this, [this] { CheckUpdates(false); }); };
+  host.notify = [this](const QString& text) { Toast(text); };
   host.interface_changed = [this] { ApplyPreferences(); };
   m_settings = BuildBigPictureSettings(host);
+  m_quick_settings = BuildBigPictureQuickSettings();
+
+  // Controllers: automatic switching and hot plug
+  m_device_timer = new QTimer(this);
+  m_device_timer->setInterval(60);
+  connect(m_device_timer, &QTimer::timeout, this, &BigPictureWindow::PollDevices);
+  m_device_timer->start();
+  connect(&Settings::Instance(), &Settings::DevicesChanged, this,
+          &BigPictureWindow::OnDevicesChanged);
+  for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+    m_known_devices << QString::fromStdString(d);
+
+  m_notifier = new NotifierWidget([this](QPainter& p) {
+    const qreal a = std::min<qreal>(1, std::min(m_notify_t / 0.3, (3.0 - m_notify_t) / 0.25));
+    const QRectF r = QRectF(m_notifier->rect()).adjusted(8, 8, -8, -8);
+    p.setOpacity(std::clamp<qreal>(a, 0, 1));
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(SURFACE.red(), SURFACE.green(), SURFACE.blue(), 235));
+    p.drawRoundedRect(r, r.height() / 2, r.height() / 2);
+    p.setBrush(ACCENT);
+    p.drawEllipse(QPointF(r.left() + r.height() / 2, r.center().y()), 7, 7);
+    QFont font(m_text_family);
+    font.setPixelSize(int(r.height() * 0.34));
+    font.setWeight(QFont::DemiBold);
+    p.setFont(font);
+    p.setPen(TEXT);
+    p.drawText(r.adjusted(r.height(), 0, -20, 0), Qt::AlignVCenter, m_notify_text);
+  });
 
   m_clock.start();
 
@@ -358,13 +468,38 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
   RebuildList();
 }
 
-BigPictureWindow::~BigPictureWindow() = default;
+BigPictureWindow::~BigPictureWindow()
+{
+  delete m_notifier;
+}
+
+void BigPictureWindow::ApplyTheme()
+{
+  const Palette pal = PaletteFor(Prefs::GetTheme());
+  BG = pal.bg;
+  SURFACE = pal.surface;
+  SURFACE_DEEP = pal.deep;
+  RAISED = pal.raised;
+  LINE = pal.line;
+  TEXT = pal.text;
+  TEXT_SOFT = pal.soft;
+  TEXT_DIM = pal.dim;
+  ACCENT = pal.accent;
+  ACCENT_SOFT = pal.accent_soft;
+  if (Prefs::GetTheme() == Prefs::Theme::GameColor && m_ambient.isValid())
+  {
+    // Accent follows the selected game's cover colour.
+    ACCENT = m_ambient;
+    ACCENT_SOFT = m_ambient.lighter(150);
+  }
+}
 
 void BigPictureWindow::ApplyPreferences()
 {
   m_view = Prefs::GetView();
   m_effect = Prefs::GetEffect();
   m_transition = Prefs::GetTransition();
+  ApplyTheme();
   m_audio->SetVolumes(Prefs::MusicEnabled() ? Prefs::MusicVolume() / 100.0f : 0.0f,
                       Prefs::SfxVolume() / 100.0f);
   update();
@@ -372,6 +507,7 @@ void BigPictureWindow::ApplyPreferences()
 
 void BigPictureWindow::Open()
 {
+  unsetCursor();
   static bool s_cleaned_up = false;
   if (!s_cleaned_up)
   {
@@ -383,6 +519,13 @@ void BigPictureWindow::Open()
   // Ignore buttons that are still held (e.g. the one used to quit the game).
   m_prev_held = ~0u;
   m_last_tick = m_clock.elapsed();
+
+  static bool s_checked_updates = false;
+  if (!s_checked_updates && Prefs::CheckUpdatesOnStart())
+  {
+    s_checked_updates = true;
+    QTimer::singleShot(6000, this, [this] { CheckUpdates(true); });
+  }
 
   if (!m_intro_done && Prefs::IntroEnabled())
   {
@@ -437,6 +580,8 @@ void BigPictureWindow::OnEmulationStateChanged(Core::State state)
       break;  // keep the loading screen until the first frames
     [[fallthrough]];
   case Core::State::Running:
+    if (m_mode == Mode::Closing)
+      break;  // the game is being stopped behind the black veil
     if (m_mode == Mode::Launching)
     {
       // Reveal the game smoothly: the menu fades away over the running game.
@@ -466,7 +611,7 @@ void BigPictureWindow::OnEmulationStateChanged(Core::State state)
   case Core::State::Uninitialized:
     m_game_timer->stop();
     if (m_mode == Mode::InGame || m_mode == Mode::Pause || m_mode == Mode::Launching ||
-        m_mode == Mode::FadingOut)
+        m_mode == Mode::FadingOut || m_mode == Mode::Closing)
     {
       m_pause_settings = false;
       QTimer::singleShot(0, this, [this] {
@@ -636,8 +781,32 @@ void BigPictureWindow::PollController()
   if (!m_active || !isVisible() || !isActiveWindow())
     return;
   if (m_mode == Mode::Setup || m_mode == Mode::InGame || m_mode == Mode::Remap ||
-      m_mode == Mode::Launching || m_mode == Mode::FadingOut)
+      m_mode == Mode::Launching || m_mode == Mode::FadingOut || m_mode == Mode::Closing)
     return;
+  if (m_mode == Mode::PadTest)
+  {
+    // Every button is being tested: hold START for one second to leave.
+    const GCPadStatus st = Pad::GetStatus(m_test_port);
+    const qint64 t = m_clock.elapsed();
+    if (st.button & PAD_BUTTON_START)
+    {
+      if (m_test_start_since < 0)
+        m_test_start_since = t;
+      else if (t - m_test_start_since > 1000)
+      {
+        m_test_start_since = -1;
+        m_audio->Play(Sound::Back);
+        BeginTransition(-1);
+        m_mode = m_mode_before_players;
+        m_prev_held = ~0u;
+      }
+    }
+    else
+    {
+      m_test_start_since = -1;
+    }
+    return;
+  }
 
   const GCPadStatus pad = Pad::GetStatus(0);
 
@@ -730,6 +899,15 @@ void BigPictureWindow::keyPressEvent(QKeyEvent* event)
   {
     if (event->key() == Qt::Key_Escape && !event->isAutoRepeat())
       FinishRemap(false);
+    return;
+  }
+  if (m_mode == Mode::PadTest)
+  {
+    if (event->key() == Qt::Key_Escape && !event->isAutoRepeat())
+    {
+      BeginTransition(-1);
+      m_mode = m_mode_before_players;
+    }
     return;
   }
   const bool repeat = event->isAutoRepeat();
@@ -830,6 +1008,49 @@ void BigPictureWindow::HandleAction(Action action)
   case Mode::Memcard:
     HandleMemcard(action);
     break;
+  case Mode::Players:
+    if (action == Action::Back || action == Action::Menu)
+    {
+      m_audio->Play(Sound::Back);
+      BeginTransition(-1);
+      SaveBigPictureSettings();
+      m_mode = m_mode_before_players;
+    }
+    else if (action == Action::Options)
+    {
+      // Back to a single player: ports 2-4 off.
+      for (int port = 1; port < 4; ++port)
+        Config::SetBaseOrCurrent(Config::GetInfoForSIDevice(port),
+                                 SerialInterface::SIDEVICE_NONE);
+      m_audio->Play(Sound::Erase);
+    }
+    break;
+  case Mode::ConfirmUpdate:
+    if (action == Action::Accept && !m_update_busy)
+    {
+      m_update_busy = true;
+      m_audio->Play(Sound::Confirm);
+      Toast(tr("Téléchargement de la mise à jour…"));
+      BigPictureUpdater::Install(this, m_update_url, [this](bool ok, const QString& error) {
+        m_update_busy = false;
+        if (!ok)
+        {
+          m_audio->Play(Sound::Error);
+          Toast(error);
+          m_mode = Mode::Library;
+          return;
+        }
+        Toast(tr("Installation… Dolphin va redémarrer"));
+        QTimer::singleShot(800, this, [this] { emit QuitRequested(); });
+      });
+    }
+    else if (action == Action::Back && !m_update_busy)
+    {
+      m_audio->Play(Sound::Cancel);
+      BeginTransition(0);
+      m_mode = Mode::Library;
+    }
+    break;
   case Mode::Calibrate:
     if (action == Action::Accept)
       FinishCalibration(true);
@@ -901,6 +1122,7 @@ void BigPictureWindow::HandleLibrary(Action action)
                                         QDateTime::currentSecsSinceEpoch());
       m_running_entry = *sel;
       m_disc = 0;
+      setCursor(Qt::BlankCursor);
       const QString path = sel->path;
       m_audio->StopMusic();
       BeginTransition(0);
@@ -990,7 +1212,7 @@ void BigPictureWindow::HandleSettings(Action action)
         m_game_layer.reset();
         m_game_settings.clear();
         m_settings_cat = 0;
-        m_mode = Mode::Library;
+        m_mode = m_mode_before_game_settings;
         Toast(tr("Réglages du jeu enregistrés"));
       }
       else if (m_pause_settings)
@@ -1058,6 +1280,12 @@ void BigPictureWindow::HandleSettings(Action action)
     m_settings_in_items = false;
     m_audio->Play(Sound::Back);
     SaveBigPictureSettings();
+    if (m_pause_settings && m_quick)
+    {
+      BeginTransition(-1);
+      m_pause_settings = false;
+      m_quick = false;
+    }
     break;
   case Action::Options:
     if (item.clear)
@@ -1073,7 +1301,7 @@ void BigPictureWindow::HandleSettings(Action action)
 
 void BigPictureWindow::HandleMenu(Action action)
 {
-  constexpr int ITEMS = 6;
+  constexpr int ITEMS = 7;
   switch (action)
   {
   case Action::Down:
@@ -1101,15 +1329,19 @@ void BigPictureWindow::HandleMenu(Action action)
       m_settings_in_items = false;
       break;
     case 2:
-      OpenMemcards();
+      m_mode_before_players = Mode::Library;
+      m_mode = Mode::Players;
       break;
     case 3:
-      StartSetup(0);
+      OpenMemcards();
       break;
     case 4:
-      emit ClassicRequested();
+      StartSetup(0);
       break;
     case 5:
+      emit ClassicRequested();
+      break;
+    case 6:
       SetMode(Mode::ConfirmQuit);
       break;
     default:
@@ -1125,7 +1357,10 @@ void BigPictureWindow::HandleMenu(Action action)
 
 std::vector<int> BigPictureWindow::PauseItems() const
 {
-  std::vector<int> items = {PAUSE_RESUME, PAUSE_SAVE, PAUSE_LOAD, PAUSE_SETTINGS};
+  std::vector<int> items = {PAUSE_RESUME, PAUSE_SAVE, PAUSE_LOAD, PAUSE_QUICK};
+  if (m_running_entry.game)
+    items.push_back(PAUSE_CHEATS);
+  items.push_back(PAUSE_SETTINGS);
   if (m_running_entry.discs.size() > 1)
     items.push_back(PAUSE_DISC);
   items.push_back(PAUSE_SCREENSHOT);
@@ -1259,6 +1494,7 @@ void BigPictureWindow::HandlePause(Action action)
       m_audio->Play(Sound::Confirm);
       BeginTransition(1);
       m_pause_settings = true;
+      m_quick = false;
       m_settings_cat = 2;  // Graphics
       m_settings_in_items = false;
       break;
@@ -1279,10 +1515,23 @@ void BigPictureWindow::HandlePause(Action action)
     case PAUSE_QUIT:
       m_audio->Play(Sound::Back);
       Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
-      m_mode = Mode::InGame;
-      m_poll_timer->stop();
-      hide();
-      emit StopRequested();
+      // Fade to black over the paused game, then stop: the menu comes back from black.
+      m_mode = Mode::Closing;
+      m_close_t = 0;
+      m_stop_sent = false;
+      break;
+    case PAUSE_QUICK:
+      m_audio->Play(Sound::Confirm);
+      BeginTransition(1);
+      m_pause_settings = true;
+      m_quick = true;
+      m_settings_cat = 0;
+      m_settings_item = 0;
+      m_settings_in_items = true;
+      break;
+    case PAUSE_CHEATS:
+      if (m_running_entry.game)
+        OpenGameSettingsFor(m_running_entry, true);
       break;
     default:
       break;
@@ -1320,7 +1569,7 @@ void BigPictureWindow::Tick()
 
   if (m_mode == Mode::Intro)
   {
-    m_intro_t += dt / 3.0;
+    m_intro_t += dt / (Prefs::GetIntroStyle() == Prefs::IntroStyle::GameCube ? 4.6 : 3.0);
     if (m_intro_t >= 1)
     {
       m_intro_done = true;
@@ -1356,6 +1605,20 @@ void BigPictureWindow::Tick()
     UpdateCalibration();
   if (m_fade_in < 1)
     m_fade_in = std::min<qreal>(1, m_fade_in + dt / 0.6);
+  if (m_mode == Mode::Closing)
+  {
+    m_close_t = std::min<qreal>(1, m_close_t + dt / 0.45);
+    if (m_close_t >= 1 && !m_stop_sent)
+    {
+      m_stop_sent = true;
+      emit StopRequested();
+    }
+  }
+  if (Prefs::GetTheme() == Prefs::Theme::GameColor && m_ambient.isValid())
+  {
+    ACCENT = m_ambient;
+    ACCENT_SOFT = m_ambient.lighter(150);
+  }
 
   for (size_t i = 0; i < m_focus.size(); ++i)
     approach(m_focus[i], static_cast<int>(i) == m_selected ? 1.0 : 0.0, 14);
@@ -1700,10 +1963,16 @@ void BigPictureWindow::DrawScene(QPainter& painter)
     DrawIntro(painter);
     return;
   }
-  if (m_mode == Mode::Pause)
+  if (m_mode == Mode::Pause || m_mode == Mode::Closing)
   {
     DrawPause(painter);
     DrawToast(painter);
+    if (m_mode == Mode::Closing)
+    {
+      QColor veil = Qt::black;
+      veil.setAlphaF(static_cast<float>(EaseInOut(m_close_t)));
+      painter.fillRect(rect(), veil);
+    }
     return;
   }
 
@@ -1724,6 +1993,30 @@ void BigPictureWindow::DrawScene(QPainter& painter)
   {
     DrawBackground(painter);
     DrawCalibration(painter);
+    return;
+  }
+  if (m_mode == Mode::Players)
+  {
+    DrawBackground(painter);
+    DrawPlayers(painter);
+    DrawToast(painter);
+    return;
+  }
+  if (m_mode == Mode::PadTest)
+  {
+    DrawBackground(painter);
+    DrawPadTest(painter);
+    return;
+  }
+  if (m_mode == Mode::ConfirmUpdate)
+  {
+    DrawBackground(painter);
+    DrawTopBar(painter);
+    DrawDialog(painter,
+               m_update_busy ? tr("Téléchargement en cours…") :
+                               tr("Nouvelle version disponible"),
+               {{QStringLiteral("A"), tr("Installer")}, {QStringLiteral("B"), tr("Plus tard")}});
+    DrawToast(painter);
     return;
   }
   if (m_mode == Mode::Memcard)
@@ -1920,11 +2213,49 @@ void BigPictureWindow::DrawBackground(QPainter& painter)
 
   case Prefs::Effect::None:
     break;
+
+  case Prefs::Effect::Cube3D:
+  {
+    halo(0.5);
+    // Big wireframe cube slowly turning, like the GameCube BIOS menu.
+    const qreal ax = t * 0.21, ay = t * 0.33;
+    const QPointF centre(width() * 0.72, height() * 0.42);
+    const qreal size = 260 * k;
+    const auto project = [&](qreal x, qreal y, qreal z, qreal s) {
+      // rotate around Y then X
+      const qreal x1 = x * std::cos(ay) + z * std::sin(ay);
+      const qreal z1 = -x * std::sin(ay) + z * std::cos(ay);
+      const qreal y1 = y * std::cos(ax) - z1 * std::sin(ax);
+      const qreal z2 = y * std::sin(ax) + z1 * std::cos(ax);
+      const qreal persp = 3.2 / (3.2 + z2);
+      return QPointF(centre.x() + x1 * s * persp, centre.y() + y1 * s * persp);
+    };
+    static constexpr int edges[12][2] = {{0, 1}, {1, 3}, {3, 2}, {2, 0}, {4, 5}, {5, 7},
+                                         {7, 6}, {6, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    for (int pass = 0; pass < 2; ++pass)
+    {
+      const qreal s = pass == 0 ? size : size * 0.42;
+      QPointF pts[8];
+      for (int v = 0; v < 8; ++v)
+        pts[v] = project(v & 1 ? 1 : -1, v & 2 ? 1 : -1, v & 4 ? 1 : -1, s);
+      QColor c = pass == 0 ? TEXT : glow;
+      c.setAlphaF(pass == 0 ? 0.10f : 0.22f);
+      painter.setPen(QPen(c, (pass == 0 ? 2.0 : 3.0) * k));
+      for (const auto& e : edges)
+        painter.drawLine(pts[e[0]], pts[e[1]]);
+    }
+    break;
+  }
   }
 }
 
 void BigPictureWindow::DrawIntro(QPainter& painter)
 {
+  if (Prefs::GetIntroStyle() == Prefs::IntroStyle::GameCube)
+  {
+    DrawIntroGameCube(painter);
+    return;
+  }
   const qreal k = height() / 1080.0;
   const qreal t = m_intro_t;
   const QPointF c(width() / 2.0, height() / 2.0 - 40 * k);
@@ -2664,19 +2995,20 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
                    QStringLiteral("Dolphin"));
 
   const QString items[] = {tr("Retour à la bibliothèque"), tr("Réglages"),
-                           tr("Cartes mémoire"),          tr("Configurer la manette"),
-                           tr("Interface classique"),     tr("Quitter Dolphin")};
-  qreal y = 230 * k;
-  for (int i = 0; i < 6; ++i)
+                           tr("Joueurs"),                 tr("Cartes mémoire"),
+                           tr("Configurer la manette"),   tr("Interface classique"),
+                           tr("Quitter Dolphin")};
+  qreal y = 220 * k;
+  for (int i = 0; i < 7; ++i)
   {
-    if (i == 5)
+    if (i == 6)
     {
       painter.fillRect(QRectF(64 * k, y + 4 * k, 572 * k, 1 * k), LINE);
       y += 20 * k;
     }
     // items slide in one after the other
     const qreal ie = EaseOut((m_overlay_t - i * 0.06) / 0.7);
-    const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 80 * k);
+    const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 74 * k);
     const bool active = i == m_menu_index;
     painter.setOpacity(e * ie);
     if (active)
@@ -2688,9 +3020,9 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
                QRectF(r.right() - 28 * k - 38 * k, r.center().y() - 19 * k, 38 * k, 38 * k));
     }
     painter.setFont(Font(false, int(26 * k), active ? 600 : 500));
-    painter.setPen(active ? BG : (i == 5 ? DANGER : TEXT));
+    painter.setPen(active ? BG : (i == 6 ? DANGER : TEXT));
     painter.drawText(r.adjusted(28 * k, 0, 0, 0), Qt::AlignVCenter, items[i]);
-    y += 86 * k;
+    y += 82 * k;
   }
   painter.setOpacity(e);
 
@@ -2805,7 +3137,13 @@ void BigPictureWindow::DrawPause(QPainter& painter)
       text = tr("Charger un état");
       break;
     case PAUSE_SETTINGS:
-      text = tr("Réglages");
+      text = tr("Tous les réglages");
+      break;
+    case PAUSE_QUICK:
+      text = tr("Réglages rapides");
+      break;
+    case PAUSE_CHEATS:
+      text = tr("Codes de triche");
       break;
     case PAUSE_DISC:
       text = tr("Changer de disque (%1 / %2)").arg(m_disc + 1).arg(m_running_entry.discs.size());
@@ -3156,18 +3494,33 @@ void BigPictureWindow::FinishSetup(bool save)
 
 std::vector<BigPictureSettingCategory>& BigPictureWindow::Cats()
 {
-  return m_mode == Mode::GameSettings ? m_game_settings : m_settings;
+  if (m_mode == Mode::GameSettings)
+    return m_game_settings;
+  if (m_pause_settings && m_quick)
+    return m_quick_settings;
+  return m_settings;
 }
 
 void BigPictureWindow::OpenGameSettings()
 {
-  const Entry* sel = Selected();
-  if (!sel)
-    return;
-  m_game_layer = std::make_shared<Config::Layer>(ConfigLoaders::GenerateLocalGameConfigLoader(
-      sel->game->GetGameID(), sel->game->GetRevision()));
-  m_game_settings = BuildBigPictureGameSettings(m_game_layer);
-  m_game_settings_title = tr("Réglages de %1").arg(sel->title);
+  if (const Entry* sel = Selected())
+    OpenGameSettingsFor(*sel, false);
+}
+
+void BigPictureWindow::OpenGameSettingsFor(const Entry& entry, bool cheats_only)
+{
+  const std::string id = entry.game->GetGameID();
+  const u16 rev = entry.game->GetRevision();
+  m_game_layer = std::make_shared<Config::Layer>(
+      ConfigLoaders::GenerateLocalGameConfigLoader(id, rev));
+  m_game_settings.clear();
+  if (!cheats_only)
+    m_game_settings = BuildBigPictureGameSettings(m_game_layer);
+  for (auto& cat : BuildBigPictureCheatSettings(id, rev))
+    m_game_settings.push_back(std::move(cat));
+  m_game_settings_title = cheats_only ? tr("Codes de triche — %1").arg(entry.title) :
+                                        tr("Réglages de %1").arg(entry.title);
+  m_mode_before_game_settings = m_mode == Mode::GameSettings ? Mode::Library : m_mode;
   m_settings_cat = 0;
   m_settings_item = 0;
   m_settings_in_items = false;
@@ -3405,8 +3758,9 @@ void BigPictureWindow::DrawCalibration(QPainter& painter)
   QPolygonF gate;
   for (int i = 0; i < 8; ++i)
   {
-    const qreal a = i * std::numbers::pi / 4 + std::numbers::pi / 8;
-    gate << QPointF(c.x() + std::cos(a) * radius, c.y() + std::sin(a) * radius);
+    // GameCube gate: corners on the axes and the diagonals.
+    const qreal a = i * std::numbers::pi / 4;
+    gate << QPointF(c.x() + std::cos(a) * radius, c.y() - std::sin(a) * radius);
   }
   painter.setPen(QPen(TEXT_DIM, 2 * k, Qt::DashLine));
   painter.setBrush(Qt::NoBrush);
@@ -3433,6 +3787,26 @@ void BigPictureWindow::DrawCalibration(QPainter& painter)
   painter.setPen(Qt::NoPen);
   painter.setBrush(TEXT);
   painter.drawEllipse(p, 12 * k, 12 * k);
+
+  // Analog triggers, to check them while calibrating.
+  {
+    const GCPadStatus st = Pad::GetStatus(m_cal_port);
+    const auto bar = [&](qreal x, const QString& icon, u8 value, bool click) {
+      const QRectF track(x, c.y() - 160 * k, 34 * k, 320 * k);
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(SURFACE);
+      painter.drawRoundedRect(track, 17 * k, 17 * k);
+      const qreal h = track.height() * value / 255.0;
+      painter.setBrush(click ? ACCENT_SOFT : ACCENT);
+      painter.drawRoundedRect(QRectF(track.left(), track.bottom() - h, track.width(), h), 17 * k,
+                              17 * k);
+      DrawIcon(painter, icon, QRectF(x - 13 * k, track.bottom() + 16 * k, 60 * k, 60 * k));
+    };
+    bar(c.x() - radius - 150 * k, QStringLiteral("L"), st.triggerLeft,
+        (st.button & PAD_TRIGGER_L) != 0);
+    bar(c.x() + radius + 116 * k, QStringLiteral("R"), st.triggerRight,
+        (st.button & PAD_TRIGGER_R) != 0);
+  }
 
   const bool sensible = m_calibrator && m_calibrator->IsCalibrationDataSensible();
   QFont prompt = Font(true, int(48 * k), 700);
@@ -3869,4 +4243,583 @@ void BigPictureWindow::DrawMemcards(QPainter& painter)
   DrawHints(painter,
             {{QStringLiteral("L"), QString()}, {QStringLiteral("R"), tr("Emplacement")}},
             {{QStringLiteral("A"), tr("Choisir")}, {QStringLiteral("B"), tr("Retour")}});
+}
+
+// ================================================================== controllers
+
+namespace
+{
+bool IsIgnoredDevice(const std::string& d)
+{
+  return d.find("Keyboard") != std::string::npos || d.find("Mouse") != std::string::npos ||
+         d.rfind("DSUClient", 0) == 0 || d.rfind("Android", 0) == 0;
+}
+
+int SourcePriority(const std::string& d)
+{
+  if (d.rfind("SDL/", 0) == 0)
+    return 0;
+  if (d.rfind("XInput/", 0) == 0)
+    return 1;
+  if (d.rfind("WGInput/", 0) == 0)
+    return 2;
+  return 3;
+}
+
+bool IsPressInput(const std::string& name)
+{
+  for (const char* prefix : {"Button", "Pad ", "Shoulder", "Start", "Back", "Guide", "Thumb",
+                             "Trigger", "Home", "Select", "Plus", "Minus"})
+  {
+    if (name.rfind(prefix, 0) == 0)
+      return true;
+  }
+  return false;
+}
+
+bool DeviceHasPress(const std::string& device_string)
+{
+  ciface::Core::DeviceQualifier dq;
+  dq.FromString(device_string);
+  const auto device = g_controller_interface.FindDevice(dq);
+  if (!device)
+    return false;
+  for (const auto* input : device->Inputs())
+  {
+    if (IsPressInput(input->GetName()) && input->GetState() > 0.6)
+      return true;
+  }
+  return false;
+}
+
+QString DeviceDisplayName(const std::string& device_string)
+{
+  ciface::Core::DeviceQualifier dq;
+  dq.FromString(device_string);
+  return QString::fromStdString(dq.name.empty() ? device_string : dq.name);
+}
+
+bool LooksLikeGameCube(const std::string& d)
+{
+  std::string lower = d;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return lower.find("gamecube") != std::string::npos;
+}
+
+bool PortActive(int port)
+{
+  return Config::Get(Config::GetInfoForSIDevice(port)) != SerialInterface::SIDEVICE_NONE;
+}
+}  // namespace
+
+std::string BigPictureWindow::PressedDevice(const std::vector<std::string>& exclude) const
+{
+  std::string best;
+  for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+  {
+    if (IsIgnoredDevice(d) || std::find(exclude.begin(), exclude.end(), d) != exclude.end())
+      continue;
+    if (!DeviceHasPress(d))
+      continue;
+    if (best.empty() || SourcePriority(d) < SourcePriority(best))
+      best = d;
+  }
+  return best;
+}
+
+void BigPictureWindow::PollDevices()
+{
+  if (!m_active)
+    return;
+  switch (m_mode)
+  {
+  case Mode::Setup:
+  case Mode::Remap:
+  case Mode::Calibrate:
+  case Mode::PadTest:
+  case Mode::Launching:
+  case Mode::Closing:
+    return;
+  default:
+    break;
+  }
+  const qint64 now = m_clock.elapsed();
+
+  // Devices already in use on some port.
+  std::vector<std::string> used;
+  bool used_pressed = false;
+  for (int port = 0; port < 4; ++port)
+  {
+    if (port > 0 && !PortActive(port))
+      continue;
+    if (auto* pad = PadController(port))
+    {
+      const std::string d = pad->GetDefaultDevice().ToString();
+      used.push_back(d);
+      used_pressed |= DeviceHasPress(d);
+    }
+  }
+  // A controller in use is being pressed: its twin seen through another backend
+  // (XInput / WGInput / SDL) must not be taken for a new controller.
+  if (used_pressed)
+    return;
+
+  if (m_mode == Mode::Players)
+  {
+    const std::string d = PressedDevice(used);
+    if (d.empty())
+      return;
+    for (int port = 1; port < 4; ++port)
+    {
+      if (PortActive(port))
+        continue;
+      Config::SetBaseOrCurrent(Config::GetInfoForSIDevice(port),
+                               SerialInterface::SIDEVICE_GC_CONTROLLER);
+      SwitchPort(port, d, false);
+      m_audio->Play(Sound::Confirm);
+      return;
+    }
+    m_audio->Play(Sound::Error);
+    return;
+  }
+
+  if (!Prefs::AutoSwitchController() || now - m_last_switch < 1200)
+    return;
+  const std::string d = PressedDevice(used);
+  if (!d.empty())
+    SwitchPort(0, d, true);
+}
+
+void BigPictureWindow::SwitchPort(int port, const std::string& device, bool announce)
+{
+  auto* pad = PadController(port);
+  if (!pad)
+    return;
+  m_last_switch = m_clock.elapsed();
+  // Keep the settings of the controller being replaced.
+  if (port == 0 || PortActive(port))
+    SaveBigPictureDeviceProfile(port);
+
+  bool needs_setup = false;
+  if (!LoadBigPictureDeviceProfile(port, device))
+  {
+    if (LooksLikeGameCube(device) || !ApplyStandardGamepadProfile(port, device))
+    {
+      const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+      ciface::Core::DeviceQualifier dq;
+      dq.FromString(device);
+      pad->SetDefaultDevice(dq);
+      pad->UpdateReferences(g_controller_interface);
+      needs_setup = true;
+    }
+  }
+  Pad::GetConfig()->SaveConfig();
+  m_prev_held = ~0u;  // the press that caused the switch must not trigger anything
+
+  const QString name = DeviceDisplayName(device);
+  if (announce)
+    Notify(tr("Joueur %1 : %2").arg(port + 1).arg(name));
+  if (needs_setup && port == 0 && Core::IsUninitialized(Core::System::GetInstance()) &&
+      (m_mode == Mode::Library || m_mode == Mode::Menu) && isVisible())
+  {
+    // A new GameCube controller: its buttons are learned once, then remembered.
+    StartSetup(0);
+  }
+  else if (needs_setup && announce)
+  {
+    Notify(tr("%1 : configure-la dans Réglages › Manettes").arg(name));
+  }
+}
+
+void BigPictureWindow::OnDevicesChanged()
+{
+  QStringList now;
+  for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+    now << QString::fromStdString(d);
+  QString added, removed;
+  for (const QString& d : now)
+  {
+    if (!m_known_devices.contains(d) && !IsIgnoredDevice(d.toStdString()) && added.isEmpty())
+      added = d;
+  }
+  for (const QString& d : m_known_devices)
+  {
+    if (!now.contains(d) && !IsIgnoredDevice(d.toStdString()) && removed.isEmpty())
+      removed = d;
+  }
+  m_known_devices = now;
+  if (!m_active)
+    return;
+
+  if (!added.isEmpty())
+    Notify(tr("Manette connectée : %1").arg(DeviceDisplayName(added.toStdString())));
+  else if (!removed.isEmpty())
+    Notify(tr("Manette déconnectée : %1").arg(DeviceDisplayName(removed.toStdString())));
+
+  // Player 1 lost its controller: take another one that is plugged in.
+  auto* pad = PadController(0);
+  if (!pad || !Prefs::AutoSwitchController() || g_controller_interface.FindDevice(pad->GetDefaultDevice()))
+    return;
+  std::string best;
+  for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+  {
+    if (!IsIgnoredDevice(d) && (best.empty() || SourcePriority(d) < SourcePriority(best)))
+      best = d;
+  }
+  if (!best.empty())
+    SwitchPort(0, best, true);
+}
+
+void BigPictureWindow::Notify(const QString& text)
+{
+  const bool over_game = m_mode == Mode::InGame || !isVisible();
+  if (!over_game)
+  {
+    Toast(text);
+    return;
+  }
+  // Over the game: a small click-through window, top right.
+  QScreen* screen = windowHandle() ? windowHandle()->screen() : QGuiApplication::primaryScreen();
+  if (!screen)
+    return;
+  const QRect g = screen->geometry();
+  const qreal k = g.height() / 1080.0;
+  m_notify_text = text;
+  m_notify_t = 0;
+  QFont font(m_text_family);
+  font.setPixelSize(int(64 * k * 0.34));
+  font.setWeight(QFont::DemiBold);
+  const int w = int(QFontMetricsF(font).horizontalAdvance(text) + 140 * k);
+  const int h = int(80 * k);
+  m_notifier->setGeometry(g.right() - w - int(40 * k), g.top() + int(40 * k), w, h);
+  m_notifier->show();
+  m_notifier->raise();
+  if (!m_notify_timer)
+  {
+    m_notify_timer = new QTimer(this);
+    m_notify_timer->setInterval(16);
+    connect(m_notify_timer, &QTimer::timeout, this, [this] {
+      m_notify_t += 0.016;
+      if (m_notify_t >= 3.0)
+      {
+        m_notify_timer->stop();
+        m_notifier->hide();
+        return;
+      }
+      m_notifier->update();
+    });
+  }
+  m_notify_timer->start();
+}
+
+void BigPictureWindow::DrawPlayers(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(0, 120 * k, width(), 30 * k), Qt::AlignCenter, tr("MULTIJOUEUR"));
+  painter.setFont(Font(true, int(52 * k), 700));
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, 160 * k, width(), 80 * k), Qt::AlignCenter, tr("Qui joue ?"));
+  painter.setFont(Font(false, int(22 * k), 400));
+  painter.setPen(TEXT_SOFT);
+  painter.drawText(QRectF(0, 250 * k, width(), 36 * k), Qt::AlignCenter,
+                   tr("Appuie sur un bouton d'une autre manette pour la faire rejoindre."));
+
+  const qreal cw = 380 * k, ch = 420 * k, gap = 36 * k;
+  const qreal x0 = (width() - (4 * cw + 3 * gap)) / 2;
+  const qreal y = 340 * k;
+  for (int port = 0; port < 4; ++port)
+  {
+    const QRectF r(x0 + port * (cw + gap), y, cw, ch);
+    const bool active = port == 0 || PortActive(port);
+    const GCPadStatus st = active ? Pad::GetStatus(port) : GCPadStatus{};
+    const bool pressed = active && (st.button & 0x1fff) != 0;
+    painter.setPen(QPen(active ? (pressed ? ACCENT_SOFT : ACCENT) : LINE, (active ? 3 : 2) * k,
+                        active ? Qt::SolidLine : Qt::DashLine));
+    painter.setBrush(active ? RAISED : SURFACE_DEEP);
+    painter.drawRoundedRect(r, 28 * k, 28 * k);
+
+    painter.setFont(Font(true, int(96 * k), 700));
+    painter.setPen(active ? TEXT : TEXT_DIM);
+    painter.drawText(QRectF(r.left(), r.top() + 40 * k, cw, 120 * k), Qt::AlignCenter,
+                     QString::number(port + 1));
+    painter.setFont(Font(false, int(18 * k), 600));
+    painter.setPen(active ? ACCENT_SOFT : TEXT_DIM);
+    painter.drawText(QRectF(r.left(), r.top() + 170 * k, cw, 30 * k), Qt::AlignCenter,
+                     tr("JOUEUR %1").arg(port + 1));
+
+    QString device;
+    if (active)
+    {
+      if (auto* pad = PadController(port))
+        device = DeviceDisplayName(pad->GetDefaultDevice().ToString());
+    }
+    DrawIcon(painter, active ? QStringLiteral("Control_Stick") : QStringLiteral("A"),
+             QRectF(r.center().x() - 36 * k, r.top() + 225 * k, 72 * k, 72 * k));
+    painter.setFont(Font(false, int(21 * k), 500));
+    painter.setPen(active ? TEXT : TEXT_DIM);
+    painter.drawText(QRectF(r.left() + 24 * k, r.top() + 310 * k, cw - 48 * k, 90 * k),
+                     Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
+                     active ? device : tr("Appuie sur un bouton pour rejoindre"));
+  }
+  DrawHints(painter, {}, {{QStringLiteral("X"), tr("Joueur seul")}, {QStringLiteral("B"), tr("Retour")}});
+}
+
+void BigPictureWindow::DrawPadTest(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  const GCPadStatus st = Pad::GetStatus(m_test_port);
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  QString device;
+  if (auto* pad = PadController(m_test_port))
+    device = DeviceDisplayName(pad->GetDefaultDevice().ToString());
+  painter.drawText(QRectF(0, 100 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("TEST DE LA MANETTE %1").arg(m_test_port + 1));
+  painter.setFont(Font(true, int(40 * k), 700));
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, 135 * k, width(), 60 * k), Qt::AlignCenter, device);
+
+  const qreal cx = width() / 2.0;
+  const auto stick = [&](QPointF c, qreal r, u8 sx, u8 sy, const QString& icon, QColor col) {
+    painter.setPen(QPen(LINE, 2 * k));
+    painter.setBrush(SURFACE);
+    QPolygonF gate;
+    for (int i = 0; i < 8; ++i)
+    {
+      const qreal a = i * std::numbers::pi / 4;
+      gate << QPointF(c.x() + std::cos(a) * r, c.y() - std::sin(a) * r);
+    }
+    painter.drawPolygon(gate);
+    painter.setPen(QPen(LINE, 1 * k, Qt::DashLine));
+    painter.drawLine(QPointF(c.x() - r, c.y()), QPointF(c.x() + r, c.y()));
+    painter.drawLine(QPointF(c.x(), c.y() - r), QPointF(c.x(), c.y() + r));
+    const qreal x = (sx - 128) / 127.0, y = (sy - 128) / 127.0;
+    const QPointF p(c.x() + std::clamp<qreal>(x, -1.1, 1.1) * r,
+                    c.y() - std::clamp<qreal>(y, -1.1, 1.1) * r);
+    painter.setPen(QPen(col, 3 * k));
+    painter.drawLine(c, p);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(col);
+    painter.drawEllipse(p, 14 * k, 14 * k);
+    DrawIcon(painter, icon, QRectF(c.x() - 28 * k, c.y() + r + 18 * k, 56 * k, 56 * k));
+    painter.setFont(Font(false, int(16 * k), 500));
+    painter.setPen(TEXT_DIM);
+    painter.drawText(QRectF(c.x() - r, c.y() + r + 78 * k, 2 * r, 24 * k), Qt::AlignCenter,
+                     QStringLiteral("%1 , %2").arg(int(sx) - 128).arg(int(sy) - 128));
+  };
+  stick(QPointF(cx - 470 * k, 560 * k), 130 * k, st.stickX, st.stickY,
+        QStringLiteral("Control_Stick"), TEXT);
+  stick(QPointF(cx + 470 * k, 600 * k), 100 * k, st.substickX, st.substickY,
+        QStringLiteral("C-Stick"), QColor(255, 214, 64));
+
+  // Triggers: analog value, digital click.
+  const auto trigger = [&](QRectF r, const QString& icon, u8 v, bool click) {
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(r, r.height() / 2, r.height() / 2);
+    painter.setBrush(click ? ACCENT_SOFT : ACCENT);
+    painter.drawRoundedRect(QRectF(r.left(), r.top(), r.width() * v / 255.0, r.height()),
+                            r.height() / 2, r.height() / 2);
+    DrawIcon(painter, icon, QRectF(r.left() - 74 * k, r.center().y() - 30 * k, 60 * k, 60 * k));
+    painter.setFont(Font(false, int(18 * k), 600));
+    painter.setPen(click ? BG : TEXT);
+    painter.drawText(r.adjusted(16 * k, 0, -16 * k, 0), Qt::AlignVCenter | Qt::AlignRight,
+                     click ? tr("CLIC") : QString::number(v));
+  };
+  trigger(QRectF(cx - 560 * k, 250 * k, 360 * k, 40 * k), QStringLiteral("L"), st.triggerLeft,
+          (st.button & PAD_TRIGGER_L) != 0);
+  trigger(QRectF(cx + 280 * k, 250 * k, 360 * k, 40 * k), QStringLiteral("R"), st.triggerRight,
+          (st.button & PAD_TRIGGER_R) != 0);
+
+  const auto button = [&](QPointF c, qreal r, const QString& icon, bool on) {
+    painter.setPen(Qt::NoPen);
+    QColor ring = on ? ACCENT : SURFACE;
+    painter.setBrush(ring);
+    painter.drawEllipse(c, r, r);
+    painter.setOpacity(on ? 1.0 : 0.55);
+    DrawIcon(painter, icon, QRectF(c.x() - r * 0.8, c.y() - r * 0.8, r * 1.6, r * 1.6));
+    painter.setOpacity(1.0);
+  };
+  const QPointF face(cx + 170 * k, 470 * k);
+  button(face, 62 * k, QStringLiteral("A"), (st.button & PAD_BUTTON_A) != 0);
+  button(face + QPointF(-100 * k, 70 * k), 40 * k, QStringLiteral("B"), (st.button & PAD_BUTTON_B) != 0);
+  button(face + QPointF(105 * k, -30 * k), 44 * k, QStringLiteral("X"), (st.button & PAD_BUTTON_X) != 0);
+  button(face + QPointF(-30 * k, -100 * k), 44 * k, QStringLiteral("Y"), (st.button & PAD_BUTTON_Y) != 0);
+  button(QPointF(cx + 200 * k, 340 * k), 38 * k, QStringLiteral("Z"), (st.button & PAD_TRIGGER_Z) != 0);
+  button(QPointF(cx, 470 * k), 36 * k, QStringLiteral("Start-Pause"), (st.button & PAD_BUTTON_START) != 0);
+
+  // D-pad: show the pressed direction with the matching icon variant.
+  QString dpad = QStringLiteral("D-Pad");
+  QString dir;
+  if (st.button & PAD_BUTTON_UP)
+    dir += QLatin1Char('U');
+  if (st.button & PAD_BUTTON_DOWN)
+    dir += QLatin1Char('D');
+  if (st.button & PAD_BUTTON_LEFT)
+    dir += QLatin1Char('L');
+  if (st.button & PAD_BUTTON_RIGHT)
+    dir += QLatin1Char('R');
+  if (!dir.isEmpty() && dir.size() <= 2)
+    dpad += QLatin1Char('-') + dir;
+  const QRectF dr(cx - 260 * k, 740 * k, 120 * k, 120 * k);
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(dir.isEmpty() ? SURFACE : ACCENT);
+  painter.drawEllipse(dr.adjusted(-14 * k, -14 * k, 14 * k, 14 * k));
+  DrawIcon(painter, dpad, dr);
+
+  painter.setFont(Font(false, int(20 * k), 400));
+  painter.setPen(TEXT_SOFT);
+  const qreal hold = m_test_start_since < 0 ? 0 :
+                                              std::min<qreal>(1, (m_clock.elapsed() - m_test_start_since) / 1000.0);
+  painter.drawText(QRectF(0, height() - 110 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("Maintiens START pour quitter"));
+  if (hold > 0)
+  {
+    const QRectF bar(cx - 150 * k, height() - 70 * k, 300 * k, 8 * k);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(bar, 4 * k, 4 * k);
+    painter.setBrush(ACCENT);
+    painter.drawRoundedRect(QRectF(bar.left(), bar.top(), bar.width() * hold, bar.height()), 4 * k,
+                            4 * k);
+  }
+}
+
+// ================================================================== updates
+
+void BigPictureWindow::CheckUpdates(bool silent)
+{
+  if (!silent)
+    Toast(tr("Recherche d'une mise à jour…"));
+  BigPictureUpdater::Check(this, [this, silent](bool available, const QString& version,
+                                                const QString& url, const QString& error) {
+    if (!error.isEmpty())
+    {
+      if (!silent)
+        Toast(error);
+      return;
+    }
+    if (!available)
+    {
+      if (!silent)
+        Toast(tr("Ton Dolphin est à jour"));
+      return;
+    }
+    m_update_url = url;
+    m_update_version = version;
+    if (BigPictureUpdater::BuildId() == QLatin1String("dev"))
+    {
+      if (!silent)
+        Toast(tr("Version locale : mise à jour automatique désactivée"));
+      return;
+    }
+    if (m_mode == Mode::Library || m_mode == Mode::Menu)
+    {
+      m_audio->Play(Sound::MenuOpen);
+      m_overlay_t = 0;
+      m_mode = Mode::ConfirmUpdate;
+    }
+    else
+    {
+      Notify(tr("Une mise à jour de Dolphin est disponible"));
+    }
+  });
+}
+
+// ================================================================== GameCube intro
+
+void BigPictureWindow::DrawIntroGameCube(QPainter& painter)
+{
+  // A small cube rolls along a "G" drawn on a 3x3 grid, leaving its trail,
+  // then the big cube appears with the title (like the console's boot).
+  const qreal k = height() / 1080.0;
+  const qreal t = m_intro_t * 4.6;
+  painter.fillRect(rect(), Qt::black);
+
+  const qreal cell = 70 * k;
+  const QPointF origin(width() / 2.0 - 1.5 * cell, height() / 2.0 - 1.5 * cell - 60 * k);
+  // Path through the cells of a 3x3 grid forming a G (col,row)
+  static constexpr int path[][2] = {{2, 0}, {1, 0}, {0, 0}, {0, 1}, {0, 2},
+                                    {1, 2}, {2, 2}, {2, 1}, {1, 1}};
+  constexpr int steps = static_cast<int>(std::size(path));
+  const qreal roll_time = 2.2;
+  const qreal progress = std::clamp<qreal>(t / roll_time, 0, 1) * (steps - 1);
+  const int done = static_cast<int>(progress);
+
+  const QColor indigo(110, 86, 230);
+  const QColor indigo_light(170, 150, 255);
+  const qreal assemble = std::clamp<qreal>((t - roll_time) / 0.6, 0, 1);
+
+  // Trail: cells already visited light up.
+  for (int i = 0; i <= done && i < steps; ++i)
+  {
+    const QRectF r(origin.x() + path[i][0] * cell, origin.y() + path[i][1] * cell, cell, cell);
+    QColor c = indigo;
+    c.setAlphaF(static_cast<float>(0.85 * (1 - assemble * 0.4)));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(c);
+    painter.drawRect(r.adjusted(3 * k, 3 * k, -3 * k, -3 * k));
+  }
+
+  if (assemble <= 0)
+  {
+    // The rolling cube, rotating a quarter turn per cell.
+    const int i = std::min(done, steps - 2);
+    const qreal f = EaseInOut(progress - i);
+    const QPointF a(origin.x() + (path[i][0] + 0.5) * cell, origin.y() + (path[i][1] + 0.5) * cell);
+    const QPointF b(origin.x() + (path[i + 1][0] + 0.5) * cell,
+                    origin.y() + (path[i + 1][1] + 0.5) * cell);
+    const QPointF pos = a + (b - a) * f;
+    painter.save();
+    painter.translate(pos);
+    painter.rotate(90 * f * ((path[i + 1][0] - path[i][0]) + (path[i + 1][1] - path[i][1])));
+    painter.setBrush(indigo_light);
+    painter.setPen(QPen(Qt::white, 2 * k));
+    painter.drawRect(QRectF(-cell * 0.42, -cell * 0.42, cell * 0.84, cell * 0.84));
+    painter.restore();
+  }
+  else
+  {
+    // The G closes into the big cube outline.
+    const QRectF box(origin.x(), origin.y(), 3 * cell, 3 * cell);
+    painter.setBrush(Qt::NoBrush);
+    QColor edge = indigo_light;
+    edge.setAlphaF(static_cast<float>(assemble));
+    painter.setPen(QPen(edge, 5 * k));
+    painter.drawRect(box.adjusted(-6 * k, -6 * k, 6 * k, 6 * k));
+    // Isometric top/side faces
+    const qreal d = 40 * k * assemble;
+    QPolygonF top, side;
+    top << box.topLeft() + QPointF(-6 * k, -6 * k) << box.topLeft() + QPointF(d - 6 * k, -d - 6 * k)
+        << box.topRight() + QPointF(d + 6 * k, -d - 6 * k) << box.topRight() + QPointF(6 * k, -6 * k);
+    side << box.topRight() + QPointF(6 * k, -6 * k) << box.topRight() + QPointF(d + 6 * k, -d - 6 * k)
+         << box.bottomRight() + QPointF(d + 6 * k, -d + 6 * k)
+         << box.bottomRight() + QPointF(6 * k, 6 * k);
+    painter.drawPolygon(top);
+    painter.drawPolygon(side);
+  }
+
+  // Title
+  const qreal title = std::clamp<qreal>((t - roll_time - 0.3) / 0.8, 0, 1);
+  if (title > 0)
+  {
+    painter.setOpacity(EaseOut(title));
+    painter.setFont(Font(true, int(76 * k), 700));
+    painter.setPen(Qt::white);
+    const qreal ty = origin.y() + 3 * cell + 70 * k + (1 - EaseOut(title)) * 20 * k;
+    painter.drawText(QRectF(0, ty, width(), 100 * k), Qt::AlignCenter, QStringLiteral("Dolphin"));
+    QFont sub = Font(false, int(20 * k), 600);
+    sub.setLetterSpacing(QFont::AbsoluteSpacing, 6 * k);
+    painter.setFont(sub);
+    painter.setPen(indigo_light);
+    painter.drawText(QRectF(0, ty + 100 * k, width(), 36 * k), Qt::AlignCenter, tr("MODE MANETTE"));
+    painter.setOpacity(1);
+  }
 }

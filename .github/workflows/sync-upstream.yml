@@ -1,0 +1,39 @@
+name: Sync with official Dolphin
+
+# Merges the official Dolphin every day, then rebuilds: the controller mode gets every
+# new Dolphin feature, installed from Settings > Rechercher une mise à jour.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/dolphin-emu/dolphin.git
+          git fetch upstream master
+          before=$(git rev-parse HEAD)
+          git merge --no-edit -m "🤖 Merge official Dolphin" upstream/master
+          git submodule update --init --recursive
+          if [ "$(git rev-parse HEAD)" != "$before" ]; then
+            git push origin HEAD:master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Rebuild
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build-windows.yml --ref master

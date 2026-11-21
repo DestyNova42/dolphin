@@ -5,6 +5,9 @@ on:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -33,6 +36,7 @@ jobs:
           cmake --preset ninja-release-x64 -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
           -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+          -DBP_BUILD_ID=${{ github.sha }}
 
       - name: Build
         run: cmake --build --preset ninja-build-release-x64 --target dolphin-emu
@@ -53,3 +57,16 @@ jobs:
         with:
           name: Dolphin-Manette-Windows
           path: dist/Dolphin-Manette
+
+      - name: Publish release (updates of the controller mode)
+        if: github.ref == 'refs/heads/master'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Compress-Archive -Path dist/Dolphin-Manette/* -DestinationPath Dolphin-Manette-Windows.zip -Force
+          gh release delete manette-latest --yes --cleanup-tag 2>$null
+          $global:LASTEXITCODE = 0
+          gh release create manette-latest Dolphin-Manette-Windows.zip `
+            --target "${{ github.sha }}" --title "${{ github.sha }}" --latest `
+            --notes "Dolphin mode manette - build ${{ github.sha }}"

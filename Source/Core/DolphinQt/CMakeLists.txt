@@ -41,6 +41,8 @@ add_executable(dolphin-emu
   BigPicture/BigPictureAudio.h
   BigPicture/BigPictureSettings.cpp
   BigPicture/BigPictureSettings.h
+  BigPicture/BigPictureUpdater.cpp
+  BigPicture/BigPictureUpdater.h
   BigPicture/BigPictureWindow.cpp
   BigPicture/BigPictureWindow.h
   CheatSearchFactoryWidget.cpp
@@ -490,6 +492,13 @@ if(ENABLE_CUBEB)
     target_link_libraries(dolphin-emu PRIVATE cubeb)
   endif()
   target_compile_definitions(dolphin-emu PRIVATE HAVE_BIGPICTURE_CUBEB)
+endif()
+
+# Controller mode updates: the CI passes the commit it builds.
+# Only on the updater source, so the rest of the build stays cached.
+if(BP_BUILD_ID)
+  set_source_files_properties(BigPicture/BigPictureUpdater.cpp PROPERTIES
+    COMPILE_DEFINITIONS "BP_BUILD_ID=\"${BP_BUILD_ID}\"")
 endif()
 
 if(ENABLE_SDL)

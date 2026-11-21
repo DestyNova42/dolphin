@@ -8,6 +8,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <QColor>
@@ -116,6 +117,10 @@ private:
     Calibrate,     // stick calibration
     Memcard,       // memory card manager
     GameSettings,  // per-game settings
+    Players,       // multiplayer: who plays on which port
+    PadTest,       // live view of a controller
+    Closing,       // fading to black before stopping the game
+    ConfirmUpdate, // an update is available
   };
 
   struct SaveIcon
@@ -205,6 +210,23 @@ private:
 
   // ---- per-game settings
   void OpenGameSettings();
+  void OpenGameSettingsFor(const Entry& entry, bool cheats_only);
+
+  // ---- controllers
+  void PollDevices();          // auto-switch, multiplayer assignment
+  void OnDevicesChanged();     // hot plug
+  void SwitchPort(int port, const std::string& device, bool announce);
+  std::string PressedDevice(const std::vector<std::string>& exclude) const;
+  void DrawPlayers(QPainter& painter);
+  void DrawPadTest(QPainter& painter);
+  void Notify(const QString& text);  // toast, also over a running game
+
+  // ---- updates
+  void CheckUpdates(bool silent);
+
+  // ---- themes
+  void ApplyTheme();
+  void DrawIntroGameCube(QPainter& painter);
   std::vector<BigPictureSettingCategory>& Cats();
 
   // ---- pause screenshots
@@ -358,4 +380,32 @@ private:
   qreal m_fade_in = 1;   // black veil after returning from a game (1 = done)
   qreal m_window_opacity = 1;
   std::array<QPixmap, 9> m_slot_thumbs;
+
+  // quick settings / cheats (pause)
+  std::vector<BigPictureSettingCategory> m_quick_settings;
+  bool m_quick = false;
+  Mode m_mode_before_game_settings = Mode::Library;
+
+  // controllers
+  QTimer* m_device_timer = nullptr;
+  QStringList m_known_devices;
+  int m_test_port = 0;
+  qint64 m_test_start_since = -1;
+  Mode m_mode_before_players = Mode::Library;
+  qint64 m_last_switch = 0;
+
+  // in-game notifications (separate, click-through window)
+  QWidget* m_notifier = nullptr;
+  QTimer* m_notify_timer = nullptr;
+  QString m_notify_text;
+  qreal m_notify_t = 0;
+
+  // closing
+  qreal m_close_t = 0;
+  bool m_stop_sent = false;
+
+  // updates
+  QString m_update_url;
+  QString m_update_version;
+  bool m_update_busy = false;
 };

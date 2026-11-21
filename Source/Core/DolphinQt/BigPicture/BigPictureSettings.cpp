@@ -10,11 +10,22 @@
 #include <utility>
 
 #include <QCoreApplication>
+#include <QDir>
+#include <QFile>
 #include <QSettings>
+#include <QStandardPaths>
 
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
 #include "Common/Config/Layer.h"
+#include "Common/FileUtil.h"
+#include "Common/IniFile.h"
+#include "Core/ActionReplay.h"
+#include "Core/ConfigManager.h"
+#include "Core/GeckoCode.h"
+#include "Core/GeckoCodeConfig.h"
+#include "Core/Core.h"
+#include "Core/System.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/GCPadEmu.h"
 #include "InputCommon/ControlReference/ControlReference.h"
@@ -205,7 +216,23 @@ View GetView()
 }
 Effect GetEffect()
 {
-  return static_cast<Effect>(std::clamp(Pref("bigpicture/effect", 0), 0, 4));
+  return static_cast<Effect>(std::clamp(Pref("bigpicture/effect", 0), 0, 5));
+}
+Theme GetTheme()
+{
+  return static_cast<Theme>(std::clamp(Pref("bigpicture/theme", 0), 0, 5));
+}
+IntroStyle GetIntroStyle()
+{
+  return static_cast<IntroStyle>(std::clamp(Pref("bigpicture/intro_style", 0), 0, 1));
+}
+bool AutoSwitchController()
+{
+  return Settings::GetQSettings().value(QStringLiteral("bigpicture/autoswitch"), true).toBool();
+}
+bool CheckUpdatesOnStart()
+{
+  return Settings::GetQSettings().value(QStringLiteral("bigpicture/check_updates"), true).toBool();
 }
 Transition GetTransition()
 {
@@ -233,6 +260,7 @@ void SaveBigPictureSettings()
 {
   Config::Save();
   Pad::GetConfig()->SaveConfig();
+  SaveBigPictureDeviceProfile(0);
   Settings::GetQSettings().sync();
 }
 
@@ -250,10 +278,16 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  Tr("Jaquettes en rangée, ou liste avec les bannières des jeux."),
                                  QStringLiteral("bigpicture/view"),
                                  {Tr("Jaquettes"), Tr("Liste avec bannières")}, 0, changed));
+    c.items.push_back(PrefChoice(Tr("Thème de couleur"), {}, QStringLiteral("bigpicture/theme"),
+                                 {Tr("Indigo nuit"), Tr("Indigo GameCube"), Tr("Orange Spice"),
+                                  Tr("Noir OLED"), Tr("Platine (clair)"), Tr("Couleur du jeu")},
+                                 0, changed));
     c.items.push_back(PrefChoice(
         Tr("Effet d'arrière-plan"), Tr("L'animation qui vit derrière la bibliothèque."),
         QStringLiteral("bigpicture/effect"),
-        {Tr("Halo"), Tr("Particules"), Tr("Cubes"), Tr("Vagues"), Tr("Aucun")}, 0, changed));
+        {Tr("Halo"), Tr("Particules"), Tr("Cubes"), Tr("Vagues"), Tr("Aucun"),
+         Tr("Cube 3D (BIOS)")},
+        0, changed));
     c.items.push_back(PrefChoice(Tr("Transitions"),
                                  Tr("L'effet utilisé quand on change d'onglet ou d'écran."),
                                  QStringLiteral("bigpicture/transition"),
@@ -262,6 +296,10 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(PrefToggle(Tr("Animation de démarrage"),
                                  Tr("Le cube animé et le jingle au lancement de Dolphin."),
                                  QStringLiteral("bigpicture/intro"), true, changed));
+    c.items.push_back(PrefChoice(Tr("Style de l'animation"),
+                                 Tr("GameCube : le petit cube qui roule et dessine le logo."),
+                                 QStringLiteral("bigpicture/intro_style"),
+                                 {Tr("GameCube"), Tr("Minimaliste")}, 0, changed));
     c.items.push_back(PrefToggle(Tr("Musique du menu"),
                                  Tr("Fichiers lus depuis <dossier utilisateur>/BigPicture/Sounds."),
                                  QStringLiteral("bigpicture/music"), true, changed));
@@ -278,6 +316,31 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Action(Tr("Rafraîchir la bibliothèque"),
                              Tr("Relit les dossiers de jeux pour trouver les nouveaux jeux."),
                              [] { Settings::Instance().RefreshGameList(); }));
+    {
+      const auto notify = host.notify;
+      c.items.push_back(Action(
+          Tr("Créer un raccourci sur le Bureau"),
+          Tr("Lance Dolphin directement en mode manette (aussi utilisable dans Steam)."),
+          [notify] {
+            const QString desktop =
+                QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
+            const QString link = QDir(desktop).filePath(QStringLiteral("Dolphin (mode manette).lnk"));
+            QFile::remove(link);
+            const bool ok = QFile::link(QCoreApplication::applicationFilePath(), link);
+            Settings::GetQSettings().setValue(QStringLiteral("bigpicture/onstart"), true);
+            if (notify)
+              notify(ok ? Tr("Raccourci créé sur le Bureau") : Tr("Impossible de créer le raccourci"));
+          }));
+    }
+    c.items.push_back(PrefToggle(Tr("Rechercher les mises à jour au démarrage"), {},
+                                 QStringLiteral("bigpicture/check_updates"), true, {}));
+    {
+      const auto check = host.check_updates;
+      c.items.push_back(Action(Tr("Rechercher une mise à jour"),
+                               Tr("Télécharge la dernière version compilée de ton Dolphin (avec "
+                                  "les nouveautés du Dolphin officiel) et l'installe."),
+                               [check] { check(); }));
+    }
     cats.push_back(std::move(c));
   }
 
@@ -655,6 +718,26 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
       item.activate = [change = item.change] { change(1); };
       c.items.push_back(std::move(item));
     }
+    c.items.push_back(PrefToggle(Tr("Changement de manette automatique"),
+                                 Tr("La dernière manette utilisée devient celle du joueur 1, avec "
+                                    "ses propres réglages."),
+                                 QStringLiteral("bigpicture/autoswitch"), true, {}));
+    {
+      const auto test = host.test_controller;
+      c.items.push_back(Action(Tr("Tester la manette"),
+                               Tr("Aperçu des boutons, des sticks et des gâchettes analogiques."),
+                               [test, port] { test(*port); }));
+    }
+    {
+      const auto notify = host.notify;
+      c.items.push_back(Action(Tr("Enregistrer le profil de cette manette"),
+                               Tr("Ses réglages reviendront dès qu'elle sera de nouveau utilisée."),
+                               [port, notify] {
+                                 SaveBigPictureDeviceProfile(*port);
+                                 if (notify)
+                                   notify(Tr("Profil enregistré"));
+                               }));
+    }
     c.items.push_back(Action(Tr("Profil automatique (manette standard)"),
                              Tr("Xbox, PlayStation, Switch Pro… : A, B, X, Y, gâchettes, sticks "
                                 "et croix réglés d'un coup."),
@@ -881,7 +964,7 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
 
 // ---------------------------------------------------------------- standard gamepad profile
 
-bool ApplyStandardGamepadProfile(int port)
+bool ApplyStandardGamepadProfile(int port, const std::string& forced_device)
 {
   auto* pad = Pad::GetConfig()->GetController(port);
   if (!pad)
@@ -890,8 +973,9 @@ bool ApplyStandardGamepadProfile(int port)
     return d.rfind("SDL/", 0) == 0 || d.rfind("XInput/", 0) == 0 ||
            d.rfind("WGInput/", 0) == 0 || d.rfind("evdev/", 0) == 0;
   };
-  std::string device = pad->GetDefaultDevice().ToString();
-  if (!is_gamepad(device) || !g_controller_interface.FindDevice(pad->GetDefaultDevice()))
+  std::string device = forced_device.empty() ? pad->GetDefaultDevice().ToString() : forced_device;
+  if (forced_device.empty() &&
+      (!is_gamepad(device) || !g_controller_interface.FindDevice(pad->GetDefaultDevice())))
   {
     device.clear();
     for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
@@ -1100,5 +1184,167 @@ BuildBigPictureGameSettings(const std::shared_ptr<Config::Layer>& layer)
                                          {3.0f, Percent(3.0f)}}));
     cats.push_back(std::move(c));
   }
+  return cats;
+}
+
+
+// ---------------------------------------------------------------- device profiles
+
+std::string BigPictureProfilePath(const std::string& device_name)
+{
+  std::string safe;
+  for (const char ch : device_name)
+  {
+    const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                    ch == ' ' || ch == '-' || ch == '_';
+    safe += ok ? ch : '_';
+  }
+  return File::GetUserPath(D_CONFIG_IDX) + "Profiles/GCPad/Mode manette - " + safe + ".ini";
+}
+
+void SaveBigPictureDeviceProfile(int port)
+{
+  auto* pad = Pad::GetConfig()->GetController(port);
+  if (!pad)
+    return;
+  const auto& dq = pad->GetDefaultDevice();
+  if (dq.name.empty() || dq.source == "DSUClient" || dq.name.find("Keyboard") != std::string::npos)
+    return;
+  const std::string path = BigPictureProfilePath(dq.name);
+  File::CreateFullPath(path);
+  Common::IniFile ini;
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    pad->SaveConfig(ini.GetOrCreateSection("Profile"));
+  }
+  ini.Save(path);
+}
+
+bool LoadBigPictureDeviceProfile(int port, const std::string& device)
+{
+  auto* pad = Pad::GetConfig()->GetController(port);
+  if (!pad)
+    return false;
+  ciface::Core::DeviceQualifier dq;
+  dq.FromString(device);
+  const std::string path = BigPictureProfilePath(dq.name);
+  Common::IniFile ini;
+  if (!File::Exists(path) || !ini.Load(path))
+    return false;
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  pad->LoadConfig(ini.GetOrCreateSection("Profile"));
+  // The profile may name another instance of the same model (e.g. SDL/1/...).
+  pad->SetDefaultDevice(dq);
+  pad->UpdateReferences(g_controller_interface);
+  return true;
+}
+
+// ---------------------------------------------------------------- quick settings (pause)
+
+std::vector<BigPictureSettingCategory> BuildBigPictureQuickSettings()
+{
+  BigPictureSettingCategory c{Tr("Réglages rapides"), {}};
+  c.items.push_back(Choice<int>(Tr("Résolution interne"), {}, Config::GFX_EFB_SCALE,
+                                {{1, Tr("Native (480p)")},
+                                 {2, Tr("2× (720p)")},
+                                 {3, Tr("3× (1080p)")},
+                                 {4, Tr("4× (1440p)")},
+                                 {5, Tr("5× (1800p)")},
+                                 {6, Tr("6× (4K)")},
+                                 {8, Tr("8× (5K)")}}));
+  c.items.push_back(Choice<u32>(Tr("Anticrénelage (MSAA)"), {}, Config::GFX_MSAA,
+                                {{1, Tr("Aucun")}, {2, Tr("2×")}, {4, Tr("4×")}, {8, Tr("8×")}}));
+  c.items.push_back(Choice<AspectMode>(Tr("Format d'image"), {}, Config::GFX_ASPECT_RATIO,
+                                       {{AspectMode::Auto, Tr("Auto")},
+                                        {AspectMode::ForceWide, Tr("16:9 forcé")},
+                                        {AspectMode::ForceStandard, Tr("4:3 forcé")},
+                                        {AspectMode::Stretch, Tr("Étirer")}}));
+  c.items.push_back(Toggle(Tr("Écran large forcé (hack)"), {}, Config::GFX_WIDESCREEN_HACK));
+  c.items.push_back(Choice<float>(Tr("Vitesse d'émulation"), {}, Config::MAIN_EMULATION_SPEED,
+                                  {{0.5f, Percent(0.5f)},
+                                   {1.0f, Percent(1.0f)},
+                                   {1.5f, Percent(1.5f)},
+                                   {2.0f, Percent(2.0f)},
+                                   {0.0f, Tr("Illimitée")}}));
+  c.items.push_back(Toggle(Tr("Afficher les FPS"), {}, Config::GFX_SHOW_FPS));
+  c.items.push_back(IntRange(Tr("Volume"), {}, Config::MAIN_AUDIO_VOLUME, 0, 100, 5,
+                             [](int v) { return QStringLiteral("%1 %").arg(v); }));
+  c.items.push_back(Toggle(Tr("Couper le son"), {}, Config::MAIN_AUDIO_MUTED));
+  std::vector<BigPictureSettingCategory> cats;
+  cats.push_back(std::move(c));
+  return cats;
+}
+
+// ---------------------------------------------------------------- cheats
+
+std::vector<BigPictureSettingCategory> BuildBigPictureCheatSettings(const std::string& game_id,
+                                                                     u16 revision)
+{
+  const std::string ini_path = File::GetUserPath(D_GAMESETTINGS_IDX) + game_id + ".ini";
+  Common::IniFile local;
+  local.Load(ini_path);
+  const Common::IniFile def = SConfig::LoadDefaultGameIni(game_id, revision);
+  auto gecko = std::make_shared<std::vector<Gecko::GeckoCode>>(Gecko::LoadCodes(def, local));
+  auto ar = std::make_shared<std::vector<ActionReplay::ARCode>>(ActionReplay::LoadCodes(def, local));
+
+  const auto save = [ini_path, gecko, ar, game_id, revision] {
+    Common::IniFile ini;
+    ini.Load(ini_path);
+    Gecko::SaveCodes(ini, *gecko);
+    ActionReplay::SaveCodes(&ini, *ar);
+    File::CreateFullPath(ini_path);
+    ini.Save(ini_path);
+    // Apply right away if this game is running.
+    auto& system = Core::System::GetInstance();
+    if (!Core::IsUninitialized(system) && SConfig::GetInstance().GetGameID() == game_id)
+    {
+      Gecko::SetActiveCodes(*gecko, game_id, revision);
+      ActionReplay::ApplyCodes(*ar, game_id, revision);
+    }
+  };
+
+  std::vector<BigPictureSettingCategory> cats;
+  BigPictureSettingCategory g{Tr("Codes Gecko"), {}};
+  for (size_t i = 0; i < gecko->size(); ++i)
+  {
+    Item item;
+    item.label = QString::fromStdString((*gecko)[i].name);
+    item.help = QString::fromStdString((*gecko)[i].creator);
+    item.kind = Item::Kind::Toggle;
+    item.is_on = [gecko, i] { return (*gecko)[i].enabled; };
+    item.change = [gecko, i, save](int) {
+      (*gecko)[i].enabled = !(*gecko)[i].enabled;
+      save();
+    };
+    item.activate = [change = item.change] { change(1); };
+    g.items.push_back(std::move(item));
+  }
+  if (g.items.empty())
+    g.items.push_back(Action(Tr("Aucun code Gecko pour ce jeu"), {}, [] {}));
+  cats.push_back(std::move(g));
+
+  BigPictureSettingCategory a{Tr("Codes Action Replay"), {}};
+  for (size_t i = 0; i < ar->size(); ++i)
+  {
+    Item item;
+    item.label = QString::fromStdString((*ar)[i].name);
+    item.kind = Item::Kind::Toggle;
+    item.is_on = [ar, i] { return (*ar)[i].enabled; };
+    item.change = [ar, i, save](int) {
+      (*ar)[i].enabled = !(*ar)[i].enabled;
+      save();
+    };
+    item.activate = [change = item.change] { change(1); };
+    a.items.push_back(std::move(item));
+  }
+  if (a.items.empty())
+    a.items.push_back(Action(Tr("Aucun code Action Replay pour ce jeu"), {}, [] {}));
+  cats.push_back(std::move(a));
+
+  BigPictureSettingCategory o{Tr("Options des codes"), {}};
+  o.items.push_back(Toggle(Tr("Activer les codes de triche"),
+                           Tr("Réglage général : nécessaire pour que les codes fonctionnent."),
+                           Config::MAIN_ENABLE_CHEATS));
+  cats.push_back(std::move(o));
   return cats;
 }

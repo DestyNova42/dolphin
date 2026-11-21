@@ -12,6 +12,8 @@
 
 #include <QString>
 
+#include "Common/CommonTypes.h"
+
 struct BigPictureSettingItem
 {
   enum class Kind
@@ -47,6 +49,9 @@ struct BigPictureSettingsHost
       remap_control;
   std::function<void(int port, int group)> calibrate_stick;
   std::function<void()> open_memory_cards;
+  std::function<void(int port)> test_controller;
+  std::function<void()> check_updates;
+  std::function<void(const QString&)> notify;  // short message on screen
   std::function<void()> open_classic;
   std::function<void()> interface_changed;  // a controller-mode preference changed
 };
@@ -71,6 +76,21 @@ enum class Effect
   Cubes,
   Waves,
   None,
+  Cube3D,
+};
+enum class Theme
+{
+  IndigoNight,
+  IndigoGameCube,
+  Spice,
+  Oled,
+  Platinum,
+  GameColor,
+};
+enum class IntroStyle
+{
+  GameCube,
+  Minimal,
 };
 enum class Transition
 {
@@ -82,6 +102,10 @@ enum class Transition
 
 View GetView();
 Effect GetEffect();
+Theme GetTheme();
+IntroStyle GetIntroStyle();
+bool AutoSwitchController();
+bool CheckUpdatesOnStart();
 Transition GetTransition();
 bool IntroEnabled();
 bool MusicEnabled();
@@ -95,8 +119,20 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
 std::vector<BigPictureSettingCategory>
 BuildBigPictureGameSettings(const std::shared_ptr<Config::Layer>& layer);
 
+// Short list for the pause menu.
+std::vector<BigPictureSettingCategory> BuildBigPictureQuickSettings();
+
+// Gecko / Action Replay codes of a game (enabled state saved immediately in GameSettings).
+std::vector<BigPictureSettingCategory> BuildBigPictureCheatSettings(const std::string& game_id,
+                                                                     u16 revision);
+
+// Per-device controller profiles: <User>/Config/Profiles/GCPad/Mode manette - <device>.ini
+std::string BigPictureProfilePath(const std::string& device_name);
+void SaveBigPictureDeviceProfile(int port);
+bool LoadBigPictureDeviceProfile(int port, const std::string& device);
+
 // Writes changed settings to disk.
 void SaveBigPictureSettings();
 
 // Applies a standard gamepad layout (Xbox / PlayStation / Switch Pro…) to a GameCube port.
-bool ApplyStandardGamepadProfile(int port);
+bool ApplyStandardGamepadProfile(int port, const std::string& device = {});
