@@ -1015,9 +1015,9 @@ void BigPictureWindow::paintEvent(QPaintEvent*)
     const QPointF c(width() - 430 * k, 290 * k);
     QRadialGradient g(c, 760 * k);
     QColor inner = m_ambient;
-    inner.setAlphaF(0.26);
+    inner.setAlphaF(0.26f);
     QColor outer = m_ambient;
-    outer.setAlphaF(0.0);
+    outer.setAlphaF(0.0f);
     g.setColorAt(0, inner);
     g.setColorAt(0.55, QColor(m_ambient.red(), m_ambient.green(), m_ambient.blue(), 25));
     g.setColorAt(1, outer);
