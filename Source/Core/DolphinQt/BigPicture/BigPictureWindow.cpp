@@ -41,6 +41,12 @@
 #include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
 #include "Core/Config/GraphicsSettings.h"
+#include "VideoCommon/VideoConfig.h"
+#include "VideoCommon/Widescreen.h"
+#include "DolphinQt/BigPicture/BigPictureDisplay.h"
+#ifdef _WIN32
+#include "InputCommon/ControllerInterface/Switch2BLE/Switch2BLE.h"
+#endif
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigLoaders/GameConfigLoader.h"
 #include "Core/ConfigManager.h"
@@ -110,10 +116,10 @@ Palette PaletteFor(BigPicturePrefs::Theme theme)
     return {{38, 31, 96},     {52, 44, 122},    {44, 37, 108},    {66, 56, 146},
             {88, 77, 172},    {248, 246, 255},  {210, 204, 244},  {166, 158, 222},
             {160, 146, 255},  {222, 214, 255}};
-  case T::Spice:  // Spice Orange, the colour of the console
-    return {{22, 11, 4},      {42, 23, 10},     {32, 17, 7},      {60, 33, 14},
-            {94, 55, 24},     {255, 246, 236},  {232, 200, 168},  {168, 132, 102},
-            {247, 134, 28},   {255, 177, 94}};
+  case T::Spice:  // Spice Orange: orange like the console, black like its lid
+    return {{240, 124, 20},   {226, 108, 10},   {232, 116, 14},   {252, 146, 48},
+            {255, 176, 96},   {255, 255, 255},  {255, 236, 214},  {255, 212, 168},
+            {28, 25, 30},     {66, 30, 0}};
   case T::JetBlack:  // Jet Black
     return {{6, 6, 8},        {20, 20, 23},     {12, 12, 14},     {34, 34, 39},
             {52, 52, 60},     {242, 242, 246},  {172, 172, 182},  {122, 122, 134},
@@ -493,6 +499,7 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
 
 BigPictureWindow::~BigPictureWindow()
 {
+  BigPictureDisplay::RestoreHdr();
   delete m_notifier;
 }
 
@@ -531,6 +538,9 @@ void BigPictureWindow::ApplyPreferences()
 void BigPictureWindow::Open()
 {
   unsetCursor();
+  // The controller mode's CRT shaders were removed: don't leave Dolphin pointing at them.
+  if (Config::Get(Config::GFX_ENHANCE_POST_SHADER).rfind("crt_manette", 0) == 0)
+    Config::SetBaseOrCurrent(Config::GFX_ENHANCE_POST_SHADER, std::string());
   m_resume_known.clear();
   m_resume_shot_path.clear();
   static bool s_cleaned_up = false;
@@ -637,6 +647,7 @@ void BigPictureWindow::OnEmulationStateChanged(Core::State state)
     break;
   case Core::State::Uninitialized:
     m_game_timer->stop();
+    BigPictureDisplay::RestoreHdr();
     if (m_mode == Mode::InGame || m_mode == Mode::Pause || m_mode == Mode::Launching ||
         m_mode == Mode::FadingOut || m_mode == Mode::Closing)
     {
@@ -1520,6 +1531,7 @@ void BigPictureWindow::OpenPause()
   // Capture the current image for the save-state thumbnails, then pause.
   QFile::remove(PauseShotPath());
   Core::SaveScreenShot("bigpicture_pause");
+  m_game_aspect = GameAspect();
   QTimer::singleShot(150, this, [this] {
     if (m_mode == Mode::Pause)
       Core::SetState(Core::System::GetInstance(), Core::State::Paused);
@@ -2714,7 +2726,7 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
   DrawHero(painter, *sel, left, 216 * k, resume ? 1000 * k : 1150 * k);
   if (resume)
   {
-    const qreal cw = 690 * k, chh = 388 * k;
+    const qreal chh = 388 * k, cw = chh * ResumeAspect(*sel);
     DrawResumeCard(painter, *sel, QRectF(width() - 80 * k - cw, 168 * k, cw, chh));
   }
 
@@ -3467,19 +3479,17 @@ void BigPictureWindow::DrawPause(QPainter& painter)
       painter.drawRoundedRect(r.adjusted(-4 * k, -4 * k, 4 * k, 4 * k), 20 * k, 20 * k);
     }
     const u64 when = State::GetUnixTimeOfSlot(static_cast<u32>(s));
-    // Thumbnail (16:9) on the left of the card
-    const QRectF tr_(r.left() + 12 * k, r.top() + 12 * k, (ch - 24 * k) * 16 / 9, ch - 24 * k);
+    // Thumbnail on the left of the card, with the game's proportions (4:3 or 16:9)
+    const QRectF tr_(r.left() + 12 * k, r.top() + 12 * k, (ch - 24 * k) * m_game_aspect,
+                     ch - 24 * k);
     QPainterPath tclip;
     tclip.addRoundedRect(tr_, 10 * k, 10 * k);
     painter.save();
     painter.setClipPath(tclip, Qt::IntersectClip);
     if (when != 0 && !m_slot_thumbs[s].isNull())
     {
-      const QPixmap& th = m_slot_thumbs[s];
-      const QSizeF src = QSizeF(th.size()).scaled(tr_.size(), Qt::KeepAspectRatioByExpanding);
-      painter.drawPixmap(QRectF(tr_.center().x() - src.width() / 2,
-                                tr_.center().y() - src.height() / 2, src.width(), src.height()),
-                         th, QRectF(th.rect()));
+      // The capture is the game's picture: shown at the game's proportions
+      painter.drawPixmap(tr_, m_slot_thumbs[s], QRectF(m_slot_thumbs[s].rect()));
     }
     else
     {
@@ -4590,6 +4600,21 @@ void BigPictureWindow::PollDevices()
 {
   if (!m_active)
     return;
+#ifdef _WIN32
+  // Bluetooth of the Switch 2 controllers: show connections and failures.
+  {
+    const QString bt = QString::fromStdString(ciface::Switch2BLE::GetStatus());
+    if (bt != m_bt_status)
+    {
+      const bool first = m_bt_status.isEmpty();
+      m_bt_status = bt;
+      if (!first && (bt.startsWith(QStringLiteral("Échec")) ||
+                     bt.startsWith(QStringLiteral("Connectée")) ||
+                     bt.startsWith(QStringLiteral("Manette trouvée"))))
+        Notify(QStringLiteral("Bluetooth : ") + bt);
+    }
+  }
+#endif
   switch (m_mode)
   {
   case Mode::Setup:
@@ -5201,16 +5226,7 @@ void BigPictureWindow::ActivateHero(int button)
 
 void BigPictureWindow::StartNewGame(const Entry& entry)
 {
-  if (entry.discs.size() > 1)
-  {
-    // Several discs: which one?
-    m_audio->Play(Sound::MenuOpen);
-    m_choose_entry = entry;
-    m_choose_disc = 0;
-    m_overlay_t = 0;
-    m_mode = Mode::ChooseDisc;
-    return;
-  }
+  // Multi-disc games start on disc 1: the game asks for the next one and Dolphin swaps it.
   Launch(entry, 0, false);
 }
 
@@ -5255,7 +5271,8 @@ QString BigPictureWindow::ResumeShotPath(const std::string& game_id) const
 
 bool BigPictureWindow::HasResume(const Entry& entry) const
 {
-  if (!entry.game)
+  if (!entry.game ||
+      !Settings::GetQSettings().value(QStringLiteral("bigpicture/resume"), true).toBool())
     return false;
   const QString id = QString::fromStdString(entry.game->GetGameID());
   if (id.isEmpty())
@@ -5280,8 +5297,11 @@ const QPixmap& BigPictureWindow::ResumeShot(const Entry& entry)
 void BigPictureWindow::SaveResume()
 {
   const std::string id = SConfig::GetInstance().GetGameID();
-  if (id.empty())
+  if (id.empty() ||
+      !Settings::GetQSettings().value(QStringLiteral("bigpicture/resume"), true).toBool())
     return;
+  Settings::GetQSettings().setValue(
+      QStringLiteral("bigpicture/resume_aspect/") + QString::fromStdString(id), m_game_aspect);
   auto& system = Core::System::GetInstance();
   // The game is paused: the state is taken now and written in the background.
   State::SaveAs(system, ResumeStatePath(id).toStdString());
@@ -5331,24 +5351,12 @@ void BigPictureWindow::DrawResumeCard(QPainter& painter, const Entry& sel, const
   const QPixmap& shot = ResumeShot(sel);
   if (!shot.isNull())
   {
-    // fill the card, keep the picture's proportions
-    const QSizeF s = QSizeF(shot.size()).scaled(r.size(), Qt::KeepAspectRatioByExpanding);
-    painter.drawPixmap(QRectF(r.center().x() - s.width() / 2, r.center().y() - s.height() / 2,
-                              s.width(), s.height()),
-                       shot, QRectF(shot.rect()));
+    // The card has the game's proportions (4:3 or 16:9)
+    painter.drawPixmap(r, shot, QRectF(shot.rect()));
   }
   else
   {
     painter.fillRect(r, SURFACE);
-  }
-  const std::string shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
-  const bool crt = shader.find("crt") != std::string::npos;
-  if (crt)
-  {
-    // hint of the CRT filter on the picture
-    painter.setPen(QPen(QColor(0, 0, 0, 46), 1.4 * k));
-    for (qreal yy = r.top(); yy < r.bottom(); yy += 3.5 * k)
-      painter.drawLine(QPointF(r.left(), yy), QPointF(r.right(), yy));
   }
   QLinearGradient shade(r.left(), r.bottom() - 180 * k, r.left(), r.bottom());
   shade.setColorAt(0, QColor(0, 0, 0, 0));
@@ -5374,12 +5382,6 @@ void BigPictureWindow::DrawResumeCard(QPainter& painter, const Entry& sel, const
     painter.drawText(t, Qt::AlignCenter, text);
   };
   tag(tr("●  REPRISE AUTOMATIQUE"), true, QColor(255, 246, 236));
-  if (crt)
-  {
-    QString name = QString::fromStdString(shader);
-    name.remove(QStringLiteral("crt_manette_"));
-    tag(tr("FILTRE CRT · %1").arg(name.toUpper()), false, ACCENT_SOFT);
-  }
 
   painter.setFont(Font(true, int(28 * k), 700));
   painter.setPen(QColor(255, 246, 236));
@@ -5611,4 +5613,30 @@ int BigPictureWindow::ImportSave(CardView& card, u8 src_index, CardView& from)
     (void)card.card->Save();
   }
   return static_cast<int>(ret);
+}
+
+qreal BigPictureWindow::GameAspect() const
+{
+  switch (Config::Get(Config::GFX_ASPECT_RATIO))
+  {
+  case AspectMode::ForceWide:
+    return 16.0 / 9.0;
+  case AspectMode::ForceStandard:
+    return 4.0 / 3.0;
+  case AspectMode::Stretch:
+    return height() > 0 ? qreal(width()) / height() : 16.0 / 9.0;
+  default:
+    // Automatic: what the game itself uses
+    return (g_widescreen && g_widescreen->IsGameWidescreen()) ? 16.0 / 9.0 : 4.0 / 3.0;
+  }
+}
+
+qreal BigPictureWindow::ResumeAspect(const Entry& entry) const
+{
+  const qreal a = Settings::GetQSettings()
+                      .value(QStringLiteral("bigpicture/resume_aspect/") +
+                                 QString::fromStdString(entry.game->GetGameID()),
+                             4.0 / 3.0)
+                      .toDouble();
+  return std::clamp<qreal>(a, 1.0, 2.5);
 }

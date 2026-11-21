@@ -29,6 +29,8 @@
 #include <winrt/windows.storage.streams.h>
 #pragma comment(lib, "windowsapp")
 
+#include <fmt/format.h>
+
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
 #include "Common/Thread.h"
@@ -43,6 +45,16 @@ namespace Streams = winrt::Windows::Storage::Streams;
 
 namespace
 {
+std::mutex s_status_mutex;
+std::string s_status = "Bluetooth : démarrage";
+
+void SetStatus(std::string text)
+{
+  NOTICE_LOG_FMT(CONTROLLERINTERFACE, "Switch2BLE: {}", text);
+  std::lock_guard lk(s_status_mutex);
+  s_status = std::move(text);
+}
+
 constexpr u16 NINTENDO_COMPANY_ID = 0x0553;
 
 // GATT attributes (see ndeadly/switch2_controller_research, bluetooth_interface.md)
@@ -56,6 +68,11 @@ constexpr winrt::guid CHAR_RESPONSE{0xc765a961, 0xd9d8, 0x4d36,
                                     {0xa2, 0x0a, 0x53, 0x15, 0xb1, 0x11, 0x83, 0x6a}};
 constexpr winrt::guid CHAR_UNKNOWN_NOTIFY{0xd3bd69d2, 0x841c, 0x4241,
                                           {0xab, 0x15, 0xf8, 0x6f, 0x40, 0x6d, 0x2a, 0x80}};
+// Common input report 0x05 (all controllers) and basic command output (all controllers)
+constexpr winrt::guid CHAR_INPUT_COMMON{0xab7de9be, 0x89fe, 0x49ad,
+                                        {0x82, 0x8f, 0x11, 0x8f, 0x09, 0xdf, 0x7f, 0xd2}};
+constexpr winrt::guid CHAR_COMMAND_BASIC{0x649d4ac9, 0x8eb7, 0x4e6c,
+                                         {0xaf, 0x44, 0x1e, 0xa5, 0x4f, 0xe5, 0xf0, 0x05}};
 constexpr winrt::guid DESC_REPORT_RATE{0x679d5510, 0x5a24, 0x4dee,
                                        {0x95, 0x57, 0x95, 0xdf, 0x80, 0x48, 0x6e, 0xcb}};
 
@@ -192,44 +209,38 @@ struct Connection
     return std::clamp((v - c) / range, -1.0f, 1.0f);
   }
 
+  // Input report 0x05 (common to every Switch 2 controller, no report id over Bluetooth):
+  //  0x04 buttons (32-bit LE), 0x0A left stick, 0x0D right stick (12-bit packed),
+  //  0x1F battery voltage (mV), 0x3C / 0x3D GameCube analog triggers
   void Parse(const std::vector<u8>& r)
   {
-    if (r.size() < 14)
+    if (r.size() < 0x10)
       return;
     const KindInfo& info = Info(kind);
-    // Power info: [2:5] battery level 0-9
-    battery.store(std::min(100.0f, ((r[1] >> 2) & 0x0F) * 100.0f / 9.0f), std::memory_order_relaxed);
-
-    const bool joycon = kind == Kind::JoyConL || kind == Kind::JoyConR;
-    if (joycon)
+    buttons.store(r[4] | (r[5] << 8) | (r[6] << 16) | (static_cast<u32>(r[7]) << 24),
+                  std::memory_order_relaxed);
+    const auto stick = [&r](size_t o, float* x, float* y) {
+      *x = static_cast<float>(r[o] | ((r[o + 1] & 0x0F) << 8));
+      *y = static_cast<float>((r[o + 1] >> 4) | (r[o + 2] << 4));
+    };
+    float rlx, rly, rrx, rry;
+    stick(0x0A, &rlx, &rly);
+    stick(0x0D, &rrx, &rry);
+    // A lone right Joy-Con may report its stick in the first field
+    if (kind == Kind::JoyConR && rrx == 0 && rry == 0)
     {
-      // 2 bytes of buttons, one stick at 0x05
-      buttons.store(r[2] | (r[3] << 8), std::memory_order_relaxed);
-      const float sx = static_cast<float>(r[5] | ((r[6] & 0x0F) << 8));
-      const float sy = static_cast<float>((r[6] >> 4) | (r[7] << 4));
-      if (!calibrated)
-      {
-        calibrated = true;
-        if (std::abs(sx - 2048.0f) < 500.0f && std::abs(sy - 2048.0f) < 500.0f)
-        {
-          lcx = sx;
-          lcy = sy;
-        }
-      }
-      auto& ax = kind == Kind::JoyConL ? lx : rx;
-      auto& ay = kind == Kind::JoyConL ? ly : ry;
-      ax.store(Axis(sx, lcx, info.stick_range), std::memory_order_relaxed);
-      ay.store(Axis(sy, lcy, info.stick_range), std::memory_order_relaxed);
-      return;
+      rrx = rlx;
+      rry = rly;
     }
-
-    // GameCube and Pro: 3 bytes of buttons, two sticks
-    buttons.store(r[2] | (r[3] << 8) | (r[4] << 16), std::memory_order_relaxed);
-    const float rlx = static_cast<float>(r[5] | ((r[6] & 0x0F) << 8));
-    const float rly = static_cast<float>((r[6] >> 4) | (r[7] << 4));
-    const float rrx = static_cast<float>(r[8] | ((r[9] & 0x0F) << 8));
-    const float rry = static_cast<float>((r[9] >> 4) | (r[10] << 4));
-    const float tl = r[12], tr = r[13];
+    const float tl = r.size() > 0x3D ? r[0x3C] : 0.0f;
+    const float tr = r.size() > 0x3D ? r[0x3D] : 0.0f;
+    if (r.size() > 0x20)
+    {
+      const float mv = static_cast<float>(r[0x1F] | (r[0x20] << 8));
+      if (mv > 2500 && mv < 5000)
+        battery.store(std::clamp((mv - 3300.0f) / (4100.0f - 3300.0f) * 100.0f, 0.0f, 100.0f),
+                      std::memory_order_relaxed);
+    }
     if (!calibrated)
     {
       calibrated = true;
@@ -469,6 +480,13 @@ private:
     }
   }
 
+  // Report 0x05 buttons:
+  //  byte 0: Y 01, X 02, B 04, A 08, SR(R) 10, SL(R) 20, R 40, ZR 80
+  //  byte 1: - 01, + 02, R stick 04, L stick 08, Home 10, Capture 20, C 40
+  //  byte 2: Down 01, Up 02, Right 04, Left 08, SR(L) 10, SL(L) 20, L 40, ZL 80
+  //  byte 3: GR 01, GL 02
+  // On the GameCube controller: ZR = Z, R / L = end of travel of the triggers.
+
   // Same names as SDL gives this controller over USB, so one profile fits both.
   void BuildGameCube(Connection& c)
   {
@@ -478,19 +496,20 @@ private:
       u32 mask;
     };
     static constexpr Def defs[] = {
-        {"Button S", 0x000002},    // A
-        {"Button W", 0x000001},    // B
-        {"Button E", 0x000008},    // X
-        {"Button N", 0x000004},    // Y
-        {"Shoulder R", 0x000010},  // Z
-        {"Misc 4", 0x000020},      // R (end of travel)
-        {"Start", 0x000040},
-        {"Shoulder L", 0x001000},  // ZL
-        {"Misc 3", 0x002000},      // L (end of travel)
-        {"Pad S", 0x000100},       {"Pad E", 0x000200}, {"Pad W", 0x000400},
-        {"Pad N", 0x000800},       {"Guide", 0x010000},  // Home
-        {"Misc 1", 0x020000},                            // Capture
-        {"Misc 2", 0x100000},                            // C
+        {"Button S", 0x00000008},    // A
+        {"Button W", 0x00000004},    // B
+        {"Button E", 0x00000002},    // X
+        {"Button N", 0x00000001},    // Y
+        {"Shoulder R", 0x00000080},  // Z
+        {"Misc 4", 0x00000040},      // R (end of travel)
+        {"Start", 0x00000200},
+        {"Guide", 0x00001000},   // Home
+        {"Misc 1", 0x00002000},  // Capture
+        {"Misc 2", 0x00004000},  // C
+        {"Pad S", 0x00010000},       {"Pad N", 0x00020000}, {"Pad E", 0x00040000},
+        {"Pad W", 0x00080000},
+        {"Misc 3", 0x00400000},      // L (end of travel)
+        {"Shoulder L", 0x00800000},  // ZL
     };
     for (const auto& d : defs)
       AddInput(new Button(d.name, c.buttons, d.mask));
@@ -501,29 +520,38 @@ private:
   }
 
   // Positional names like SDL (south = bottom button) + XInput aliases.
+  void FaceButtons(Connection& c)
+  {
+    AddInput(new Button("Button S", c.buttons, 0x00000004, "Button A"));  // B (bottom)
+    AddInput(new Button("Button E", c.buttons, 0x00000008, "Button B"));  // A (right)
+    AddInput(new Button("Button W", c.buttons, 0x00000001, "Button X"));  // Y (left)
+    AddInput(new Button("Button N", c.buttons, 0x00000002, "Button Y"));  // X (top)
+    AddInput(new Button("Shoulder R", c.buttons, 0x00000040));
+    AddInput(new Button("Trigger R", c.buttons, 0x00000080));  // ZR (digital)
+    AddInput(new Button("Start", c.buttons, 0x00000200));
+    AddInput(new Button("Thumb R", c.buttons, 0x00000400));
+    AddInput(new Button("Guide", c.buttons, 0x00001000));
+    AddInput(new Button("Misc 2", c.buttons, 0x00004000));  // C
+  }
+  void LeftButtons(Connection& c)
+  {
+    AddInput(new Button("Back", c.buttons, 0x00000100));
+    AddInput(new Button("Thumb L", c.buttons, 0x00000800));
+    AddInput(new Button("Misc 1", c.buttons, 0x00002000));  // Capture
+    AddInput(new Button("Pad S", c.buttons, 0x00010000));
+    AddInput(new Button("Pad N", c.buttons, 0x00020000));
+    AddInput(new Button("Pad E", c.buttons, 0x00040000));
+    AddInput(new Button("Pad W", c.buttons, 0x00080000));
+    AddInput(new Button("Shoulder L", c.buttons, 0x00400000));
+    AddInput(new Button("Trigger L", c.buttons, 0x00800000));  // ZL (digital)
+  }
+
   void BuildPro(Connection& c)
   {
-    AddInput(new Button("Button S", c.buttons, 0x000001, "Button A"));  // B
-    AddInput(new Button("Button E", c.buttons, 0x000002, "Button B"));  // A
-    AddInput(new Button("Button W", c.buttons, 0x000004, "Button X"));  // Y
-    AddInput(new Button("Button N", c.buttons, 0x000008, "Button Y"));  // X
-    AddInput(new Button("Shoulder R", c.buttons, 0x000010));
-    AddInput(new Button("Trigger R", c.buttons, 0x000020));  // ZR (digital)
-    AddInput(new Button("Start", c.buttons, 0x000040));
-    AddInput(new Button("Thumb R", c.buttons, 0x000080));
-    AddInput(new Button("Pad S", c.buttons, 0x000100));
-    AddInput(new Button("Pad E", c.buttons, 0x000200));
-    AddInput(new Button("Pad W", c.buttons, 0x000400));
-    AddInput(new Button("Pad N", c.buttons, 0x000800));
-    AddInput(new Button("Shoulder L", c.buttons, 0x001000));
-    AddInput(new Button("Trigger L", c.buttons, 0x002000));  // ZL (digital)
-    AddInput(new Button("Back", c.buttons, 0x004000));
-    AddInput(new Button("Thumb L", c.buttons, 0x008000));
-    AddInput(new Button("Guide", c.buttons, 0x010000));
-    AddInput(new Button("Misc 1", c.buttons, 0x020000));    // Capture
-    AddInput(new Button("Paddle 1", c.buttons, 0x040000));  // GR
-    AddInput(new Button("Paddle 2", c.buttons, 0x080000));  // GL
-    AddInput(new Button("Misc 2", c.buttons, 0x100000));    // C
+    FaceButtons(c);
+    LeftButtons(c);
+    AddInput(new Button("Paddle 1", c.buttons, 0x01000000));  // GR
+    AddInput(new Button("Paddle 2", c.buttons, 0x02000000));  // GL
     Sticks(c, true, true);
   }
 
@@ -531,33 +559,16 @@ private:
   {
     if (c.kind == Kind::JoyConL)
     {
-      AddInput(new Button("Pad S", c.buttons, 0x0001));
-      AddInput(new Button("Pad E", c.buttons, 0x0002));
-      AddInput(new Button("Pad W", c.buttons, 0x0004));
-      AddInput(new Button("Pad N", c.buttons, 0x0008));
-      AddInput(new Button("Shoulder L", c.buttons, 0x0010));
-      AddInput(new Button("Trigger L", c.buttons, 0x0020));
-      AddInput(new Button("Back", c.buttons, 0x0040));
-      AddInput(new Button("Thumb L", c.buttons, 0x0080));
-      AddInput(new Button("Misc 1", c.buttons, 0x0100));  // Capture
-      AddInput(new Button("Paddle 4", c.buttons, 0x4000));  // SR (L)
-      AddInput(new Button("Paddle 2", c.buttons, 0x8000));  // SL (L)
+      LeftButtons(c);
+      AddInput(new Button("Paddle 4", c.buttons, 0x00100000));  // SR (L)
+      AddInput(new Button("Paddle 2", c.buttons, 0x00200000));  // SL (L)
       Sticks(c, true, false);
     }
     else
     {
-      AddInput(new Button("Button S", c.buttons, 0x0001, "Button A"));  // B
-      AddInput(new Button("Button E", c.buttons, 0x0002, "Button B"));  // A
-      AddInput(new Button("Button W", c.buttons, 0x0004, "Button X"));  // Y
-      AddInput(new Button("Button N", c.buttons, 0x0008, "Button Y"));  // X
-      AddInput(new Button("Shoulder R", c.buttons, 0x0010));
-      AddInput(new Button("Trigger R", c.buttons, 0x0020));
-      AddInput(new Button("Start", c.buttons, 0x0040));
-      AddInput(new Button("Thumb R", c.buttons, 0x0080));
-      AddInput(new Button("Guide", c.buttons, 0x0100));
-      AddInput(new Button("Misc 2", c.buttons, 0x1000));    // C
-      AddInput(new Button("Paddle 3", c.buttons, 0x4000));  // SR (R)
-      AddInput(new Button("Paddle 1", c.buttons, 0x8000));  // SL (R)
+      FaceButtons(c);
+      AddInput(new Button("Paddle 3", c.buttons, 0x00000010));  // SR (R)
+      AddInput(new Button("Paddle 1", c.buttons, 0x00000020));  // SL (R)
       Sticks(c, false, true);
     }
   }
@@ -574,7 +585,25 @@ struct SharedState
   std::map<u64, std::shared_ptr<Connection>> connections;
   std::set<u64> connecting;
   std::atomic<bool> shutdown{false};
+  Adv::BluetoothLEAdvertisementWatcher watcher{nullptr};
 };
+
+// Windows connects more reliably when it isn't scanning at the same time.
+void PauseScan(SharedState& s, bool pause)
+{
+  try
+  {
+    if (!s.watcher)
+      return;
+    if (pause)
+      s.watcher.Stop();
+    else if (!s.shutdown)
+      s.watcher.Start();
+  }
+  catch (const winrt::hresult_error&)
+  {
+  }
+}
 
 bool IsJoyCon(const Connection& c)
 {
@@ -611,16 +640,17 @@ public:
     try
     {
       m_watcher = Adv::BluetoothLEAdvertisementWatcher();
-      m_watcher.ScanningMode(Adv::BluetoothLEScanningMode::Active);
+      m_watcher.ScanningMode(Adv::BluetoothLEScanningMode::Passive);
       m_received = m_watcher.Received(
           [this](const Adv::BluetoothLEAdvertisementWatcher&,
                  const Adv::BluetoothLEAdvertisementReceivedEventArgs& args) { OnAdvert(args); });
+      m_s->watcher = m_watcher;
       m_watcher.Start();
+      SetStatus("Prête : appuie sur le bouton d'appairage de la manette");
     }
     catch (const winrt::hresult_error& e)
     {
-      WARN_LOG_FMT(CONTROLLERINTERFACE, "Switch2BLE: no Bluetooth LE ({:08x})",
-                   static_cast<u32>(e.code()));
+      SetStatus(fmt::format("Bluetooth indisponible ({:08x})", static_cast<u32>(e.code())));
       m_watcher = nullptr;
     }
   }
@@ -643,6 +673,7 @@ public:
     for (auto& [addr, conn] : m_s->connections)
       conn->Close();
     m_s->connections.clear();
+    m_s->watcher = nullptr;
   }
 
   void PopulateDevices() override
@@ -696,7 +727,9 @@ private:
     std::thread([shared = m_s, address, k = *kind] {
       Common::SetCurrentThreadName("Switch2 BLE connect");
       winrt::init_apartment(winrt::apartment_type::multi_threaded);
+      PauseScan(*shared, true);
       auto conn = Connect(address, k);
+      PauseScan(*shared, false);
       bool add = false;
       {
         std::lock_guard lk(shared->mutex);
@@ -760,7 +793,10 @@ private:
     {
       conn->device = BT::BluetoothLEDevice::FromBluetoothAddressAsync(address).get();
       if (!conn->device)
+      {
+        SetStatus("Échec : Windows n'a pas pu ouvrir la manette");
         return nullptr;
+      }
       conn->session = Gatt::GattSession::FromDeviceIdAsync(conn->device.BluetoothDeviceId()).get();
       if (conn->session)
         conn->session.MaintainConnection(true);
@@ -780,24 +816,50 @@ private:
         }
       }
 
-      const auto services =
-          conn->device.GetGattServicesForUuidAsync(SERVICE_HID, BT::BluetoothCacheMode::Uncached)
-              .get();
-      if (services.Status() != Gatt::GattCommunicationStatus::Success ||
-          services.Services().Size() == 0)
+      SetStatus("Manette trouvée, connexion…");
+      // The first GATT queries often fail right after connecting: retry.
+      Gatt::GattDeviceServicesResult services{nullptr};
+      for (int attempt = 0; attempt < 10; ++attempt)
       {
-        WARN_LOG_FMT(CONTROLLERINTERFACE, "Switch2BLE: HID service not found");
+        services = conn->device.GetGattServicesAsync(BT::BluetoothCacheMode::Uncached).get();
+        if (services.Status() == Gatt::GattCommunicationStatus::Success &&
+            services.Services().Size() > 0)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+      if (!services || services.Status() != Gatt::GattCommunicationStatus::Success)
+      {
+        SetStatus("Échec : services Bluetooth inaccessibles (si la manette est dans les "
+                  "paramètres Bluetooth de Windows, supprime-la)");
         conn->Close();
         return nullptr;
       }
-      const auto hid = services.Services().GetAt(0);
-      conn->input = FindChar(hid, info.input);
-      conn->command = FindChar(hid, info.command);
-      if (kind == Kind::GameCube)
-        conn->rumble = FindChar(hid, info.rumble);
+
+      Gatt::GattCharacteristic other_write{nullptr};
+      std::vector<Gatt::GattCharacteristic> notifies;
+      for (const auto& service : services.Services())
+      {
+        const auto chars = service.GetCharacteristicsAsync(BT::BluetoothCacheMode::Uncached).get();
+        if (chars.Status() != Gatt::GattCommunicationStatus::Success)
+          continue;
+        for (const auto& ch : chars.Characteristics())
+        {
+          const winrt::guid id = ch.Uuid();
+          if (id == CHAR_INPUT_COMMON)
+            conn->input = ch;
+          else if (id == CHAR_COMMAND_BASIC)
+            conn->command = ch;
+          else if (kind == Kind::GameCube && id == info.rumble)
+            conn->rumble = ch;
+          else if (id == CHAR_OTHER_WRITE)
+            other_write = ch;
+          else if (id == CHAR_RESPONSE || id == info.response || id == CHAR_UNKNOWN_NOTIFY)
+            notifies.push_back(ch);
+        }
+      }
       if (!conn->input || !conn->command)
       {
-        WARN_LOG_FMT(CONTROLLERINTERFACE, "Switch2BLE: characteristics not found");
+        SetStatus("Échec : caractéristiques de la manette introuvables");
         conn->Close();
         return nullptr;
       }
@@ -808,40 +870,42 @@ private:
             if (dev.ConnectionStatus() == BT::BluetoothConnectionStatus::Disconnected)
             {
               if (auto c = weak.lock())
+              {
                 c->valid = false;
+                SetStatus("Manette déconnectée");
+              }
             }
           });
 
       // Same order as the console.
-      const auto other =
-          conn->device.GetGattServicesForUuidAsync(SERVICE_OTHER, BT::BluetoothCacheMode::Uncached)
-              .get();
-      if (other.Status() == Gatt::GattCommunicationStatus::Success && other.Services().Size() > 0)
+      if (other_write)
       {
-        if (auto c = FindChar(other.Services().GetAt(0), CHAR_OTHER_WRITE))
-          (void)c.WriteValueAsync(ToBuffer({0x01, 0x00}), Gatt::GattWriteOption::WriteWithResponse)
-              .get();
+        (void)other_write
+            .WriteValueAsync(ToBuffer({0x01, 0x00}), Gatt::GattWriteOption::WriteWithResponse)
+            .get();
       }
-      for (const winrt::guid& uuid : {CHAR_RESPONSE, info.response, CHAR_UNKNOWN_NOTIFY})
+      for (auto& c : notifies)
       {
-        if (auto c = FindChar(hid, uuid))
+        try
         {
           (void)c.WriteClientCharacteristicConfigurationDescriptorAsync(
                      Gatt::GattClientCharacteristicConfigurationDescriptorValue::Notify)
               .get();
           conn->notify_keepalive.push_back(c);
         }
+        catch (const winrt::hresult_error&)
+        {
+        }
       }
 
+      // Commands go to the basic command characteristic: no prefix, same on every controller.
       const auto send = [&](std::vector<u8> cmd) {
-        // report id + rumble data before the command, depending on the controller
-        std::vector<u8> packet(info.command_prefix, 0);
-        packet.insert(packet.end(), cmd.begin(), cmd.end());
         (void)conn->command
-            .WriteValueAsync(ToBuffer(packet), Gatt::GattWriteOption::WriteWithoutResponse)
+            .WriteValueAsync(ToBuffer(cmd), Gatt::GattWriteOption::WriteWithoutResponse)
             .get();
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
       };
+      const u8 flags = kind == Kind::GameCube ? 0x27 : kind == Kind::Pro ? 0x2F : 0x37;
       send({0x07, 0x91, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00});
       send({0x10, 0x91, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00});
       send({0x16, 0x91, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00});
@@ -849,25 +913,11 @@ private:
       send({0x0a, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00});
       send({0x09, 0x91, 0x01, 0x07, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00});
-      // Feature flags: buttons, sticks, analog triggers (no motion)
-      send({0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00});
+      // Feature flags: buttons, sticks, triggers
+      send({0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, flags, 0x00, 0x00, 0x00});
       send({0x11, 0x91, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00});
-      send({0x0c, 0x91, 0x01, 0x04, 0x00, 0x04, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00});
+      send({0x0c, 0x91, 0x01, 0x04, 0x00, 0x04, 0x00, 0x00, flags, 0x00, 0x00, 0x00});
 
-      // Report rate (?) then input notifications
-      try
-      {
-        const auto descs = conn->input
-                               .GetDescriptorsForUuidAsync(DESC_REPORT_RATE,
-                                                           BT::BluetoothCacheMode::Uncached)
-                               .get();
-        if (descs.Status() == Gatt::GattCommunicationStatus::Success &&
-            descs.Descriptors().Size() > 0)
-          (void)descs.Descriptors().GetAt(0).WriteValueAsync(ToBuffer({0x85, 0x00})).get();
-      }
-      catch (const winrt::hresult_error&)
-      {
-      }
       conn->input_token = conn->input.ValueChanged(
           [weak](const Gatt::GattCharacteristic&, const Gatt::GattValueChangedEventArgs& args) {
             if (auto c = weak.lock())
@@ -881,23 +931,33 @@ private:
               }
             }
           });
-      const auto status = conn->input
-                              .WriteClientCharacteristicConfigurationDescriptorAsync(
-                                  Gatt::GattClientCharacteristicConfigurationDescriptorValue::Notify)
-                              .get();
+      Gatt::GattCommunicationStatus status = Gatt::GattCommunicationStatus::Unreachable;
+      for (int attempt = 0; attempt < 5 && status != Gatt::GattCommunicationStatus::Success;
+           ++attempt)
+      {
+        status = conn->input
+                     .WriteClientCharacteristicConfigurationDescriptorAsync(
+                         Gatt::GattClientCharacteristicConfigurationDescriptorValue::Notify)
+                     .get();
+        if (status != Gatt::GattCommunicationStatus::Success)
+          std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      }
       if (status != Gatt::GattCommunicationStatus::Success)
       {
-        WARN_LOG_FMT(CONTROLLERINTERFACE, "Switch2BLE: input notifications refused");
+        SetStatus(fmt::format("Échec : la manette refuse d'envoyer ses boutons ({})",
+                              static_cast<int>(status)));
         conn->Close();
         return nullptr;
       }
+      SetStatus(kind == Kind::GameCube ? "Connectée : manette GameCube" :
+                kind == Kind::Pro      ? "Connectée : manette Pro 2" :
+                                         "Connectée : Joy-Con 2");
       NOTICE_LOG_FMT(CONTROLLERINTERFACE, "Switch2BLE: controller connected");
       return conn;
     }
     catch (const winrt::hresult_error& e)
     {
-      WARN_LOG_FMT(CONTROLLERINTERFACE, "Switch2BLE: connection failed ({:08x})",
-                   static_cast<u32>(e.code()));
+      SetStatus(fmt::format("Échec de la connexion ({:08x}), réessaie", static_cast<u32>(e.code())));
       conn->Close();
       return nullptr;
     }
@@ -908,6 +968,12 @@ private:
   std::shared_ptr<SharedState> m_s = std::make_shared<SharedState>();
 };
 }  // namespace
+
+std::string GetStatus()
+{
+  std::lock_guard lk(s_status_mutex);
+  return s_status;
+}
 
 std::unique_ptr<ciface::InputBackend> CreateInputBackend(ControllerInterface* controller_interface)
 {

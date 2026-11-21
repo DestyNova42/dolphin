@@ -251,6 +251,8 @@ private:
   QString ResumeShotPath(const std::string& game_id) const;
   const QPixmap& ResumeShot(const Entry& entry);
   void SaveResume();
+  qreal GameAspect() const;          // running game: 4:3 or 16:9 (automatic mode)
+  qreal ResumeAspect(const Entry& entry) const;
   void CycleSort();
   void DrawResumeCard(QPainter& painter, const Entry& sel, const QRectF& rect);
   void DrawChooseDisc(QPainter& painter);
@@ -416,6 +418,7 @@ private:
   qreal m_fade_in = 1;   // black veil after returning from a game (1 = done)
   qreal m_window_opacity = 1;
   std::array<QPixmap, 9> m_slot_thumbs;
+  qreal m_game_aspect = 4.0 / 3.0;
 
   // quick settings / cheats (pause)
   std::vector<BigPictureSettingCategory> m_quick_settings;
@@ -424,6 +427,7 @@ private:
 
   // controllers
   QTimer* m_device_timer = nullptr;
+  QString m_bt_status;
   QStringList m_known_devices;
   int m_test_port = 0;
   qint64 m_test_start_since = -1;

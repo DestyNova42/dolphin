@@ -8,10 +8,13 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "InputCommon/ControllerInterface/InputBackend.h"
 
 namespace ciface::Switch2BLE
 {
 std::unique_ptr<ciface::InputBackend> CreateInputBackend(ControllerInterface* controller_interface);
+// What the Bluetooth side is doing, for the interface ("Connectée", "Échec : ...").
+std::string GetStatus();
 }

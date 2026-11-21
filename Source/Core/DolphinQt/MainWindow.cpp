@@ -76,6 +76,7 @@
 #include "DiscIO/RiivolutionPatcher.h"
 
 #include "DolphinQt/AboutDialog.h"
+#include "DolphinQt/BigPicture/BigPictureDisplay.h"
 #include "DolphinQt/BigPicture/BigPictureWindow.h"
 #include "DolphinQt/Achievements/AchievementsWindow.h"
 #include "DolphinQt/CheatsManager.h"
@@ -435,6 +436,10 @@ void MainWindow::LaunchFromBigPicture(const QString& path, const QString& savest
     }
   }
   Config::SetCurrent(Config::MAIN_SKIP_IPL, !use_ipl);
+
+  // The screen follows Dolphin's HDR setting while the game runs (given back afterwards).
+  if (Settings::GetQSettings().value(QStringLiteral("bigpicture/auto_hdr"), true).toBool())
+    BigPictureDisplay::MatchHdr(Config::Get(Config::GFX_ENHANCE_HDR_OUTPUT));
 
   std::unique_ptr<BootSessionData> session;
   if (!savestate.isEmpty())

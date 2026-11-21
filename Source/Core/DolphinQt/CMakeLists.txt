@@ -39,6 +39,8 @@ add_executable(dolphin-emu
   AboutDialog.h
   BigPicture/BigPictureAudio.cpp
   BigPicture/BigPictureAudio.h
+  BigPicture/BigPictureDisplay.cpp
+  BigPicture/BigPictureDisplay.h
   BigPicture/BigPictureDriver.cpp
   BigPicture/BigPictureDriver.h
   BigPicture/BigPictureSettings.cpp

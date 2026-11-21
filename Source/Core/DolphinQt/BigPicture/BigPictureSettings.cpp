@@ -37,6 +37,9 @@
 #include "InputCommon/ControllerInterface/CoreDevice.h"
 #include "InputCommon/InputConfig.h"
 #include "Core/Config/GraphicsSettings.h"
+#ifdef _WIN32
+#include "InputCommon/ControllerInterface/Switch2BLE/Switch2BLE.h"
+#endif
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/SYSCONFSettings.h"
 #include "Core/Config/UISettings.h"
@@ -196,20 +199,6 @@ Item PrefPercent(const QString& label, const QString& help, const QString& key, 
   return item;
 }
 
-Item CrtFilter()
-{
-  return Choice<std::string>(
-      Tr("Filtre d'image (CRT)"),
-      Tr("Imite une télé cathodique : lignes, phosphores et lueur, réglés pour la 1080p comme "
-         "pour la 4K, quelle que soit la résolution interne."),
-      Config::GFX_ENHANCE_POST_SHADER,
-      {{"", Tr("Aucun")},
-       {"crt_manette_trinitron", Tr("CRT Trinitron")},
-       {"crt_manette_pvm", Tr("CRT PVM (net)")},
-       {"crt_manette_arcade", Tr("CRT Arcade (bombé)")},
-       {"crt_lottes_fast", Tr("CRT Lottes (classique)")}});
-}
-
 QString Percent(float v)
 {
   return QStringLiteral("%1 %").arg(static_cast<int>(std::lround(v * 100.0f)));
@@ -295,6 +284,10 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  QStringLiteral("bigpicture/sort"),
                                  {Tr("Nom"), Tr("Dernière partie"), Tr("Temps de jeu")}, 0,
                                  changed));
+    c.items.push_back(PrefToggle(Tr("Reprendre"),
+                                 Tr("En quittant un jeu depuis le menu pause, Dolphin le "
+                                    "sauvegarde pour reprendre exactement au même endroit."),
+                                 QStringLiteral("bigpicture/resume"), true, changed));
     c.items.push_back(PrefToggle(
         Tr("Vraie animation de démarrage GameCube"),
         Tr("Lance le BIOS de ta console avant le jeu. Copie le fichier IPL.bin de ta GameCube "
@@ -441,7 +434,8 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Toggle(Tr("Compiler les shaders avant de démarrer"),
                              Tr("Démarrage plus long, moins de saccades ensuite."),
                              Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING));
-    c.items.push_back(CrtFilter());
+    c.items.push_back(Toggle(Tr("Sortie HDR"), Tr("S'applique au prochain lancement du jeu."),
+                           Config::GFX_ENHANCE_HDR_OUTPUT));
   c.items.push_back(Toggle(Tr("Afficher les FPS"), {}, Config::GFX_SHOW_FPS));
     c.items.push_back(Toggle(Tr("Afficher la vitesse"), {}, Config::GFX_SHOW_SPEED));
     c.items.push_back(Toggle(Tr("Afficher la résolution interne"), {},
@@ -452,7 +446,13 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
   // ---- Enhancements
   {
     BigPictureSettingCategory c{Tr("Améliorations"), {}};
-    c.items.push_back(CrtFilter());
+    c.items.push_back(Toggle(Tr("Sortie HDR"),
+                             Tr("Couleurs et luminosité étendues sur un écran HDR."),
+                             Config::GFX_ENHANCE_HDR_OUTPUT));
+    c.items.push_back(PrefToggle(Tr("Basculer l'écran en HDR automatiquement"),
+                                 Tr("Pendant le jeu, Windows passe en HDR si la sortie HDR est "
+                                    "activée (et en SDR sinon), puis revient comme avant."),
+                                 QStringLiteral("bigpicture/auto_hdr"), true, {}));
     c.items.push_back(Choice<int>(Tr("Résolution interne"),
                                   Tr("Plus c'est haut, plus l'image est nette et plus la carte "
                                     "graphique travaille."),
@@ -788,14 +788,18 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     }
     {
       const auto notify = host.notify;
-      c.items.push_back(Action(
-          Tr("Manette GameCube Switch 2 en Bluetooth"),
-          Tr("Appuie sur le petit bouton d'appairage en haut de la manette : elle se connecte "
-             "toute seule."),
+      Item bt = Action(
+          Tr("Manettes Switch 2 en Bluetooth"),
+          Tr("GameCube, Pro 2 et Joy-Con 2 : appuie sur le petit bouton d'appairage de la "
+             "manette, elle se connecte toute seule. Ne l'appaire pas dans Windows."),
           [notify] {
             if (notify)
               notify(Tr("Appuie sur le bouton d'appairage de la manette"));
-          }));
+          });
+#ifdef _WIN32
+      bt.value = [] { return QString::fromStdString(ciface::Switch2BLE::GetStatus()); };
+#endif
+      c.items.push_back(std::move(bt));
     }
 
     // Individual controls
