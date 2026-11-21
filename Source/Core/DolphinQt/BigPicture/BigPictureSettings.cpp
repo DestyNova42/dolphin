@@ -512,12 +512,12 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                    {5, Tr("Néerlandais")}}));
     c.items.push_back(Toggle(Tr("Passer le menu de démarrage (IPL)"), {}, Config::MAIN_SKIP_IPL));
     using EXI = ExpansionInterface::EXIDeviceType;
-    const std::vector<std::pair<EXI, QString>> slots = {
+    const std::vector<std::pair<EXI, QString>> exi_slots = {
         {EXI::None, Tr("Vide")},
         {EXI::MemoryCard, Tr("Carte mémoire")},
         {EXI::MemoryCardFolder, Tr("Dossier GCI")}};
-    c.items.push_back(Choice<EXI>(Tr("Emplacement A"), {}, Config::MAIN_SLOT_A, slots));
-    c.items.push_back(Choice<EXI>(Tr("Emplacement B"), {}, Config::MAIN_SLOT_B, slots));
+    c.items.push_back(Choice<EXI>(Tr("Emplacement A"), {}, Config::MAIN_SLOT_A, exi_slots));
+    c.items.push_back(Choice<EXI>(Tr("Emplacement B"), {}, Config::MAIN_SLOT_B, exi_slots));
     c.items.push_back(Toggle(Tr("Lecture rapide du disque"), Tr("Chargements plus courts."),
                              Config::MAIN_FAST_DISC_SPEED));
     cats.push_back(std::move(c));
