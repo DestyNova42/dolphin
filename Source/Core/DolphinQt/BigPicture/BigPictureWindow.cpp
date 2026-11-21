@@ -21,6 +21,7 @@
 #include <QFile>
 #include <QGuiApplication>
 #include <QScreen>
+#include <QWindow>
 #include <QFont>
 #include <QFontDatabase>
 #include <QFontMetrics>
