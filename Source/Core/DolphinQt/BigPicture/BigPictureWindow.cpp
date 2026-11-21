@@ -38,7 +38,9 @@
 
 #include "Common/Config/Config.h"
 #include "Common/Config/Layer.h"
+#include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
+#include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigLoaders/GameConfigLoader.h"
 #include "Core/ConfigManager.h"
@@ -2839,10 +2841,10 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
 
   if (m_mode == Mode::Library)
   {
-    const bool resume = HasResume(*sel);
+    const bool can_resume = HasResume(*sel);
     DrawHints(painter, {{QStringLiteral("Control_Stick"), tr("Naviguer")}},
               {{QStringLiteral("A"), m_hero_focus ? tr("Valider") :
-                                     resume       ? tr("Reprendre") :
+                                     can_resume   ? tr("Reprendre") :
                                                     tr("Jouer")},
                {QStringLiteral("Y"), tr("Favori")},
                {QStringLiteral("Z"), tr("Trier")},
