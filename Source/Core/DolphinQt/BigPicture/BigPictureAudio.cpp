@@ -4,6 +4,7 @@
 #include "DolphinQt/BigPicture/BigPictureAudio.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <filesystem>
 
@@ -170,9 +171,26 @@ void BigPictureAudio::Play(Sound sound)
   if (clip.empty())
     return;
   std::lock_guard lk(m_mutex);
-  // Navigation sounds cut the previous instance instead of piling up.
-  std::erase_if(m_voices, [&](const Voice& v) { return v.clip == &clip; });
-  m_voices.push_back({&clip, 0.0});
+  // Fast scrolling: the previous instance fades out in a few ms (no click), and quick
+  // repeats are played softer so they don't pile up into a buzz.
+  const auto now = std::chrono::steady_clock::now();
+  auto& last = m_last_play[static_cast<size_t>(sound) % m_last_play.size()];
+  const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+  last = now;
+  float gain = 1.0f;
+  if (since < 70)
+    return;  // faster than the ear can separate: skip
+  if (since < 160)
+    gain = 0.55f;
+  for (Voice& v : m_voices)
+  {
+    if (v.clip == &clip && v.fade < 0)
+      v.fade = 240;  // 5 ms at 48 kHz
+  }
+  // Never more than a handful of effects at once.
+  while (m_voices.size() >= 6)
+    m_voices.erase(m_voices.begin());
+  m_voices.push_back({&clip, 0.0, gain, -1});
 }
 
 void BigPictureAudio::StartMusic()
@@ -228,20 +246,38 @@ long BigPictureAudio::Mix(float* out, long frames)
   for (Voice& v : m_voices)
   {
     const double clip_frames = static_cast<double>(v.clip->Frames()) - 1;
-    for (long i = 0; i < frames && v.pos < clip_frames; ++i, v.pos += v.clip->step)
+    for (long i = 0; i < frames && v.pos < clip_frames && v.fade != 0;
+         ++i, v.pos += v.clip->step)
     {
       float l, r;
       Sample(*v.clip, v.pos, &l, &r);
-      out[i * 2] += l * m_sfx_volume;
-      out[i * 2 + 1] += r * m_sfx_volume;
+      float g = m_sfx_volume * v.gain * 0.8f;
+      if (v.fade > 0)
+      {
+        g *= static_cast<float>(v.fade) / 240.0f;
+        --v.fade;
+      }
+      out[i * 2] += l * g;
+      out[i * 2 + 1] += r * g;
     }
   }
   std::erase_if(m_voices, [](const Voice& v) {
-    return v.pos >= static_cast<double>(v.clip->Frames()) - 1;
+    return v.fade == 0 || v.pos >= static_cast<double>(v.clip->Frames()) - 1;
   });
 
-  for (long i = 0; i < frames * 2; ++i)
-    out[i] = std::clamp(out[i], -1.0f, 1.0f);
+  // Smooth limiter: lowers the gain quickly when the mix gets too loud, then recovers
+  // slowly, instead of clipping (which sounds saturated).
+  for (long i = 0; i < frames; ++i)
+  {
+    const float peak = std::max(std::abs(out[i * 2]), std::abs(out[i * 2 + 1]));
+    const float wanted = peak * m_limiter > 0.9f ? 0.9f / peak : 1.0f;
+    if (wanted < m_limiter)
+      m_limiter += (wanted - m_limiter) * 0.5f;
+    else
+      m_limiter += (wanted - m_limiter) * 0.0005f;
+    out[i * 2] = std::clamp(out[i * 2] * m_limiter, -1.0f, 1.0f);
+    out[i * 2 + 1] = std::clamp(out[i * 2 + 1] * m_limiter, -1.0f, 1.0f);
+  }
   return frames;
 }
 

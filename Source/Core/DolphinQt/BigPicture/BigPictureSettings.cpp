@@ -220,7 +220,7 @@ Effect GetEffect()
 }
 Theme GetTheme()
 {
-  return static_cast<Theme>(std::clamp(Pref("bigpicture/theme", 0), 0, 5));
+  return static_cast<Theme>(std::clamp(Pref("bigpicture/theme", 0), 0, 6));
 }
 IntroStyle GetIntroStyle()
 {
@@ -259,8 +259,7 @@ int SfxVolume()
 void SaveBigPictureSettings()
 {
   Config::Save();
-  Pad::GetConfig()->SaveConfig();
-  SaveBigPictureDeviceProfile(0);
+  SaveBigPicturePads();
   Settings::GetQSettings().sync();
 }
 
@@ -278,9 +277,12 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  Tr("Jaquettes en rangée, ou liste avec les bannières des jeux."),
                                  QStringLiteral("bigpicture/view"),
                                  {Tr("Jaquettes"), Tr("Liste avec bannières")}, 0, changed));
-    c.items.push_back(PrefChoice(Tr("Thème de couleur"), {}, QStringLiteral("bigpicture/theme"),
-                                 {Tr("Indigo nuit"), Tr("Indigo GameCube"), Tr("Orange Spice"),
-                                  Tr("Noir OLED"), Tr("Platine (clair)"), Tr("Couleur du jeu")},
+    c.items.push_back(PrefChoice(Tr("Thème de couleur"),
+                                 Tr("Les couleurs des modèles de GameCube."),
+                                 QStringLiteral("bigpicture/theme"),
+                                 {Tr("Indigo nuit"), Tr("Indigo"), Tr("Spice Orange"),
+                                  Tr("Jet Black"), Tr("Platinum"), Tr("Pearl White"),
+                                  Tr("Couleur du jeu")},
                                  0, changed));
     c.items.push_back(PrefChoice(
         Tr("Effet d'arrière-plan"), Tr("L'animation qui vit derrière la bibliothèque."),
@@ -738,15 +740,38 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                    notify(Tr("Profil enregistré"));
                                }));
     }
-    c.items.push_back(Action(Tr("Profil automatique (manette standard)"),
-                             Tr("Xbox, PlayStation, Switch Pro… : A, B, X, Y, gâchettes, sticks "
-                                "et croix réglés d'un coup."),
-                             [port] { ApplyStandardGamepadProfile(*port); }));
+    c.items.push_back(Action(Tr("Profil automatique"),
+                             Tr("Manette GameCube (Switch 2, adaptateur), Xbox, PlayStation… : "
+                                "tout est réglé d'un coup."),
+                             [port] {
+                               auto* pad = Pad::GetConfig()->GetController(*port);
+                               const std::string d = pad ? pad->GetDefaultDevice().ToString() : "";
+                               if (!ApplyGameCubeProfile(*port, d))
+                                 ApplyStandardGamepadProfile(*port);
+                               SaveBigPicturePads();
+                             }));
     const auto configure = host.configure_controller;
     c.items.push_back(Action(Tr("Assistant bouton par bouton"),
-                             Tr("Indispensable pour la manette GameCube Switch 2 et les "
-                                "manettes peu courantes."),
+                             Tr("Pour les manettes peu courantes."),
                              [configure, port] { configure(*port); }));
+    {
+      const auto install = host.install_drivers;
+      c.items.push_back(Action(Tr("Pilote USB des manettes Switch 2"),
+                               Tr("Une seule fois, pour brancher la manette GameCube Switch 2 en "
+                                  "USB (remplace Zadig). Windows demande une confirmation."),
+                               [install] { install(); }));
+    }
+    {
+      const auto notify = host.notify;
+      c.items.push_back(Action(
+          Tr("Manette GameCube Switch 2 en Bluetooth"),
+          Tr("Appuie sur le petit bouton d'appairage en haut de la manette : elle se connecte "
+             "toute seule."),
+          [notify] {
+            if (notify)
+              notify(Tr("Appuie sur le bouton d'appairage de la manette"));
+          }));
+    }
 
     // Individual controls
     struct Ctl
@@ -1347,4 +1372,58 @@ std::vector<BigPictureSettingCategory> BuildBigPictureCheatSettings(const std::s
                            Config::MAIN_ENABLE_CHEATS));
   cats.push_back(std::move(o));
   return cats;
+}
+
+void SaveBigPicturePads()
+{
+  Pad::GetConfig()->SaveConfig();
+  for (int port = 0; port < 4; ++port)
+  {
+    if (port == 0 || Config::Get(Config::GetInfoForSIDevice(port)) != SerialInterface::SIDEVICE_NONE)
+      SaveBigPictureDeviceProfile(port);
+  }
+}
+
+bool IsSwitch2GameCube(const std::string& device)
+{
+  return device.find("GameCube") != std::string::npos &&
+         (device.rfind("SDL/", 0) == 0 || device.rfind("Switch2/", 0) == 0);
+}
+
+bool ApplyGameCubeProfile(int port, const std::string& device)
+{
+  auto* pad = Pad::GetConfig()->GetController(port);
+  if (!pad || !IsSwitch2GameCube(device))
+    return false;
+  // Names are the same for SDL (USB) and the Bluetooth backend of the controller mode.
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  pad->SetDefaultDevice(device);
+  const auto set = [port](PadGroup group, int index, const char* expr) {
+    (void)Pad::GetGroup(port, group)->controls[index]->control_ref->SetExpression(expr);
+  };
+  set(PadGroup::Buttons, 0, "`Button S`");    // A
+  set(PadGroup::Buttons, 1, "`Button W`");    // B
+  set(PadGroup::Buttons, 2, "`Button E`");    // X
+  set(PadGroup::Buttons, 3, "`Button N`");    // Y
+  set(PadGroup::Buttons, 4, "`Shoulder R`");  // Z
+  set(PadGroup::Buttons, 5, "`Start`");
+  set(PadGroup::MainStick, 0, "`Left Y+`");
+  set(PadGroup::MainStick, 1, "`Left Y-`");
+  set(PadGroup::MainStick, 2, "`Left X-`");
+  set(PadGroup::MainStick, 3, "`Left X+`");
+  set(PadGroup::CStick, 0, "`Right Y+`");
+  set(PadGroup::CStick, 1, "`Right Y-`");
+  set(PadGroup::CStick, 2, "`Right X-`");
+  set(PadGroup::CStick, 3, "`Right X+`");
+  set(PadGroup::Triggers, 0, "`Misc 3`");  // L click (end of travel)
+  set(PadGroup::Triggers, 1, "`Misc 4`");  // R click
+  set(PadGroup::Triggers, 2, "`Trigger L`");
+  set(PadGroup::Triggers, 3, "`Trigger R`");
+  set(PadGroup::DPad, 0, "`Pad N`");
+  set(PadGroup::DPad, 1, "`Pad S`");
+  set(PadGroup::DPad, 2, "`Pad W`");
+  set(PadGroup::DPad, 3, "`Pad E`");
+  set(PadGroup::Rumble, 0, "`Motor`");
+  pad->UpdateReferences(g_controller_interface);
+  return true;
 }

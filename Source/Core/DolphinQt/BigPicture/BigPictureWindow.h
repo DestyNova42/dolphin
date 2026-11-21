@@ -121,6 +121,7 @@ private:
     PadTest,       // live view of a controller
     Closing,       // fading to black before stopping the game
     ConfirmUpdate, // an update is available
+    ConfirmDriver, // USB driver of Switch 2 controllers
   };
 
   struct SaveIcon
@@ -223,6 +224,10 @@ private:
 
   // ---- updates
   void CheckUpdates(bool silent);
+
+  // ---- USB driver (instead of Zadig)
+  void CheckDrivers();
+  void InstallDrivers();
 
   // ---- themes
   void ApplyTheme();
@@ -408,4 +413,10 @@ private:
   QString m_update_url;
   QString m_update_version;
   bool m_update_busy = false;
+
+  // USB driver
+  QStringList m_driver_asked;
+  QString m_driver_devices;
+  bool m_driver_busy = false;
+  Mode m_mode_before_driver = Mode::Library;
 };

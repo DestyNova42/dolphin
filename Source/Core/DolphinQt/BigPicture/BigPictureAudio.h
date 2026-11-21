@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -68,6 +69,8 @@ private:
   {
     const Clip* clip;
     double pos;
+    float gain = 1.0f;
+    int fade = -1;  // frames left of a quick fade-out (-1: playing normally)
   };
 
   void LoadAll();
@@ -83,6 +86,8 @@ private:
 
   std::mutex m_mutex;
   std::vector<Voice> m_voices;
+  std::array<std::chrono::steady_clock::time_point, 32> m_last_play{};
+  float m_limiter = 1.0f;
   double m_music_pos = 0;
   bool m_music_on = false;
   float m_music_gain = 0.0f;

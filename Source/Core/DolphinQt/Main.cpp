@@ -32,6 +32,7 @@
 #include "Core/System.h"
 
 #include "DolphinQt/Host.h"
+#include "DolphinQt/BigPicture/BigPictureDriver.h"
 #include "DolphinQt/MainWindow.h"
 #include "DolphinQt/QtUtils/AnalyticsPrompt.h"
 #include "DolphinQt/QtUtils/ModalMessageBox.h"
@@ -319,6 +320,9 @@ int main(int argc, char* argv[])
 int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int)
 {
   std::vector<std::string> args = Common::CommandLineToUtf8Argv(GetCommandLineW());
+  // Elevated helper of the controller mode: installs the USB driver of Nintendo controllers.
+  if (args.size() >= 2 && args[1] == BigPictureDriver::INSTALL_ARG)
+    return BigPictureDriver::RunElevatedInstall();
   const int argc = static_cast<int>(args.size());
   std::vector<char*> argv(args.size());
   for (size_t i = 0; i < args.size(); ++i)

@@ -103,6 +103,8 @@ if(WIN32)
     ControllerInterface/Win32/Win32.h
     ControllerInterface/WGInput/WGInput.cpp
     ControllerInterface/WGInput/WGInput.h
+    ControllerInterface/Switch2BLE/Switch2BLE.cpp
+    ControllerInterface/Switch2BLE/Switch2BLE.h
     ControllerInterface/XInput/XInput.cpp
     ControllerInterface/XInput/XInput.h
     ControllerInterface/ForceFeedback/ForceFeedbackDevice.cpp

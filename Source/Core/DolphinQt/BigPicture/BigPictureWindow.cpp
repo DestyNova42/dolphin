@@ -54,6 +54,7 @@
 #include "Core/TimePlayed.h"
 #include "DiscIO/Enums.h"
 #include "DolphinQt/BigPicture/BigPictureAudio.h"
+#include "DolphinQt/BigPicture/BigPictureDriver.h"
 #include "DolphinQt/BigPicture/BigPictureUpdater.h"
 #include "DolphinQt/GameList/GameListModel.h"
 #include "DolphinQt/QtUtils/ImageConverter.h"
@@ -99,22 +100,26 @@ Palette PaletteFor(BigPicturePrefs::Theme theme)
   using T = BigPicturePrefs::Theme;
   switch (theme)
   {
-  case T::IndigoGameCube:
-    return {{27, 22, 66},     {41, 34, 96},     {33, 27, 80},     {56, 47, 124},
-            {74, 64, 150},    {246, 244, 255},  {196, 190, 232},  {150, 142, 200},
-            {124, 104, 238},  {214, 204, 255}};
-  case T::Spice:
-    return {{24, 13, 6},      {44, 26, 13},     {34, 19, 9},      {66, 39, 18},
-            {92, 56, 26},     {255, 246, 236},  {226, 196, 168},  {178, 146, 118},
-            {255, 140, 40},   {255, 196, 140}};
-  case T::Oled:
-    return {{0, 0, 0},        {16, 16, 18},     {8, 8, 10},       {30, 30, 34},
-            {46, 46, 52},     {245, 245, 247},  {176, 176, 184},  {128, 128, 138},
-            {200, 200, 210},  {225, 225, 232}};
-  case T::Platinum:
-    return {{230, 231, 236},  {214, 216, 224},  {222, 223, 230},  {198, 200, 210},
-            {178, 180, 192},  {22, 22, 30},     {70, 72, 88},     {108, 110, 126},
-            {96, 74, 210},    {86, 66, 190}};
+  case T::IndigoGameCube:  // the indigo console
+    return {{38, 31, 96},     {52, 44, 122},    {44, 37, 108},    {66, 56, 146},
+            {88, 77, 172},    {248, 246, 255},  {210, 204, 244},  {166, 158, 222},
+            {160, 146, 255},  {222, 214, 255}};
+  case T::Spice:  // Spice Orange
+    return {{36, 16, 4},      {60, 28, 8},      {48, 22, 6},      {84, 40, 12},
+            {116, 56, 18},    {255, 247, 238},  {236, 200, 166},  {190, 148, 112},
+            {255, 138, 20},   {255, 194, 128}};
+  case T::JetBlack:  // Jet Black
+    return {{6, 6, 8},        {20, 20, 23},     {12, 12, 14},     {34, 34, 39},
+            {52, 52, 60},     {242, 242, 246},  {172, 172, 182},  {122, 122, 134},
+            {196, 198, 210},  {228, 229, 236}};
+  case T::Platinum:  // Platinum (silver)
+    return {{206, 209, 216},  {188, 192, 202},  {197, 200, 208},  {174, 178, 190},
+            {150, 154, 168},  {20, 21, 28},     {62, 64, 80},     {98, 101, 118},
+            {84, 66, 186},    {72, 56, 170}};
+  case T::PearlWhite:  // Pearl White
+    return {{244, 243, 247},  {231, 230, 237},  {238, 237, 243},  {219, 218, 228},
+            {198, 197, 210},  {26, 25, 36},     {78, 77, 98},     {120, 119, 142},
+            {122, 104, 228},  {104, 86, 210}};
   default:
     return {{13, 11, 26},     {23, 20, 43},     {18, 15, 36},     {34, 29, 61},
             {46, 40, 80},     {244, 241, 255},  {185, 178, 214},  {141, 133, 179},
@@ -389,6 +394,17 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
     });
   };
   host.check_updates = [this] { QTimer::singleShot(0, this, [this] { CheckUpdates(false); }); };
+  host.install_drivers = [this] {
+    QTimer::singleShot(0, this, [this] {
+      if (BigPictureDriver::DevicesNeedingDriver().empty())
+      {
+        Toast(tr("Branche la manette en USB : aucun pilote à installer"));
+        return;
+      }
+      m_mode_before_driver = m_mode;
+      InstallDrivers();
+    });
+  };
   host.notify = [this](const QString& text) { Toast(text); };
   host.interface_changed = [this] { ApplyPreferences(); };
   m_settings = BuildBigPictureSettings(host);
@@ -520,6 +536,8 @@ void BigPictureWindow::Open()
   // Ignore buttons that are still held (e.g. the one used to quit the game).
   m_prev_held = ~0u;
   m_last_tick = m_clock.elapsed();
+
+  QTimer::singleShot(1500, this, [this] { CheckDrivers(); });
 
   static bool s_checked_updates = false;
   if (!s_checked_updates && Prefs::CheckUpdatesOnStart())
@@ -1024,6 +1042,19 @@ void BigPictureWindow::HandleAction(Action action)
         Config::SetBaseOrCurrent(Config::GetInfoForSIDevice(port),
                                  SerialInterface::SIDEVICE_NONE);
       m_audio->Play(Sound::Erase);
+    }
+    break;
+  case Mode::ConfirmDriver:
+    if (action == Action::Accept && !m_driver_busy)
+    {
+      m_audio->Play(Sound::Confirm);
+      InstallDrivers();
+    }
+    else if (action == Action::Back && !m_driver_busy)
+    {
+      m_audio->Play(Sound::Cancel);
+      BeginTransition(0);
+      m_mode = m_mode_before_driver;
     }
     break;
   case Mode::ConfirmUpdate:
@@ -2007,6 +2038,18 @@ void BigPictureWindow::DrawScene(QPainter& painter)
   {
     DrawBackground(painter);
     DrawPadTest(painter);
+    return;
+  }
+  if (m_mode == Mode::ConfirmDriver)
+  {
+    DrawBackground(painter);
+    DrawTopBar(painter);
+    DrawDialog(painter,
+               m_driver_busy ? tr("Installation du pilote… (confirme dans Windows)") :
+                               tr("%1 branchée : installer son pilote USB ? (une seule fois)")
+                                   .arg(m_driver_devices),
+               {{QStringLiteral("A"), tr("Installer")}, {QStringLiteral("B"), tr("Plus tard")}});
+    DrawToast(painter);
     return;
   }
   if (m_mode == Mode::ConfirmUpdate)
@@ -3357,6 +3400,9 @@ bool BigPictureWindow::NeedsSetup() const
   const auto& dq = pad->GetDefaultDevice();
   if (dq.source == "DSUClient")
     return true;
+  // With automatic switching, a missing controller is replaced by the next one pressed.
+  if (Prefs::AutoSwitchController())
+    return false;
   return g_controller_interface.FindDevice(dq) == nullptr;
 }
 
@@ -3459,11 +3505,8 @@ void BigPictureWindow::UpdateSetup()
     FinishSetup(true);
     return;
   }
-  // Short pause so the same press isn't detected twice.
-  QTimer::singleShot(250, this, [this] {
-    if (m_mode == Mode::Setup)
-      StartSetupStep();
-  });
+  // The button has been released (detection waits for it): next step right away.
+  StartSetupStep();
 }
 
 void BigPictureWindow::FinishSetup(bool save)
@@ -3475,7 +3518,7 @@ void BigPictureWindow::FinishSetup(bool save)
     if (save)
     {
       pad->UpdateReferences(g_controller_interface);
-      Pad::GetConfig()->SaveConfig();
+      SaveBigPicturePads();
     }
     else
     {
@@ -3619,7 +3662,7 @@ void BigPictureWindow::UpdateRemap()
     }
     pad->UpdateReferences(g_controller_interface);
   }
-  Pad::GetConfig()->SaveConfig();
+  SaveBigPicturePads();
   FinishRemap(true);
 }
 
@@ -3701,7 +3744,7 @@ void BigPictureWindow::UpdateCalibration()
   if (m_calibrator->IsComplete())
   {
     m_calibrator->ApplyResults(stick);
-    Pad::GetConfig()->SaveConfig();
+    SaveBigPicturePads();
     m_calibrator.reset();
     m_audio->Play(Sound::Confirm);
     Toast(tr("Stick étalonné"));
@@ -3720,7 +3763,7 @@ void BigPictureWindow::FinishCalibration(bool apply)
         Pad::GetGroup(m_cal_port, static_cast<PadGroup>(m_cal_group)));
     const auto lock = ControllerEmu::EmulatedController::GetStateLock();
     m_calibrator->ApplyResults(stick);
-    Pad::GetConfig()->SaveConfig();
+    SaveBigPicturePads();
     Toast(tr("Stick étalonné"));
     m_audio->Play(Sound::Confirm);
   }
@@ -3788,26 +3831,6 @@ void BigPictureWindow::DrawCalibration(QPainter& painter)
   painter.setPen(Qt::NoPen);
   painter.setBrush(TEXT);
   painter.drawEllipse(p, 12 * k, 12 * k);
-
-  // Analog triggers, to check them while calibrating.
-  {
-    const GCPadStatus st = Pad::GetStatus(m_cal_port);
-    const auto bar = [&](qreal x, const QString& icon, u8 value, bool click) {
-      const QRectF track(x, c.y() - 160 * k, 34 * k, 320 * k);
-      painter.setPen(Qt::NoPen);
-      painter.setBrush(SURFACE);
-      painter.drawRoundedRect(track, 17 * k, 17 * k);
-      const qreal h = track.height() * value / 255.0;
-      painter.setBrush(click ? ACCENT_SOFT : ACCENT);
-      painter.drawRoundedRect(QRectF(track.left(), track.bottom() - h, track.width(), h), 17 * k,
-                              17 * k);
-      DrawIcon(painter, icon, QRectF(x - 13 * k, track.bottom() + 16 * k, 60 * k, 60 * k));
-    };
-    bar(c.x() - radius - 150 * k, QStringLiteral("L"), st.triggerLeft,
-        (st.button & PAD_TRIGGER_L) != 0);
-    bar(c.x() + radius + 116 * k, QStringLiteral("R"), st.triggerRight,
-        (st.button & PAD_TRIGGER_R) != 0);
-  }
 
   const bool sensible = m_calibrator && m_calibrator->IsCalibrationDataSensible();
   QFont prompt = Font(true, int(48 * k), 700);
@@ -4270,7 +4293,7 @@ int SourcePriority(const std::string& d)
 bool IsPressInput(const std::string& name)
 {
   for (const char* prefix : {"Button", "Pad ", "Shoulder", "Start", "Back", "Guide", "Thumb",
-                             "Trigger", "Home", "Select", "Plus", "Minus"})
+                             "Trigger", "Home", "Select", "Plus", "Minus", "Misc"})
   {
     if (name.rfind(prefix, 0) == 0)
       return true;
@@ -4297,7 +4320,10 @@ QString DeviceDisplayName(const std::string& device_string)
 {
   ciface::Core::DeviceQualifier dq;
   dq.FromString(device_string);
-  return QString::fromStdString(dq.name.empty() ? device_string : dq.name);
+  QString name = QString::fromStdString(dq.name.empty() ? device_string : dq.name);
+  if (dq.source == "Switch2")
+    name += QStringLiteral(" (Bluetooth)");
+  return name;
 }
 
 bool LooksLikeGameCube(const std::string& d)
@@ -4403,7 +4429,7 @@ void BigPictureWindow::SwitchPort(int port, const std::string& device, bool anno
     SaveBigPictureDeviceProfile(port);
 
   bool needs_setup = false;
-  if (!LoadBigPictureDeviceProfile(port, device))
+  if (!LoadBigPictureDeviceProfile(port, device) && !ApplyGameCubeProfile(port, device))
   {
     if (LooksLikeGameCube(device) || !ApplyStandardGamepadProfile(port, device))
     {
@@ -4415,7 +4441,7 @@ void BigPictureWindow::SwitchPort(int port, const std::string& device, bool anno
       needs_setup = true;
     }
   }
-  Pad::GetConfig()->SaveConfig();
+  SaveBigPicturePads();
   m_prev_held = ~0u;  // the press that caused the switch must not trigger anything
 
   const QString name = DeviceDisplayName(device);
@@ -4452,6 +4478,7 @@ void BigPictureWindow::OnDevicesChanged()
   m_known_devices = now;
   if (!m_active)
     return;
+  QTimer::singleShot(800, this, [this] { CheckDrivers(); });
 
   if (!added.isEmpty())
     Notify(tr("Manette connectée : %1").arg(DeviceDisplayName(added.toStdString())));
@@ -4574,119 +4601,143 @@ void BigPictureWindow::DrawPadTest(QPainter& painter)
 {
   const qreal k = height() / 1080.0;
   const GCPadStatus st = Pad::GetStatus(m_test_port);
+  const auto on = [&](u16 mask) { return (st.button & mask) != 0; };
+
+  // Header
   QFont label = Font(false, int(18 * k), 600);
   label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
   painter.setFont(label);
   painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(0, 90 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("TEST DE LA MANETTE — JOUEUR %1").arg(m_test_port + 1));
   QString device;
   if (auto* pad = PadController(m_test_port))
     device = DeviceDisplayName(pad->GetDefaultDevice().ToString());
-  painter.drawText(QRectF(0, 100 * k, width(), 30 * k), Qt::AlignCenter,
-                   tr("TEST DE LA MANETTE %1").arg(m_test_port + 1));
   painter.setFont(Font(true, int(40 * k), 700));
   painter.setPen(TEXT);
-  painter.drawText(QRectF(0, 135 * k, width(), 60 * k), Qt::AlignCenter, device);
+  painter.drawText(QRectF(0, 125 * k, width(), 60 * k), Qt::AlignCenter, device);
 
-  const qreal cx = width() / 2.0;
-  const auto stick = [&](QPointF c, qreal r, u8 sx, u8 sy, const QString& icon, QColor col) {
-    painter.setPen(QPen(LINE, 2 * k));
-    painter.setBrush(SURFACE);
-    QPolygonF gate;
+  // One panel shaped like the controller, everything at its place on it.
+  const QRectF panel(width() / 2.0 - 760 * k, 220 * k, 1520 * k, 660 * k);
+  painter.setPen(QPen(LINE, 2 * k));
+  painter.setBrush(SURFACE);
+  painter.drawRoundedRect(panel, 56 * k, 56 * k);
+
+  // Shoulders: analog value + click
+  const auto trigger = [&](bool left, u8 v, bool click) {
+    const qreal w = 430 * k, h = 34 * k;
+    const qreal x = left ? panel.left() + 150 * k : panel.right() - 150 * k - w;
+    const QRectF bar(x, panel.top() + 46 * k, w, h);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(SURFACE_DEEP);
+    painter.drawRoundedRect(bar, h / 2, h / 2);
+    const qreal fill = bar.width() * v / 255.0;
+    if (fill > 1)
+    {
+      painter.setBrush(click ? ACCENT_SOFT : ACCENT);
+      painter.drawRoundedRect(left ? QRectF(bar.left(), bar.top(), fill, h) :
+                                     QRectF(bar.right() - fill, bar.top(), fill, h),
+                              h / 2, h / 2);
+    }
+    const QRectF icon(left ? bar.left() - 82 * k : bar.right() + 22 * k, bar.center().y() - 30 * k,
+                      60 * k, 60 * k);
+    DrawIcon(painter, left ? QStringLiteral("L") : QStringLiteral("R"), icon);
+    painter.setFont(Font(false, int(17 * k), 600));
+    painter.setPen(TEXT_DIM);
+    painter.drawText(QRectF(bar.left(), bar.bottom() + 6 * k, bar.width(), 24 * k),
+                     (left ? Qt::AlignLeft : Qt::AlignRight) | Qt::AlignVCenter,
+                     click ? tr("Clic") : QStringLiteral("%1 %").arg(int(v * 100 / 255)));
+  };
+  trigger(true, st.triggerLeft, on(PAD_TRIGGER_L));
+  trigger(false, st.triggerRight, on(PAD_TRIGGER_R));
+
+  // Sticks, scaled to the GameCube gate (full tilt touches the octagon)
+  const auto stick = [&](QPointF c, qreal r, u8 sx, u8 sy, qreal gate, const QString& icon,
+                         QColor col) {
+    QPolygonF oct;
     for (int i = 0; i < 8; ++i)
     {
       const qreal a = i * std::numbers::pi / 4;
-      gate << QPointF(c.x() + std::cos(a) * r, c.y() - std::sin(a) * r);
+      oct << QPointF(c.x() + std::cos(a) * r, c.y() - std::sin(a) * r);
     }
-    painter.drawPolygon(gate);
+    painter.setPen(QPen(LINE, 2 * k));
+    painter.setBrush(SURFACE_DEEP);
+    painter.drawPolygon(oct);
     painter.setPen(QPen(LINE, 1 * k, Qt::DashLine));
     painter.drawLine(QPointF(c.x() - r, c.y()), QPointF(c.x() + r, c.y()));
     painter.drawLine(QPointF(c.x(), c.y() - r), QPointF(c.x(), c.y() + r));
-    const qreal x = (sx - 128) / 127.0, y = (sy - 128) / 127.0;
-    const QPointF p(c.x() + std::clamp<qreal>(x, -1.1, 1.1) * r,
-                    c.y() - std::clamp<qreal>(y, -1.1, 1.1) * r);
+    const qreal x = (sx - 128) / (127.0 * gate), y = (sy - 128) / (127.0 * gate);
+    const QPointF p(c.x() + std::clamp<qreal>(x, -1.15, 1.15) * r,
+                    c.y() - std::clamp<qreal>(y, -1.15, 1.15) * r);
     painter.setPen(QPen(col, 3 * k));
     painter.drawLine(c, p);
     painter.setPen(Qt::NoPen);
     painter.setBrush(col);
-    painter.drawEllipse(p, 14 * k, 14 * k);
-    DrawIcon(painter, icon, QRectF(c.x() - 28 * k, c.y() + r + 18 * k, 56 * k, 56 * k));
+    painter.drawEllipse(p, 15 * k, 15 * k);
+    DrawIcon(painter, icon, QRectF(c.x() - r - 70 * k, c.y() + r - 52 * k, 52 * k, 52 * k));
     painter.setFont(Font(false, int(16 * k), 500));
     painter.setPen(TEXT_DIM);
-    painter.drawText(QRectF(c.x() - r, c.y() + r + 78 * k, 2 * r, 24 * k), Qt::AlignCenter,
-                     QStringLiteral("%1 , %2").arg(int(sx) - 128).arg(int(sy) - 128));
+    painter.drawText(QRectF(c.x() - r, c.y() + r + 8 * k, 2 * r, 24 * k), Qt::AlignCenter,
+                     QStringLiteral("X %1   Y %2").arg(int(sx) - 128).arg(int(sy) - 128));
   };
-  stick(QPointF(cx - 470 * k, 560 * k), 130 * k, st.stickX, st.stickY,
-        QStringLiteral("Control_Stick"), TEXT);
-  stick(QPointF(cx + 470 * k, 600 * k), 100 * k, st.substickX, st.substickY,
-        QStringLiteral("C-Stick"), QColor(255, 214, 64));
+  stick(QPointF(panel.left() + 330 * k, panel.top() + 285 * k), 135 * k, st.stickX, st.stickY,
+        0.7937125, QStringLiteral("Control_Stick"), TEXT);
+  stick(QPointF(panel.right() - 560 * k, panel.top() + 505 * k), 100 * k, st.substickX,
+        st.substickY, 0.7221375, QStringLiteral("C-Stick"), QColor(255, 210, 60));
 
-  // Triggers: analog value, digital click.
-  const auto trigger = [&](QRectF r, const QString& icon, u8 v, bool click) {
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(SURFACE);
-    painter.drawRoundedRect(r, r.height() / 2, r.height() / 2);
-    painter.setBrush(click ? ACCENT_SOFT : ACCENT);
-    painter.drawRoundedRect(QRectF(r.left(), r.top(), r.width() * v / 255.0, r.height()),
-                            r.height() / 2, r.height() / 2);
-    DrawIcon(painter, icon, QRectF(r.left() - 74 * k, r.center().y() - 30 * k, 60 * k, 60 * k));
-    painter.setFont(Font(false, int(18 * k), 600));
-    painter.setPen(click ? BG : TEXT);
-    painter.drawText(r.adjusted(16 * k, 0, -16 * k, 0), Qt::AlignVCenter | Qt::AlignRight,
-                     click ? tr("CLIC") : QString::number(v));
-  };
-  trigger(QRectF(cx - 560 * k, 250 * k, 360 * k, 40 * k), QStringLiteral("L"), st.triggerLeft,
-          (st.button & PAD_TRIGGER_L) != 0);
-  trigger(QRectF(cx + 280 * k, 250 * k, 360 * k, 40 * k), QStringLiteral("R"), st.triggerRight,
-          (st.button & PAD_TRIGGER_R) != 0);
-
-  const auto button = [&](QPointF c, qreal r, const QString& icon, bool on) {
-    painter.setPen(Qt::NoPen);
-    QColor ring = on ? ACCENT : SURFACE;
-    painter.setBrush(ring);
-    painter.drawEllipse(c, r, r);
-    painter.setOpacity(on ? 1.0 : 0.55);
-    DrawIcon(painter, icon, QRectF(c.x() - r * 0.8, c.y() - r * 0.8, r * 1.6, r * 1.6));
-    painter.setOpacity(1.0);
-  };
-  const QPointF face(cx + 170 * k, 470 * k);
-  button(face, 62 * k, QStringLiteral("A"), (st.button & PAD_BUTTON_A) != 0);
-  button(face + QPointF(-100 * k, 70 * k), 40 * k, QStringLiteral("B"), (st.button & PAD_BUTTON_B) != 0);
-  button(face + QPointF(105 * k, -30 * k), 44 * k, QStringLiteral("X"), (st.button & PAD_BUTTON_X) != 0);
-  button(face + QPointF(-30 * k, -100 * k), 44 * k, QStringLiteral("Y"), (st.button & PAD_BUTTON_Y) != 0);
-  button(QPointF(cx + 200 * k, 340 * k), 38 * k, QStringLiteral("Z"), (st.button & PAD_TRIGGER_Z) != 0);
-  button(QPointF(cx, 470 * k), 36 * k, QStringLiteral("Start-Pause"), (st.button & PAD_BUTTON_START) != 0);
-
-  // D-pad: show the pressed direction with the matching icon variant.
-  QString dpad = QStringLiteral("D-Pad");
+  // D-pad: the icon variant shows the pressed direction
   QString dir;
-  if (st.button & PAD_BUTTON_UP)
+  if (on(PAD_BUTTON_UP))
     dir += QLatin1Char('U');
-  if (st.button & PAD_BUTTON_DOWN)
+  if (on(PAD_BUTTON_DOWN))
     dir += QLatin1Char('D');
-  if (st.button & PAD_BUTTON_LEFT)
+  if (on(PAD_BUTTON_LEFT))
     dir += QLatin1Char('L');
-  if (st.button & PAD_BUTTON_RIGHT)
+  if (on(PAD_BUTTON_RIGHT))
     dir += QLatin1Char('R');
+  QString dpad = QStringLiteral("D-Pad");
   if (!dir.isEmpty() && dir.size() <= 2)
     dpad += QLatin1Char('-') + dir;
-  const QRectF dr(cx - 260 * k, 740 * k, 120 * k, 120 * k);
+  const QPointF dc(panel.left() + 560 * k, panel.top() + 505 * k);
   painter.setPen(Qt::NoPen);
-  painter.setBrush(dir.isEmpty() ? SURFACE : ACCENT);
-  painter.drawEllipse(dr.adjusted(-14 * k, -14 * k, 14 * k, 14 * k));
-  DrawIcon(painter, dpad, dr);
+  painter.setBrush(dir.isEmpty() ? SURFACE_DEEP : ACCENT);
+  painter.drawEllipse(dc, 78 * k, 78 * k);
+  DrawIcon(painter, dpad, QRectF(dc.x() - 58 * k, dc.y() - 58 * k, 116 * k, 116 * k));
 
+  // Buttons
+  const auto button = [&](QPointF c, qreal r, const QString& icon, bool pressed) {
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(pressed ? ACCENT : SURFACE_DEEP);
+    painter.drawEllipse(c, r, r);
+    painter.setOpacity(pressed ? 1.0 : 0.6);
+    DrawIcon(painter, icon, QRectF(c.x() - r * 0.78, c.y() - r * 0.78, r * 1.56, r * 1.56));
+    painter.setOpacity(1.0);
+  };
+  button(QPointF(panel.center().x(), panel.top() + 285 * k), 36 * k,
+         QStringLiteral("Start-Pause"), on(PAD_BUTTON_START));
+  const QPointF a(panel.right() - 330 * k, panel.top() + 285 * k);
+  button(a, 66 * k, QStringLiteral("A"), on(PAD_BUTTON_A));
+  button(a + QPointF(-120 * k, 72 * k), 42 * k, QStringLiteral("B"), on(PAD_BUTTON_B));
+  button(a + QPointF(122 * k, -22 * k), 46 * k, QStringLiteral("X"), on(PAD_BUTTON_X));
+  button(a + QPointF(-24 * k, -122 * k), 46 * k, QStringLiteral("Y"), on(PAD_BUTTON_Y));
+  button(QPointF(panel.right() - 200 * k, panel.top() + 140 * k), 34 * k, QStringLiteral("Z"),
+         on(PAD_TRIGGER_Z));
+
+  // Footer: hold START to leave
+  const qreal cx = width() / 2.0;
   painter.setFont(Font(false, int(20 * k), 400));
   painter.setPen(TEXT_SOFT);
-  const qreal hold = m_test_start_since < 0 ? 0 :
-                                              std::min<qreal>(1, (m_clock.elapsed() - m_test_start_since) / 1000.0);
-  painter.drawText(QRectF(0, height() - 110 * k, width(), 30 * k), Qt::AlignCenter,
+  painter.drawText(QRectF(0, panel.bottom() + 40 * k, width(), 30 * k), Qt::AlignCenter,
                    tr("Maintiens START pour quitter"));
+  const qreal hold = m_test_start_since < 0 ?
+                         0 :
+                         std::min<qreal>(1, (m_clock.elapsed() - m_test_start_since) / 1000.0);
+  const QRectF bar(cx - 150 * k, panel.bottom() + 84 * k, 300 * k, 8 * k);
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(SURFACE);
+  painter.drawRoundedRect(bar, 4 * k, 4 * k);
   if (hold > 0)
   {
-    const QRectF bar(cx - 150 * k, height() - 70 * k, 300 * k, 8 * k);
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(SURFACE);
-    painter.drawRoundedRect(bar, 4 * k, 4 * k);
     painter.setBrush(ACCENT);
     painter.drawRoundedRect(QRectF(bar.left(), bar.top(), bar.width() * hold, bar.height()), 4 * k,
                             4 * k);
@@ -4823,4 +4874,61 @@ void BigPictureWindow::DrawIntroGameCube(QPainter& painter)
     painter.drawText(QRectF(0, ty + 100 * k, width(), 36 * k), Qt::AlignCenter, tr("MODE MANETTE"));
     painter.setOpacity(1);
   }
+}
+
+// ================================================================== USB driver (no Zadig)
+
+void BigPictureWindow::CheckDrivers()
+{
+  if (!m_active || !isVisible() || m_driver_busy)
+    return;
+  if (m_mode != Mode::Library && m_mode != Mode::Menu)
+    return;
+  QStringList names;
+  bool new_device = false;
+  for (const auto& t : BigPictureDriver::DevicesNeedingDriver())
+  {
+    const QString id = QString::fromStdWString(t.instance_id);
+    names << QString::fromStdString(t.description);
+    if (!m_driver_asked.contains(id))
+    {
+      m_driver_asked << id;
+      new_device = true;
+    }
+  }
+  if (!new_device)
+    return;
+  names.removeDuplicates();
+  m_driver_devices = names.join(QStringLiteral(", "));
+  m_mode_before_driver = m_mode == Mode::Menu ? Mode::Library : m_mode;
+  m_audio->Play(Sound::MenuOpen);
+  m_overlay_t = 0;
+  m_mode = Mode::ConfirmDriver;
+}
+
+void BigPictureWindow::InstallDrivers()
+{
+  m_driver_busy = true;
+  if (m_mode != Mode::ConfirmDriver)
+  {
+    m_overlay_t = 0;
+    m_mode = Mode::ConfirmDriver;
+  }
+  BigPictureDriver::InstallAsync(this, [this](bool ok) {
+    m_driver_busy = false;
+    BeginTransition(0);
+    m_mode = m_mode_before_driver == Mode::ConfirmDriver ? Mode::Library : m_mode_before_driver;
+    if (ok)
+    {
+      m_audio->Play(Sound::Confirm);
+      Toast(tr("Pilote installé : la manette est prête"));
+      // Let Windows restart the device, then look again.
+      QTimer::singleShot(1500, this, [] { g_controller_interface.RefreshDevices(); });
+    }
+    else
+    {
+      m_audio->Play(Sound::Error);
+      Toast(tr("Pilote non installé"));
+    }
+  });
 }

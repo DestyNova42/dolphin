@@ -51,6 +51,7 @@ struct BigPictureSettingsHost
   std::function<void()> open_memory_cards;
   std::function<void(int port)> test_controller;
   std::function<void()> check_updates;
+  std::function<void()> install_drivers;
   std::function<void(const QString&)> notify;  // short message on screen
   std::function<void()> open_classic;
   std::function<void()> interface_changed;  // a controller-mode preference changed
@@ -78,13 +79,15 @@ enum class Effect
   None,
   Cube3D,
 };
+// The colours of the GameCube models
 enum class Theme
 {
   IndigoNight,
   IndigoGameCube,
   Spice,
-  Oled,
+  JetBlack,
   Platinum,
+  PearlWhite,
   GameColor,
 };
 enum class IntroStyle
@@ -129,6 +132,11 @@ std::vector<BigPictureSettingCategory> BuildBigPictureCheatSettings(const std::s
 // Per-device controller profiles: <User>/Config/Profiles/GCPad/Mode manette - <device>.ini
 std::string BigPictureProfilePath(const std::string& device_name);
 void SaveBigPictureDeviceProfile(int port);
+// Saves the controller settings and the profile of every controller in use.
+void SaveBigPicturePads();
+// GameCube buttons on GameCube buttons: Switch 2 GameCube controller (USB or Bluetooth).
+bool ApplyGameCubeProfile(int port, const std::string& device);
+bool IsSwitch2GameCube(const std::string& device);
 bool LoadBigPictureDeviceProfile(int port, const std::string& device);
 
 // Writes changed settings to disk.

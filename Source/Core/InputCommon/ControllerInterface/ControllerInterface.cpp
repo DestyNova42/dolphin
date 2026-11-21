@@ -10,6 +10,7 @@
 #include "Core/HW/WiimoteReal/WiimoteReal.h"
 
 #ifdef CIFACE_USE_WIN32
+#include "InputCommon/ControllerInterface/Switch2BLE/Switch2BLE.h"
 #include "InputCommon/ControllerInterface/Win32/Win32.h"
 #endif
 #ifdef CIFACE_USE_XLIB
@@ -60,6 +61,8 @@ void ControllerInterface::Initialize(const WindowSystemInfo& wsi)
 
 #ifdef CIFACE_USE_WIN32
   m_input_backends.emplace_back(ciface::Win32::CreateInputBackend(this));
+  // Switch 2 GameCube controller over Bluetooth (controller mode)
+  m_input_backends.emplace_back(ciface::Switch2BLE::CreateInputBackend(this));
 #endif
 #ifdef CIFACE_USE_XLIB
   m_input_backends.emplace_back(ciface::XInput2::CreateInputBackend(this));
