@@ -24,6 +24,7 @@ class QString;
 
 class AchievementsWindow;
 class AssemblerWidget;
+class BigPictureWindow;
 class BreakpointWidget;
 struct BootParameters;
 class CheatsManager;
@@ -171,6 +172,8 @@ private:
   void ShowGeneralWindow();
   void ShowAudioWindow();
   void ShowControllersWindow();
+  void ShowBigPicture();
+  void LaunchFromBigPicture(const QString& path);
   void ShowGraphicsWindow();
   void ShowFreeLookWindow();
   void ShowAboutDialog();
@@ -242,6 +245,7 @@ private:
   MenuBar* m_menu_bar;
   SearchBar* m_search_bar;
   GameList* m_game_list;
+  BigPictureWindow* m_big_picture = nullptr;
   GameCount* m_game_count;
   RenderWidget* m_render_widget = nullptr;
   bool m_rendering_to_main;

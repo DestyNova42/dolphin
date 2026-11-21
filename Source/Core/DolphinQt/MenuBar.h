@@ -117,6 +117,7 @@ signals:
 
   // View
   void ShowList();
+  void ShowBigPicture();
   void ShowGrid();
   void PurgeGameListCache();
   void ShowSearch();

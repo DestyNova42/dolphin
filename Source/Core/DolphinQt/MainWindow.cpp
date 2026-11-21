@@ -7,6 +7,7 @@
 #include <QCloseEvent>
 #include <QDateTime>
 #include <QDesktopServices>
+#include <QTimer>
 #include <QDir>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -74,6 +75,7 @@
 #include "DiscIO/RiivolutionPatcher.h"
 
 #include "DolphinQt/AboutDialog.h"
+#include "DolphinQt/BigPicture/BigPictureWindow.h"
 #include "DolphinQt/Achievements/AchievementsWindow.h"
 #include "DolphinQt/CheatsManager.h"
 #include "DolphinQt/Config/FreeLookWindow.h"
@@ -235,7 +237,46 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
   QSettings& settings = Settings::GetQSettings();
   restoreState(settings.value(QStringLiteral("mainwindow/state")).toByteArray());
   restoreGeometry(settings.value(QStringLiteral("mainwindow/geometry")).toByteArray());
-  if (!Settings::Instance().IsBatchModeEnabled())
+
+  // Controller mode ("Mode manette"): shown instead of the classic window at startup.
+  m_big_picture = new BigPictureWindow(m_game_list->GetGameListModel());
+  connect(m_big_picture, &BigPictureWindow::LaunchRequested, this,
+          &MainWindow::LaunchFromBigPicture);
+  connect(m_big_picture, &BigPictureWindow::ClassicRequested, this, [this] {
+    m_big_picture->Close();
+    Settings::GetQSettings().setValue(QStringLiteral("bigpicture/onstart"), false);
+    show();
+    raise();
+    activateWindow();
+  });
+  connect(m_big_picture, &BigPictureWindow::QuitRequested, this, [this] {
+    m_big_picture->Close();
+    if (RequestStop())
+      m_exit_requested = true;
+  });
+  connect(&Settings::Instance(), &Settings::EmulationStateChanged, this, [this](Core::State state) {
+    if (!m_big_picture->IsActive())
+      return;
+    if (state == Core::State::Uninitialized)
+    {
+      if (m_exit_requested)
+        return;
+      QTimer::singleShot(0, this, [this] {
+        hide();
+        if (m_big_picture->IsActive())
+          m_big_picture->Open();
+      });
+    }
+    else
+    {
+      m_big_picture->Suspend();
+    }
+  });
+
+  const bool start_big_picture =
+      !Settings::Instance().IsBatchModeEnabled() && !boot_parameters &&
+      settings.value(QStringLiteral("bigpicture/onstart"), true).toBool();
+  if (!Settings::Instance().IsBatchModeEnabled() && !start_big_picture)
   {
     show();
   }
@@ -329,10 +370,36 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
     StartGame(std::move(m_pending_boot));
     m_pending_boot.reset();
   }
+
+  if (start_big_picture)
+    ShowBigPicture();
+}
+
+void MainWindow::ShowBigPicture()
+{
+  Settings::GetQSettings().setValue(QStringLiteral("bigpicture/onstart"), true);
+  // Game covers make the controller mode much nicer.
+  if (!Config::Get(Config::MAIN_USE_GAME_COVERS))
+    Config::SetBase(Config::MAIN_USE_GAME_COVERS, true);
+  if (Core::IsUninitialized(m_system))
+  {
+    hide();
+    m_big_picture->Open();
+  }
+}
+
+void MainWindow::LaunchFromBigPicture(const QString& path)
+{
+  if (!Core::IsUninitialized(m_system))
+    return;
+  // Games started from the controller mode always run fullscreen.
+  m_fullscreen_requested = true;
+  StartGame(path, ScanForSecondDisc::Yes);
 }
 
 MainWindow::~MainWindow()
 {
+  delete m_big_picture;
   // Shut down NetPlay first to avoid race condition segfault
   Settings::Instance().ResetNetPlayClient();
   Settings::Instance().ResetNetPlayServer();
@@ -585,6 +652,7 @@ void MainWindow::ConnectMenuBar()
 
   // View
   connect(m_menu_bar, &MenuBar::ShowList, m_game_list, &GameList::SetListView);
+  connect(m_menu_bar, &MenuBar::ShowBigPicture, this, &MainWindow::ShowBigPicture);
   connect(m_menu_bar, &MenuBar::ShowGrid, m_game_list, &GameList::SetGridView);
   connect(m_menu_bar, &MenuBar::PurgeGameListCache, m_game_list, &GameList::PurgeCache);
   connect(m_menu_bar, &MenuBar::ShowSearch, m_search_bar, &SearchBar::Show);

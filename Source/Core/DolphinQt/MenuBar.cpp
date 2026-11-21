@@ -492,6 +492,10 @@ void MenuBar::AddViewMenu()
   connect(show_log_config, &QAction::toggled, &Settings::Instance(),
           &Settings::SetLogConfigVisible);
 
+  QAction* big_picture = view_menu->addAction(tr("Mode manette (plein écran)"));
+  connect(big_picture, &QAction::triggered, this, &MenuBar::ShowBigPicture);
+  view_menu->addSeparator();
+
   QAction* show_toolbar = view_menu->addAction(tr("Show &Toolbar"));
   show_toolbar->setCheckable(true);
   show_toolbar->setChecked(Settings::Instance().IsToolBarVisible());
