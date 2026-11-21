@@ -249,12 +249,12 @@ public:
   std::string GetSource() const override { return "Switch2"; }
   int GetSortPriority() const override { return 2; }
 
-  DeviceRemoval UpdateInput() override
+  Core::DeviceRemoval UpdateInput() override
   {
     if (!m_conn->valid.load())
-      return DeviceRemoval::Remove;
+      return Core::DeviceRemoval::Remove;
     m_conn->SendRumble();
-    return DeviceRemoval::Keep;
+    return Core::DeviceRemoval::Keep;
   }
 
   bool IsValid() const override { return m_conn->valid.load(); }

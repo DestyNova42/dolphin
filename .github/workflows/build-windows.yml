@@ -39,7 +39,7 @@ jobs:
           -DBP_BUILD_ID=${{ github.sha }}
 
       - name: Build
-        run: cmake --build --preset ninja-build-release-x64 --target dolphin-emu
+        run: cmake --build --preset ninja-build-release-x64 --target dolphin-emu -- -k 0
 
       - name: sccache stats
         run: sccache --show-stats
