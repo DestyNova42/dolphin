@@ -15,6 +15,8 @@
 #include <thread>
 #include <vector>
 
+// C++/WinRT event delegates trip C4265 (in the SDK headers).
+#pragma warning(disable : 4265)
 #include <winrt/base.h>
 #include <winrt/windows.devices.bluetooth.advertisement.h>
 #include <winrt/windows.devices.bluetooth.genericattributeprofile.h>
