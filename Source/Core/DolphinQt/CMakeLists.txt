@@ -37,6 +37,8 @@ set_property(TARGET Qt6::Core PROPERTY INTERFACE_COMPILE_FEATURES "")
 add_executable(dolphin-emu
   AboutDialog.cpp
   AboutDialog.h
+  BigPicture/BigPictureAudio.cpp
+  BigPicture/BigPictureAudio.h
   BigPicture/BigPictureWindow.cpp
   BigPicture/BigPictureWindow.h
   CheatSearchFactoryWidget.cpp
@@ -477,6 +479,16 @@ PRIVATE
   imgui
   implot
 )
+
+if(ENABLE_CUBEB)
+  # Menu music / sounds of the controller mode
+  if(TARGET cubeb::cubeb)
+    target_link_libraries(dolphin-emu PRIVATE cubeb::cubeb)
+  else()
+    target_link_libraries(dolphin-emu PRIVATE cubeb)
+  endif()
+  target_compile_definitions(dolphin-emu PRIVATE HAVE_BIGPICTURE_CUBEB)
+endif()
 
 if(ENABLE_SDL)
   target_link_libraries(dolphin-emu
