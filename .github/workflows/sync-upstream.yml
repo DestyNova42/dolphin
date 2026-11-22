@@ -1,10 +1,9 @@
 name: Sync with official Dolphin
 
-# Merges the official Dolphin every day, then rebuilds: the controller mode gets every
-# new Dolphin feature, installed from Settings > Rechercher une mise à jour.
+# Merges the official Dolphin, then rebuilds: the controller mode gets every new Dolphin
+# feature, installed from Settings > Rechercher une mise à jour.
+# Manual only: Actions > Sync with official Dolphin > Run workflow.
 on:
-  schedule:
-    - cron: "17 4 * * *"
   workflow_dispatch:
 
 permissions:
