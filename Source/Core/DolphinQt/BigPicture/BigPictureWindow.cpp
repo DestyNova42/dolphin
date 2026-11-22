@@ -2085,8 +2085,8 @@ void BigPictureWindow::DrawHints(QPainter& painter,
   const QFont font = Font(false, int(20 * k), 400);
   painter.setFont(font);
   const QFontMetricsF fm(font);
-  const qreal icon = 38 * k;
-  const qreal y = height() - 44 * k - icon / 2;
+  const qreal icon = 52 * k;
+  const qreal y = height() - 38 * k - icon / 2;
 
   // Icon style: GameCube or the Wii Classic Controller
   const bool wii_icons =
@@ -5185,7 +5185,7 @@ void BigPictureWindow::DrawPadTest(QPainter& painter)
     painter.setBrush(pressed ? ACCENT : SURFACE_DEEP);
     painter.drawEllipse(c, r, r);
     painter.setOpacity(pressed ? 1.0 : 0.6);
-    DrawIcon(painter, icon, QRectF(c.x() - r * 0.78, c.y() - r * 0.78, r * 1.56, r * 1.56));
+    DrawIcon(painter, icon, QRectF(c.x() - r * 0.95, c.y() - r * 0.95, r * 1.9, r * 1.9));
     painter.setOpacity(1.0);
   };
   button(QPointF(panel.center().x(), panel.top() + 285 * k), 36 * k,
@@ -6218,7 +6218,7 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     painter.setBrush(on ? ACCENT : SURFACE_DEEP);
     painter.drawEllipse(c, r, r);
     painter.setOpacity(on ? 1.0 : 0.65);
-    DrawIcon(painter, icon, QRectF(c.x() - r * 0.8, c.y() - r * 0.8, r * 1.6, r * 1.6));
+    DrawIcon(painter, icon, QRectF(c.x() - r * 0.98, c.y() - r * 0.98, r * 1.96, r * 1.96));
     painter.setOpacity(1.0);
   };
   const auto stick = [&](QPointF c, qreal r, const QString& icon, qreal x, qreal y) {
