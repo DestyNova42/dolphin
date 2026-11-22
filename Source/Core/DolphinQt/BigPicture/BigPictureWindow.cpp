@@ -4,6 +4,7 @@
 #include "DolphinQt/BigPicture/BigPictureWindow.h"
 
 #include <algorithm>
+#include <optional>
 #include <cctype>
 #include <functional>
 #include <chrono>
@@ -32,6 +33,8 @@
 #include <QHash>
 #include <QImage>
 #include <QKeyEvent>
+#include <QWheelEvent>
+#include <QMouseEvent>
 #ifdef HAVE_BIGPICTURE_DBUS
 #include <QDBusConnection>
 #include <QDBusInterface>
@@ -91,6 +94,7 @@
 #include "DolphinQt/BigPicture/BigPictureAudio.h"
 #include "DolphinQt/BigPicture/BigPictureDriver.h"
 #include "DolphinQt/BigPicture/BigPictureSync.h"
+#include "DolphinQt/BigPicture/BigPictureTriggers.h"
 #include "DolphinQt/BigPicture/BigPictureUpdater.h"
 #include "DolphinQt/GameList/GameListModel.h"
 #include "DolphinQt/QtUtils/ImageConverter.h"
@@ -458,6 +462,11 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
   setAttribute(Qt::WA_TranslucentBackground);  // the pause menu shows the game behind it
   setFocusPolicy(Qt::StrongFocus);
   setCursor(Qt::BlankCursor);
+  setMouseTracking(true);
+  m_cursor_timer = new QTimer(this);
+  m_cursor_timer->setSingleShot(true);
+  m_cursor_timer->setInterval(2500);
+  connect(m_cursor_timer, &QTimer::timeout, this, [this] { setCursor(Qt::BlankCursor); });
 
   const QString res_dir =
       QString::fromStdString(File::GetSysDirectory() + "Resources/BigPicture/");
@@ -668,7 +677,7 @@ void BigPictureWindow::ApplyPreferences()
 
 void BigPictureWindow::Open()
 {
-  unsetCursor();
+  setCursor(Qt::BlankCursor);  // shown again as soon as the mouse moves
   QTimer::singleShot(1200, this, [this] {
     if (m_active && Core::IsUninitialized(Core::System::GetInstance()))
       SyncSaves(false);
@@ -737,6 +746,7 @@ void BigPictureWindow::Suspend()
 void BigPictureWindow::Close()
 {
   m_active = false;
+  BigPictureTriggers::Release();
   m_game_timer->stop();
   Suspend();
 }
@@ -1066,6 +1076,7 @@ void BigPictureWindow::PollInGame()
 {
   if (!m_active || m_mode != Mode::InGame)
     return;
+  BigPictureTriggers::Update(true);
   auto& system = Core::System::GetInstance();
   if (Core::GetState(system) != Core::State::Running)
     return;
@@ -1447,7 +1458,17 @@ void BigPictureWindow::HandleLibrary(Action action)
   {
     const int dir = action == Action::PageDown ? 1 : -1;
     BeginTransition(dir);
-    m_tab = static_cast<Tab>((static_cast<int>(m_tab) + 4 + dir) % 4);
+    // "Récents" is no longer a tab: the sort has a "recent" order
+    {
+      constexpr Tab order[] = {Tab::All, Tab::Favorites, Tab::Settings};
+      int pos = 0;
+      for (int t = 0; t < 3; ++t)
+      {
+        if (order[t] == m_tab)
+          pos = t;
+      }
+      m_tab = order[(pos + 3 + dir) % 3];
+    }
     m_audio->Play(Sound::Page);
     m_settings_in_items = false;
     m_hero_focus = false;
@@ -2149,9 +2170,11 @@ QString WiiIconName(const QString& name)
       {QStringLiteral("B"), QStringLiteral("WCC-B")},
       {QStringLiteral("X"), QStringLiteral("WCC-X")},
       {QStringLiteral("Y"), QStringLiteral("WCC-Y")},
-      {QStringLiteral("L"), QStringLiteral("WCC-L")},
-      {QStringLiteral("R"), QStringLiteral("WCC-R")},
-      {QStringLiteral("Z"), QStringLiteral("WCC-ZR")},
+      // As on the Classic Controller Pro: the GameCube triggers sit where ZL / ZR are, and Z
+      // is a shoulder button like R.
+      {QStringLiteral("L"), QStringLiteral("WCC-ZL")},
+      {QStringLiteral("R"), QStringLiteral("WCC-ZR")},
+      {QStringLiteral("Z"), QStringLiteral("WCC-R")},
       {QStringLiteral("Start-Pause"), QStringLiteral("Wii-Plus")},
   };
   if (const auto it = map.constFind(name); it != map.constEnd())
@@ -2161,11 +2184,11 @@ QString WiiIconName(const QString& name)
   if (name.startsWith(QStringLiteral("D-Pad")))
     return QStringLiteral("Wii-D-Pad");
   if (name.startsWith(QStringLiteral("L-")))
-    return QStringLiteral("WCC-L");
+    return QStringLiteral("WCC-ZL");
   if (name.startsWith(QStringLiteral("R-")))
-    return QStringLiteral("WCC-R");
-  if (name.startsWith(QStringLiteral("Z-")))
     return QStringLiteral("WCC-ZR");
+  if (name.startsWith(QStringLiteral("Z-")))
+    return QStringLiteral("WCC-R");
   return name;
 }
 }  // namespace
@@ -2226,24 +2249,62 @@ void BigPictureWindow::DrawHints(QPainter& painter,
   const qreal icon = 52 * k;
   const qreal y = height() - 38 * k - icon / 2;
 
+  // A click on a hint does what its button does
+  const auto hint_action = [](const QString& name) -> std::optional<Action> {
+    if (name == QStringLiteral("A"))
+      return Action::Accept;
+    if (name == QStringLiteral("B"))
+      return Action::Back;
+    if (name == QStringLiteral("X"))
+      return Action::Options;
+    if (name == QStringLiteral("Y"))
+      return Action::Favorite;
+    if (name == QStringLiteral("Z"))
+      return Action::Sort;
+    if (name == QStringLiteral("Start-Pause"))
+      return Action::Menu;
+    if (name == QStringLiteral("L"))
+      return Action::PageUp;
+    if (name == QStringLiteral("R"))
+      return Action::PageDown;
+    if (name.endsWith(QStringLiteral("-U")))
+      return Action::Up;
+    if (name.endsWith(QStringLiteral("-D")))
+      return Action::Down;
+    if (name.endsWith(QStringLiteral("-L")))
+      return Action::Left;
+    if (name.endsWith(QStringLiteral("-R")))
+      return Action::Right;
+    return std::nullopt;
+  };
+  const auto hint_hit = [&](const QString& name, const QRectF& r) {
+    if (const auto a = hint_action(name))
+      AddHit(r, [this, a] { HandleAction(*a); });
+  };
+
   qreal x = 80 * k;
   for (const auto& [btn, label] : left)
   {
+    const qreal x0 = x;
     DrawIcon(painter, btn, QRectF(x, y - icon / 2, icon, icon));
     x += icon + 12 * k;
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x, y - icon / 2, 600 * k, icon), Qt::AlignVCenter, label);
-    x += fm.horizontalAdvance(label) + 36 * k;
+    x += fm.horizontalAdvance(label);
+    hint_hit(btn, QRectF(x0, y - icon / 2, x - x0, icon));
+    x += 36 * k;
   }
 
   x = width() - 80 * k;
   for (auto it = right.rbegin(); it != right.rend(); ++it)
   {
+    const qreal x1 = x;
     const qreal tw = fm.horizontalAdvance(it->second);
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x - tw, y - icon / 2, tw + 2, icon), Qt::AlignVCenter, it->second);
     x -= tw + 10 * k + icon;
     DrawIcon(painter, it->first, QRectF(x, y - icon / 2, icon, icon));
+    hint_hit(it->first, QRectF(x, y - icon / 2, x1 - x, icon));
     x -= 36 * k;
   }
 }
@@ -2312,6 +2373,7 @@ void BigPictureWindow::DrawToast(QPainter& painter)
 
 void BigPictureWindow::paintEvent(QPaintEvent*)
 {
+  m_hits.clear();
   m_wii_icons = Settings::GetQSettings().value(QStringLiteral("bigpicture/icons"), 0).toInt() == 1;
   const qreal dpr = devicePixelRatioF();
   const QSize px_size = size() * dpr;
@@ -2787,11 +2849,13 @@ void BigPictureWindow::DrawTopBar(QPainter& painter)
                    QStringLiteral("Dolphin"));
 
   // Tabs, with a sliding highlight
-  const QString tabs[] = {tr("Bibliothèque"), tr("Récents"), tr("Favoris"), tr("Réglages")};
+  const QString tabs[] = {tr("Bibliothèque"), tr("Favoris"), tr("Réglages")};
+  constexpr Tab tab_ids[] = {Tab::All, Tab::Favorites, Tab::Settings};
+  constexpr int tab_count = 3;
   const QFontMetricsF fm(Font(false, int(20 * k), 600));
-  qreal widths[4];
+  qreal widths[tab_count];
   qreal pill_w = 12 * k;
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < tab_count; ++i)
   {
     widths[i] = fm.horizontalAdvance(tabs[i]) + 56 * k;
     pill_w += widths[i] + 6 * k;
@@ -2807,9 +2871,9 @@ void BigPictureWindow::DrawTopBar(QPainter& painter)
   static qreal s_hl_x = -1, s_hl_w = 0;
   qreal tx = pill_x + 6 * k;
   qreal target_x = tx, target_w = widths[0];
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < tab_count; ++i)
   {
-    if (static_cast<int>(m_tab) == i)
+    if (m_tab == tab_ids[i])
     {
       target_x = tx;
       target_w = widths[i];
@@ -2828,19 +2892,32 @@ void BigPictureWindow::DrawTopBar(QPainter& painter)
   painter.drawRoundedRect(hl, hl.height() / 2, hl.height() / 2);
 
   tx = pill_x + 6 * k;
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < tab_count; ++i)
   {
     const QRectF r(tx, cy - pill_h / 2 + 6 * k, widths[i], pill_h - 12 * k);
-    const bool active = static_cast<int>(m_tab) == i;
+    const bool active = m_tab == tab_ids[i];
+    AddHit(r, [this, tab = tab_ids[i]] {
+      if (m_tab == tab || (m_mode != Mode::Library))
+        return;
+      BeginTransition(static_cast<int>(tab) > static_cast<int>(m_tab) ? 1 : -1);
+      m_tab = tab;
+      m_audio->Play(Sound::Page);
+      m_settings_in_items = false;
+      m_hero_focus = false;
+      ApplyTab();
+    });
     painter.setFont(Font(false, int(20 * k), active ? 600 : 500));
     painter.setPen(active ? BG : TEXT_SOFT);
     painter.drawText(r, Qt::AlignCenter, tabs[i]);
     tx += widths[i] + 6 * k;
   }
   const qreal icon = 46 * k;
-  DrawIcon(painter, QStringLiteral("L"),
-           QRectF(pill.left() - 14 * k - icon, cy - icon / 2, icon, icon));
-  DrawIcon(painter, QStringLiteral("R"), QRectF(pill.right() + 14 * k, cy - icon / 2, icon, icon));
+  const QRectF lr(pill.left() - 14 * k - icon, cy - icon / 2, icon, icon);
+  const QRectF rr(pill.right() + 14 * k, cy - icon / 2, icon, icon);
+  DrawIcon(painter, QStringLiteral("L"), lr);
+  DrawIcon(painter, QStringLiteral("R"), rr);
+  AddHit(lr, [this] { HandleAction(Action::PageUp); });
+  AddHit(rr, [this] { HandleAction(Action::PageDown); });
 
   // Clock
   const QString clock = QTime::currentTime().toString(QStringLiteral("HH:mm"));
@@ -2906,7 +2983,48 @@ void BigPictureWindow::DrawHero(QPainter& painter, const Entry& sel, qreal left,
   painter.setFont(Font(false, int(22 * k), 400));
   painter.setPen(TEXT_SOFT);
   painter.drawText(QRectF(left, y, max_width, 32 * k), Qt::AlignVCenter, PlayInfo(sel));
-  y += 52 * k;
+  y += 44 * k;
+
+  // The game's own short description, as on the console's menu (two lines at most)
+  {
+    const QString maker = QString::fromStdString(sel.game->GetLongMaker()).trimmed();
+    const QString desc =
+        QString::fromStdString(
+            sel.game->GetDescription(UICommon::GameFile::Variant::LongAndNotCustom))
+            .simplified();
+    if (!maker.isEmpty() || !desc.isEmpty())
+    {
+      const QFont maker_font = Font(false, int(18 * k), 700);
+      const QFont desc_font = Font(false, int(19 * k), 400);
+      qreal x = left;
+      if (!maker.isEmpty())
+      {
+        painter.setFont(maker_font);
+        painter.setPen(TEXT);
+        const QString m = maker.toUpper() + QStringLiteral("   ");
+        painter.drawText(QRectF(x, y, max_width, 26 * k), Qt::AlignLeft | Qt::AlignVCenter, m);
+        x += QFontMetricsF(maker_font).horizontalAdvance(m);
+      }
+      painter.setFont(desc_font);
+      painter.setPen(TEXT_SOFT);
+      const QRectF dbox(left, y + 30 * k, std::min<qreal>(max_width, 900 * k), 56 * k);
+      const QString shown = QFontMetricsF(desc_font).elidedText(
+          desc, Qt::ElideRight, dbox.width() * 2 - 40 * k);
+      painter.drawText(dbox, Qt::TextWordWrap | Qt::AlignLeft | Qt::AlignTop, shown);
+      (void)x;
+      y += desc.isEmpty() ? 36 * k : 30 * k + std::min<qreal>(56 * k,
+                                                               QFontMetricsF(desc_font)
+                                                                   .boundingRect(dbox,
+                                                                                 Qt::TextWordWrap,
+                                                                                 shown)
+                                                                   .height()) +
+                                           14 * k;
+    }
+    else
+    {
+      y += 8 * k;
+    }
+  }
 
   qreal bx = left;
   const auto buttons = HeroButtons(sel);
@@ -2965,6 +3083,11 @@ void BigPictureWindow::DrawHero(QPainter& painter, const Entry& sel, qreal left,
                                                              tr("Favori");
       w = DrawPillButton(painter, bx, y, icon, label, primary);
     }
+    AddHit(QRectF(bx, y, w, h), [this, i] {
+      m_hero_focus = true;
+      m_hero_button = static_cast<int>(i);
+      HandleAction(Action::Accept);
+    });
     if (m_hero_focus && static_cast<int>(i) == m_hero_button)
     {
       painter.setPen(QPen(ACCENT_SOFT, 3 * k));
@@ -3083,6 +3206,7 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
     const QRectF r(x, bottom - h, w, h);
     if (r.right() < 0 || r.left() > width())
       continue;
+    AddHit(r, [this, i] { ClickEntry(i); });
 
     // Shadow under the focused cover
     if (f > 0.01)
@@ -3191,6 +3315,8 @@ void BigPictureWindow::DrawList(QPainter& painter)
     const qreal f = EaseOut(m_focus[i]);
     const qreal y = top + (i - m_list_scroll) * row_h;
     const QRectF r(left + f * 14 * k, y + 6 * k, list_w - f * 14 * k, row_h - 12 * k);
+    AddHit(r.intersected(QRectF(0, top - 10 * k, left + list_w + 40 * k, view_h + 20 * k)),
+           [this, i] { ClickEntry(i); });
 
     painter.setPen(Qt::NoPen);
     QColor bg = RAISED;
@@ -3277,25 +3403,6 @@ void BigPictureWindow::DrawList(QPainter& painter)
     const QRectF card(px, y, ch * aspect, ch);
     DrawResumeCard(painter, *sel, card);
     y = card.bottom() + 30 * k;
-  }
-  else
-  {
-    // No resume point (or resume turned off): the game's banner, big
-    const qreal e = EaseOut(m_hero_t);
-    painter.save();
-    painter.setOpacity(e);
-    const QRectF br(px, y, pw, pw / 3);
-    QPainterPath bclip;
-    bclip.addRoundedRect(br, 18 * k, 18 * k);
-    painter.fillPath(bclip, RAISED);
-    const QPixmap banner = BannerFor(*sel, br.size().toSize());
-    if (!banner.isNull())
-    {
-      painter.setClipPath(bclip);
-      painter.drawPixmap(br, banner, QRectF(banner.rect()));
-    }
-    painter.restore();
-    y = br.bottom() + 30 * k;
   }
 
   const qreal e = EaseOut(m_hero_t);
@@ -3418,6 +3525,14 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
   {
     const QRectF r(left, top + 20 * k + i * (cat_h + 6 * k), cats_w, cat_h);
     const bool active = i == m_settings_cat;
+    AddHit(r, [this, i] {
+      if (m_settings_cat != i || m_settings_in_items)
+        m_audio->Play(Sound::Move);
+      m_settings_cat = i;
+      m_settings_in_items = false;
+      m_settings_item = 0;
+      m_settings_scroll = 0;
+    });
     if (active)
     {
       painter.setPen(Qt::NoPen);
@@ -3449,6 +3564,19 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
       continue;
     const QRectF r(ix, y, iw, row_h);
     const bool focused = m_settings_in_items && i == m_settings_item;
+    AddHitAt(r.intersected(QRectF(ix - 20 * k, list_top - 6 * k, iw + 40 * k, view_h + 12 * k)),
+             [this, i, r, k](QPointF pos) {
+               const bool was = m_settings_in_items && m_settings_item == i;
+               m_settings_in_items = true;
+               m_settings_item = i;
+               // The value area on the right: its left half goes back, its right half forward
+               if (pos.x() > r.right() - 360 * k)
+                 HandleAction(pos.x() < r.right() - 180 * k ? Action::Left : Action::Right);
+               else if (was)
+                 HandleAction(Action::Accept);
+               else
+                 m_audio->Play(Sound::Move);
+             });
     painter.setPen(Qt::NoPen);
     painter.setBrush(focused ? TEXT : SURFACE);
     painter.drawRoundedRect(r, 16 * k, 16 * k);
@@ -3557,6 +3685,7 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
 
 void BigPictureWindow::DrawMenu(QPainter& painter)
 {
+  m_hits.clear();  // the menu covers the screen under it
   const qreal k = height() / 1080.0;
   const qreal e = EaseOut(m_overlay_t);
   QColor shade(9, 7, 20);
@@ -3598,6 +3727,10 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
     const qreal ie = EaseOut((m_overlay_t - i * 0.06) / 0.7);
     const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 62 * k);
     const bool active = i == m_menu_index;
+    AddHit(r, [this, i] {
+      m_menu_index = i;
+      HandleAction(Action::Accept);
+    });
     painter.setOpacity(e * ie);
     if (active)
     {
@@ -3634,6 +3767,7 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
 void BigPictureWindow::DrawDialog(QPainter& painter, const QString& title,
                                   const std::vector<std::pair<QString, QString>>& hints)
 {
+  m_hits.clear();
   const qreal k = height() / 1080.0;
   const qreal e = EaseOut(m_overlay_t);
   QColor shade(9, 7, 20);
@@ -3672,6 +3806,7 @@ void BigPictureWindow::DrawDialog(QPainter& painter, const QString& title,
 
 void BigPictureWindow::DrawPause(QPainter& painter)
 {
+  m_hits.clear();  // the menu covers the screen under it
   const qreal k = height() / 1080.0;
   const qreal e = EaseOut(m_overlay_t);
 
@@ -3753,6 +3888,10 @@ void BigPictureWindow::DrawPause(QPainter& painter)
     const qreal ie = EaseOut((m_overlay_t - i * 0.05) / 0.7);
     const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 74 * k);
     const bool active = i == m_pause_index;
+    AddHit(r, [this, i] {
+      m_pause_index = i;
+      HandleAction(Action::Accept);
+    });
     painter.setOpacity(e * ie);
     if (active)
     {
@@ -3799,6 +3938,11 @@ void BigPictureWindow::DrawPause(QPainter& painter)
     const qreal ce = EaseOut((m_overlay_t - 0.1 - s * 0.03) / 0.6);
     const QRectF r(sx + col * (cw + gap), 150 * k + row * (ch + gap) + (1 - ce) * 20 * k, cw, ch);
     const bool current = s == m_slot;
+    AddHit(r, [this, s] {
+      if (m_slot != s)
+        m_audio->Play(Sound::Move);
+      m_slot = s;
+    });
     painter.setOpacity(e * ce);
     painter.setPen(Qt::NoPen);
     painter.setBrush(QColor(23, 20, 43, 235));
@@ -5050,6 +5194,8 @@ void BigPictureWindow::PollDevices()
 {
   if (!m_active)
     return;
+  if (m_mode != Mode::InGame)
+    BigPictureTriggers::Update(false);
 #ifdef _WIN32
   // Bluetooth of the Switch 2 controllers: show connections and failures.
   {
@@ -6742,4 +6888,90 @@ void BigPictureWindow::OnPrepareForSleep(bool start)
     TakeSleepInhibitor();
     OnSystemResume();
   }
+}
+
+// ================================================================== mouse
+
+void BigPictureWindow::AddHit(const QRectF& rect, std::function<void()> click)
+{
+  m_hits.push_back({rect, [click = std::move(click)](QPointF) { click(); }});
+}
+
+void BigPictureWindow::AddHitAt(const QRectF& rect, std::function<void(QPointF)> click)
+{
+  m_hits.push_back({rect, std::move(click)});
+}
+
+void BigPictureWindow::ClickEntry(int index)
+{
+  if (m_mode != Mode::Library || index < 0 || index >= static_cast<int>(m_entries.size()))
+    return;
+  m_hero_focus = false;
+  if (index == m_selected)
+    HandleAction(Action::Accept);
+  else
+    SetSelected(index);
+}
+
+void BigPictureWindow::mouseMoveEvent(QMouseEvent* event)
+{
+  QWidget::mouseMoveEvent(event);
+  if (m_mode == Mode::InGame || m_mode == Mode::Launching)
+    return;  // never over a game
+  if (cursor().shape() != Qt::ArrowCursor)
+    setCursor(Qt::ArrowCursor);
+  m_cursor_timer->start();
+}
+
+void BigPictureWindow::mousePressEvent(QMouseEvent* event)
+{
+  if (m_mode == Mode::InGame || m_mode == Mode::Launching || m_mode == Mode::Intro)
+    return;
+  setCursor(Qt::ArrowCursor);
+  m_cursor_timer->start();
+  if (event->button() == Qt::RightButton || event->button() == Qt::BackButton)
+  {
+    // Like Esc (and B): back, cancel, leave a tester
+    QKeyEvent esc(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+    keyPressEvent(&esc);
+    return;
+  }
+  if (event->button() == Qt::MiddleButton)
+  {
+    HandleAction(Action::Menu);
+    return;
+  }
+  if (event->button() != Qt::LeftButton)
+    return;
+  const QPointF pos = event->position();
+  for (auto it = m_hits.rbegin(); it != m_hits.rend(); ++it)
+  {
+    if (it->rect.contains(pos))
+    {
+      const auto click = it->click;  // the list may be rebuilt by the click
+      click(pos);
+      update();
+      return;
+    }
+  }
+}
+
+void BigPictureWindow::wheelEvent(QWheelEvent* event)
+{
+  if (m_mode == Mode::InGame || m_mode == Mode::Launching)
+    return;
+  const QPoint d = event->angleDelta();
+  const int delta = std::abs(d.y()) >= std::abs(d.x()) ? d.y() : -d.x();
+  m_wheel_accum += delta;
+  // The covers shelf scrolls sideways; everything else up and down
+  const bool sideways = m_mode == Mode::Library && m_tab != Tab::Settings &&
+                        m_view != Prefs::View::List && !m_settings_in_items;
+  while (std::abs(m_wheel_accum) >= 120)
+  {
+    const bool back = m_wheel_accum > 0;
+    m_wheel_accum += back ? -120 : 120;
+    HandleAction(sideways ? (back ? Action::Left : Action::Right) :
+                            (back ? Action::Up : Action::Down));
+  }
+  event->accept();
 }

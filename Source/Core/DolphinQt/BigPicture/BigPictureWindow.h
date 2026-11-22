@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <functional>
 #include <vector>
 
 #include <QColor>
@@ -108,6 +109,9 @@ private slots:
 protected:
   void paintEvent(QPaintEvent* event) override;
   void keyPressEvent(QKeyEvent* event) override;
+  void mouseMoveEvent(QMouseEvent* event) override;
+  void mousePressEvent(QMouseEvent* event) override;
+  void wheelEvent(QWheelEvent* event) override;
 
 private:
   enum class Action
@@ -516,6 +520,18 @@ private:
   int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
   void TakeSleepInhibitor();
   void QuitGame();
+  // Mouse: clickable areas, rebuilt with each frame
+  struct Hit
+  {
+    QRectF rect;
+    std::function<void(QPointF)> click;
+  };
+  std::vector<Hit> m_hits;
+  void AddHit(const QRectF& rect, std::function<void()> click);
+  void AddHitAt(const QRectF& rect, std::function<void(QPointF)> click);
+  void ClickEntry(int index);
+  QTimer* m_cursor_timer = nullptr;
+  int m_wheel_accum = 0;
   void DrawDpadDot(QPainter& painter, QPointF p, qreal r);
   QHash<QString, bool> m_hd_known;
 

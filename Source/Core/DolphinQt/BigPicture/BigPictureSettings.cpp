@@ -312,6 +312,13 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
         {Tr("Automatique"), Tr("Guide / Home"), Tr("Select (View)"), Tr("Les deux sticks (L3 + R3)"),
          Tr("START + Z")},
         0, {}));
+    c.items.push_back(PrefChoice(
+        Tr("Gâchettes adaptatives (DualSense)"),
+        Tr("Les gâchettes de la DualSense s'enfoncent librement puis font un clic au bout, "
+           "comme L et R de la manette GameCube. En jeu seulement. Sur Bazzite, désactive "
+           "Steam Input pour cette manette."),
+        QStringLiteral("bigpicture/adaptive_triggers"),
+        {Tr("Désactivées"), Tr("Clic GameCube"), Tr("Clic GameCube ferme")}, 1, {}));
     c.items.push_back(PrefChoice(Tr("Icônes des boutons"),
                                  Tr("Les boutons affichés en bas de l'écran."),
                                  QStringLiteral("bigpicture/icons"),
