@@ -5836,8 +5836,8 @@ void BigPictureWindow::OpenWiiSaves()
     const QDir dir(root + hi);
     for (const QString& lo : dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot))
     {
-      const QString data = dir.filePath(lo) + QStringLiteral("/data");
-      if (!QFileInfo::exists(data + QStringLiteral("/banner.bin")))
+      const QString save_dir = dir.filePath(lo) + QStringLiteral("/data");
+      if (!QFileInfo::exists(save_dir + QStringLiteral("/banner.bin")))
         continue;
       bool ok1 = false, ok2 = false;
       const u64 tid = (u64(hi.toUInt(&ok1, 16)) << 32) | lo.toUInt(&ok2, 16);
@@ -5848,7 +5848,7 @@ void BigPictureWindow::OpenWiiSaves()
         continue;
       WiiSaveEntry e;
       e.title_id = tid;
-      e.path = data;
+      e.path = save_dir;
       e.name = QString::fromStdString(banner.GetName()).trimmed();
       e.description = QString::fromStdString(banner.GetDescription()).trimmed();
       u32 w = 0, h = 0;
@@ -5859,7 +5859,7 @@ void BigPictureWindow::OpenWiiSaves()
                          QImage::Format_ARGB32);
         e.banner = QPixmap::fromImage(img.copy());
       }
-      QDirIterator it(data, QDir::Files, QDirIterator::Subdirectories);
+      QDirIterator it(save_dir, QDir::Files, QDirIterator::Subdirectories);
       while (it.hasNext())
       {
         it.next();
