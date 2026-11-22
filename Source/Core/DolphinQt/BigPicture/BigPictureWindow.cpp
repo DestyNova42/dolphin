@@ -105,6 +105,14 @@
 #include "InputCommon/InputConfig.h"
 #include "UICommon/GameFile.h"
 
+// Some Wii headers bring in Windows.h: drop the macros that clash with our names
+#ifdef _WIN32
+#undef TEXT
+#undef DrawText
+#undef DrawIcon
+#undef DrawState
+#endif
+
 using Sound = BigPictureAudio::Sound;
 namespace Prefs = BigPicturePrefs;
 

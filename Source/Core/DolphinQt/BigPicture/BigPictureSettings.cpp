@@ -25,6 +25,7 @@
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
 #include "Common/Config/Layer.h"
+#include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
 #include "Common/IniFile.h"
 #include "Core/ActionReplay.h"
@@ -317,7 +318,7 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
         QStringList list{QString()};
         const QString home = QDir::homePath();
         const QString onedrive = qEnvironmentVariable("OneDrive");
-        for (const QString& d : {onedrive, home + QStringLiteral("/OneDrive"),
+        for (const QString& d : QStringList{onedrive, home + QStringLiteral("/OneDrive"),
                                  home + QStringLiteral("/Sync"), home + QStringLiteral("/Nextcloud"),
                                  home + QStringLiteral("/Dropbox")})
         {
