@@ -152,7 +152,7 @@ ControllerEmu::EmulatedController* BigPictureController(int port, int code);
 ControllerEmu::ControlGroup* BigPictureGroup(int port, int code);
 int BigPictureWiiExtension(int port);  // 0 none, 1 Nunchuk, 2 Classic Controller
 // Wii Remote (+ Nunchuk) or Classic Controller on the controller of the same player.
-bool ApplyWiiProfile(int port, int extension);
+bool ApplyWiiProfile(int port, int extension, bool sideways = false);
 std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPictureSettingsHost& host);
 
 // Per game: HD textures and controller profile.

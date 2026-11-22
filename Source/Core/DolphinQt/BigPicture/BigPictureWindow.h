@@ -79,6 +79,9 @@ public:
   void OnSystemSuspend();
   void OnSystemResume();
 
+  // Esc / the "Stop" hotkey during a game: quit with a resume point. False if not in a game.
+  bool QuitFromHotkey();
+
 signals:
   void LaunchRequested(const QString& path, const QString& savestate);
   void ClassicRequested();
@@ -493,6 +496,7 @@ private:
   bool m_slept_in_game = false;
   int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
   void TakeSleepInhibitor();
+  void QuitGame();
   QHash<QString, bool> m_hd_known;
 
   // USB driver

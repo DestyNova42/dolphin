@@ -29,6 +29,7 @@
 #include <QFont>
 #include <QFontDatabase>
 #include <QFontMetrics>
+#include <QHash>
 #include <QImage>
 #include <QKeyEvent>
 #ifdef HAVE_BIGPICTURE_DBUS
@@ -986,28 +987,43 @@ void BigPictureWindow::PollInGame()
   if (Core::GetState(system) != Core::State::Running)
     return;
 
-  bool home = false;
-  if (auto* pad = PadController(0))
+  // Which button opens our menu (SteamOS keeps Guide for its own menu)
+  int choice = Settings::GetQSettings().value(QStringLiteral("bigpicture/menu_button"), 0).toInt();
+  std::shared_ptr<ciface::Core::Device> device;
   {
-    if (const auto device = g_controller_interface.FindDevice(pad->GetDefaultDevice()))
-    {
-      for (const char* name : {"Guide", "Home"})
-      {
-        if (const auto* input = device->FindInput(name))
-          home |= input->GetState() > 0.5;
-      }
-    }
+    ControllerEmu::EmulatedController* ctrl =
+        system.IsWii() ? Wiimote::GetConfig()->GetController(0) : PadController(0);
+    if (ctrl)
+      device = g_controller_interface.FindDevice(ctrl->GetDefaultDevice());
   }
+  const auto down = [&device](const char* name) {
+    if (!device)
+      return false;
+    const auto* input = device->FindInput(name);
+    return input && input->GetState() > 0.5;
+  };
+  bool held_button = false;  // a button that games also use: hold it in Wii games
+  if (choice == 0 || choice == 1)
+    held_button |= down("Guide") || down("Home");
+#ifndef _WIN32
+  if (choice == 0)
+    held_button |= down("Back");
+#endif
+  if (choice == 2)
+    held_button |= down("Back");
+  if (choice == 3)
+    held_button |= down("Thumb L") && down("Thumb R");
   const GCPadStatus status = Pad::GetStatus(0);
-  const bool combo = (status.button & PAD_BUTTON_START) && (status.button & PAD_TRIGGER_Z);
+  const bool combo = (choice == 0 || choice == 4) && (status.button & PAD_BUTTON_START) &&
+                     (status.button & PAD_TRIGGER_Z);
 
   if (system.IsWii())
   {
     // The Wii has its own HOME menu: a short press goes to the game, hold to open ours.
     const qint64 now = m_clock.elapsed();
-    if (home && m_home_down_since < 0)
+    if (held_button && m_home_down_since < 0)
       m_home_down_since = now;
-    if (!home)
+    if (!held_button)
       m_home_down_since = -1;
     const bool held = m_home_down_since >= 0 && now - m_home_down_since > 700;
     if ((held || combo) && !m_home_was_down)
@@ -1019,10 +1035,35 @@ void BigPictureWindow::PollInGame()
     m_home_was_down = held || combo;
     return;
   }
-  home |= combo;
-  if (home && !m_home_was_down)
+  const bool open = held_button || combo;
+  if (open && !m_home_was_down)
     OpenPause();
-  m_home_was_down = home;
+  m_home_was_down = open;
+}
+
+bool BigPictureWindow::QuitFromHotkey()
+{
+  if (!m_active || m_mode != Mode::InGame ||
+      Core::IsUninitialized(Core::System::GetInstance()))
+    return false;
+  // Same path as "Quitter le jeu": a picture and a resume point first, then the fade out.
+  OpenPause();
+  QTimer::singleShot(450, this, [this] {
+    if (m_mode == Mode::Pause)
+      QuitGame();
+  });
+  return true;
+}
+
+void BigPictureWindow::QuitGame()
+{
+  m_audio->Play(Sound::Back);
+  SaveResume();
+  Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
+  // Fade to black over the paused game, then stop: the menu comes back from black.
+  m_mode = Mode::Closing;
+  m_close_t = 0;
+  m_stop_sent = false;
 }
 
 void BigPictureWindow::keyPressEvent(QKeyEvent* event)
@@ -1739,13 +1780,7 @@ void BigPictureWindow::HandlePause(Action action)
       Toast(tr("Capture d'écran enregistrée"));
       break;
     case PAUSE_QUIT:
-      m_audio->Play(Sound::Back);
-      SaveResume();
-      Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
-      // Fade to black over the paused game, then stop: the menu comes back from black.
-      m_mode = Mode::Closing;
-      m_close_t = 0;
-      m_stop_sent = false;
+      QuitGame();
       break;
     case PAUSE_QUICK:
       m_audio->Play(Sound::Confirm);
@@ -2044,10 +2079,35 @@ void BigPictureWindow::DrawHints(QPainter& painter,
   const qreal icon = 38 * k;
   const qreal y = height() - 44 * k - icon / 2;
 
+  // Icon style: GameCube or the Wii Classic Controller
+  const bool wii_icons =
+      Settings::GetQSettings().value(QStringLiteral("bigpicture/icons"), 0).toInt() == 1;
+  const auto icon_name = [wii_icons](const QString& name) -> QString {
+    if (!wii_icons)
+      return name;
+    static const QHash<QString, QString> map = {
+        {QStringLiteral("A"), QStringLiteral("WCC-A")},
+        {QStringLiteral("B"), QStringLiteral("WCC-B")},
+        {QStringLiteral("X"), QStringLiteral("WCC-X")},
+        {QStringLiteral("Y"), QStringLiteral("WCC-Y")},
+        {QStringLiteral("L"), QStringLiteral("WCC-L")},
+        {QStringLiteral("R"), QStringLiteral("WCC-R")},
+        {QStringLiteral("Z"), QStringLiteral("WCC-ZR")},
+        {QStringLiteral("Start-Pause"), QStringLiteral("Wii-Plus")},
+    };
+    if (const auto it = map.constFind(name); it != map.constEnd())
+      return it.value();
+    if (name.startsWith(QStringLiteral("Control_Stick")) || name.startsWith(QStringLiteral("C-Stick")))
+      return QStringLiteral("Wii-Control_Stick");
+    if (name.startsWith(QStringLiteral("D-Pad")))
+      return QStringLiteral("Wii-D-Pad");
+    return name;
+  };
+
   qreal x = 80 * k;
   for (const auto& [btn, label] : left)
   {
-    DrawIcon(painter, btn, QRectF(x, y - icon / 2, icon, icon));
+    DrawIcon(painter, icon_name(btn), QRectF(x, y - icon / 2, icon, icon));
     x += icon + 12 * k;
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x, y - icon / 2, 600 * k, icon), Qt::AlignVCenter, label);
@@ -2061,7 +2121,7 @@ void BigPictureWindow::DrawHints(QPainter& painter,
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x - tw, y - icon / 2, tw + 2, icon), Qt::AlignVCenter, it->second);
     x -= tw + 10 * k + icon;
-    DrawIcon(painter, it->first, QRectF(x, y - icon / 2, icon, icon));
+    DrawIcon(painter, icon_name(it->first), QRectF(x, y - icon / 2, icon, icon));
     x -= 36 * k;
   }
 }
@@ -6100,9 +6160,14 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
                                         0, 1) :
                0.0;
   };
+  // Scaled to the stick's gate: full tilt touches the octagon (the Wii sticks stop at ~76 %)
   const auto stick_state = [port](int code) {
-    return static_cast<ControllerEmu::ReshapableInput*>(BigPictureGroup(port, code))
-        ->GetReshapableState(true);
+    auto* input = static_cast<ControllerEmu::ReshapableInput*>(BigPictureGroup(port, code));
+    auto st = input->GetReshapableState(true);
+    const ControlState gate = std::max<ControlState>(0.1, input->GetGateRadiusAtAngle(0));
+    st.x /= gate;
+    st.y /= gate;
+    return st;
   };
 
   QFont label = Font(false, int(18 * k), 600);
@@ -6146,12 +6211,27 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     DrawIcon(painter, icon, QRectF(c.x() - r - 56 * k, c.y() + r - 44 * k, 44 * k, 44 * k));
   };
   const auto dpad_icon = [&](QPointF c, qreal size, int code) {
+    // Up, Down, Left, Right
+    const qreal dx = (pressed(code, 3) ? 1 : 0) - (pressed(code, 2) ? 1 : 0);
+    const qreal dy = (pressed(code, 1) ? 1 : 0) - (pressed(code, 0) ? 1 : 0);
     const bool any = pressed(code, 0) || pressed(code, 1) || pressed(code, 2) || pressed(code, 3);
     painter.setPen(Qt::NoPen);
     painter.setBrush(any ? ACCENT : SURFACE_DEEP);
     painter.drawEllipse(c, size * 0.62, size * 0.62);
     DrawIcon(painter, QStringLiteral("Wii-D-Pad"),
              QRectF(c.x() - size / 2, c.y() - size / 2, size, size));
+    if (dx != 0 || dy != 0)
+    {
+      // A glowing dot on the pressed arm(s), like the GameCube D-pad icons
+      const QPointF p(c.x() + dx * size * 0.33, c.y() + dy * size * 0.33);
+      QRadialGradient glow(p, size * 0.2);
+      glow.setColorAt(0, QColor(255, 255, 255, 220));
+      glow.setColorAt(1, QColor(255, 255, 255, 0));
+      painter.setBrush(glow);
+      painter.drawEllipse(p, size * 0.2, size * 0.2);
+      painter.setBrush(ACCENT_SOFT);
+      painter.drawEllipse(p, size * 0.08, size * 0.08);
+    }
   };
 
   const QRectF panel(width() / 2.0 - 780 * k, 220 * k, 1560 * k, 660 * k);

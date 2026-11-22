@@ -303,6 +303,18 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  QStringLiteral("bigpicture/preset"),
                                  {Tr("Désactivé"), Tr("Automatique"), Tr("Portable"), Tr("TV")}, 0,
                                  changed));
+    c.items.push_back(PrefChoice(
+        Tr("Bouton du menu en jeu"),
+        Tr("Sur SteamOS / Bazzite, le bouton Guide ouvre le menu Steam : choisis Select (View), "
+           "les deux sticks enfoncés ou START + Z. Dans les jeux Wii, maintiens-le un instant."),
+        QStringLiteral("bigpicture/menu_button"),
+        {Tr("Automatique"), Tr("Guide / Home"), Tr("Select (View)"), Tr("Les deux sticks (L3 + R3)"),
+         Tr("START + Z")},
+        0, {}));
+    c.items.push_back(PrefChoice(Tr("Icônes des boutons"),
+                                 Tr("Les boutons affichés en bas de l'écran."),
+                                 QStringLiteral("bigpicture/icons"),
+                                 {Tr("GameCube"), Tr("Wii (manette classique)")}, 0, {}));
     c.items.push_back(PrefToggle(Tr("Mise en veille propre"),
                                  Tr("Avant la veille du PC ou de la console, le jeu est mis en "
                                     "pause et sauvegardé ; au réveil, le menu pause s'ouvre."),
@@ -1650,7 +1662,7 @@ constexpr int CG(WiimoteEmu::ClassicGroup g)
 }
 }  // namespace
 
-bool ApplyWiiProfile(int port, int extension)
+bool ApplyWiiProfile(int port, int extension, bool sideways)
 {
   using WGr = WiimoteEmu::WiimoteGroup;
   using NGr = WiimoteEmu::NunchukGroup;
@@ -1688,8 +1700,14 @@ bool ApplyWiiProfile(int port, int extension)
     set(code, 2, left);
     set(code, 3, right);
   };
+  if (sideways)
+    extension = 0;
   const int dpad = extension == 2 ? CG(CGr::DPad) : WG(WGr::DPad);
-  stick(dpad, "`Pad N`", "`Pad S`", "`Pad W`", "`Pad E`");
+  if (sideways)  // the D-pad is the "stick" of a sideways Wii Remote
+    stick(dpad, "`Pad N` | `Left Y+`", "`Pad S` | `Left Y-`", "`Pad W` | `Left X-`",
+          "`Pad E` | `Left X+`");
+  else
+    stick(dpad, "`Pad N`", "`Pad S`", "`Pad W`", "`Pad E`");
   set(WG(WGr::Rumble), 0, xinput ? "`Motor L`" : "`Motor`");
 
   if (extension == 2)
@@ -1728,6 +1746,21 @@ bool ApplyWiiProfile(int port, int extension)
     set(b, 8, "`Guide`");
     stick(CG(CGr::LeftStick), "`Left Y+`", "`Left Y-`", "`Left X-`", "`Left X+`");
     stick(CG(CGr::RightStick), "`Right Y+`", "`Right Y-`", "`Right X-`", "`Right X+`");
+  }
+  else if (sideways)
+  {
+    // Wii Remote held sideways: 2 and 1 are the main buttons, tilt on the right stick
+    const int b = WG(WGr::Buttons);
+    set(b, 3, gcpad ? "`Button S`" : "`Button A`");  // 2
+    set(b, 2, gcpad ? "`Button W`" : "`Button B`");  // 1
+    set(b, 0, gcpad ? "`Button E`" : "`Button X`");  // A
+    set(b, 1, gcpad ? "`Button N`" : "`Button Y`");  // B
+    set(b, 4, gcpad ? "`Shoulder L`" : "`Back`");    // -
+    set(b, 5, "`Start`");
+    set(b, 6, "`Guide`");
+    for (int i = 0; i < 3; ++i)
+      set(WG(WGr::Shake), i, "`Shoulder R`");
+    stick(WG(WGr::Tilt), "`Right Y+`", "`Right Y-`", "`Right X-`", "`Right X+`");
   }
   else
   {
@@ -1768,6 +1801,11 @@ bool ApplyWiiProfile(int port, int extension)
 
   static_cast<ControllerEmu::Attachments*>(BigPictureGroup(port, WG(WGr::Attachments)))
       ->SetSelectedAttachment(static_cast<u32>(extension));
+  for (auto& setting : BigPictureGroup(port, WG(WGr::Options))->numeric_settings)
+  {
+    if (std::string_view(setting->GetININame()) == WiimoteEmu::Wiimote::SIDEWAYS_OPTION)
+      static_cast<ControllerEmu::NumericSetting<bool>*>(setting.get())->SetValue(sideways);
+  }
   wm->UpdateReferences(g_controller_interface);
   Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::Emulated);
   Wiimote::GetConfig()->SaveConfig();
@@ -1852,6 +1890,19 @@ std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPi
                                const bool ok = ApplyWiiProfile(*port, ext);
                                if (notify)
                                  notify(ok ? Tr("Wiimote réglée") :
+                                             Tr("Configure d'abord la manette de ce joueur"));
+                             }));
+  }
+  {
+    const auto notify = host.notify;
+    c.items.push_back(Action(Tr("Réglage automatique : Wiimote à l'horizontale"),
+                             Tr("Pour les jeux qui se jouent Wiimote couchée (Mario Kart, New "
+                                "Super Mario Bros.…) : croix au stick gauche et à la croix, 2 et 1 "
+                                "sur A et B, inclinaison au stick droit, secouer avec R."),
+                             [port, notify] {
+                               const bool ok = ApplyWiiProfile(*port, 0, true);
+                               if (notify)
+                                 notify(ok ? Tr("Wiimote réglée à l'horizontale") :
                                              Tr("Configure d'abord la manette de ce joueur"));
                              }));
   }
