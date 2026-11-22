@@ -230,43 +230,114 @@ QPainterPath CubePath(qreal s)
   return p;
 }
 
-struct SetupStep
+// Group codes as in BigPictureGroup(): GameCube groups as is, then 100 + Wii Remote group,
+// 200 + Nunchuk group, 300 + Classic Controller group.
+constexpr int SW(WiimoteEmu::WiimoteGroup g)
 {
-  PadGroup group;
-  int index;
-  const char* prompt;
-  const char* help;
-  const char* icon;
-  int mirror_index;  // opposite direction for sticks, digital twin for triggers (-1 = none)
-  bool flip;         // mirror by flipping the axis sign
-};
+  return 100 + static_cast<int>(g);
+}
+constexpr int SN(WiimoteEmu::NunchukGroup g)
+{
+  return 200 + static_cast<int>(g);
+}
+constexpr int SC(WiimoteEmu::ClassicGroup g)
+{
+  return 300 + static_cast<int>(g);
+}
+
+using SetupStep = BigPictureWindow::WizardStep;
 
 constexpr SetupStep SETUP_STEPS[] = {
-    {PadGroup::Buttons, 0, "Appuie sur A", "Le gros bouton vert.", "A", -1, false},
-    {PadGroup::Buttons, 1, "Appuie sur B", "Le petit bouton rouge, en bas à gauche de A.", "B", -1,
+    {int(PadGroup::Buttons), 0, "Appuie sur A", "Le gros bouton vert.", "A", -1, false},
+    {int(PadGroup::Buttons), 1, "Appuie sur B", "Le petit bouton rouge, en bas à gauche de A.", "B", -1,
      false},
-    {PadGroup::Buttons, 2, "Appuie sur X", "Le bouton à droite de A.", "X", -1, false},
-    {PadGroup::Buttons, 3, "Appuie sur Y", "Le bouton au-dessus de A.", "Y", -1, false},
-    {PadGroup::Buttons, 4, "Appuie sur Z", "Le bouton violet au-dessus de la gâchette R.", "Z",
+    {int(PadGroup::Buttons), 2, "Appuie sur X", "Le bouton à droite de A.", "X", -1, false},
+    {int(PadGroup::Buttons), 3, "Appuie sur Y", "Le bouton au-dessus de A.", "Y", -1, false},
+    {int(PadGroup::Buttons), 4, "Appuie sur Z", "Le bouton violet au-dessus de la gâchette R.", "Z",
      -1, false},
-    {PadGroup::Buttons, 5, "Appuie sur START", "Le bouton au centre de la manette.",
+    {int(PadGroup::Buttons), 5, "Appuie sur START", "Le bouton au centre de la manette.",
      "Start-Pause", -1, false},
-    {PadGroup::MainStick, 0, "Stick principal vers le haut", "Pousse-le à fond puis relâche.",
+    {int(PadGroup::MainStick), 0, "Stick principal vers le haut", "Pousse-le à fond puis relâche.",
      "Control_Stick-U", 1, true},
-    {PadGroup::MainStick, 3, "Stick principal vers la droite", "Pousse-le à fond puis relâche.",
+    {int(PadGroup::MainStick), 3, "Stick principal vers la droite", "Pousse-le à fond puis relâche.",
      "Control_Stick-R", 2, true},
-    {PadGroup::CStick, 0, "Stick C vers le haut", "Le petit stick jaune.", "C-Stick-U", 1, true},
-    {PadGroup::CStick, 3, "Stick C vers la droite", "Le petit stick jaune.", "C-Stick-R", 2, true},
-    {PadGroup::Triggers, 2, "Enfonce L à fond", "Jusqu'au clic.", "L", 0, false},
-    {PadGroup::Triggers, 3, "Enfonce R à fond", "Jusqu'au clic.", "R", 1, false},
-    {PadGroup::DPad, 0, "Croix : haut", "La croix directionnelle, sous le stick.", "D-Pad-U", -1,
+    {int(PadGroup::CStick), 0, "Stick C vers le haut", "Le petit stick jaune.", "C-Stick-U", 1, true},
+    {int(PadGroup::CStick), 3, "Stick C vers la droite", "Le petit stick jaune.", "C-Stick-R", 2, true},
+    {int(PadGroup::Triggers), 2, "Enfonce L à fond", "Jusqu'au clic.", "L", 0, false},
+    {int(PadGroup::Triggers), 3, "Enfonce R à fond", "Jusqu'au clic.", "R", 1, false},
+    {int(PadGroup::DPad), 0, "Croix : haut", "La croix directionnelle, sous le stick.", "D-Pad-U", -1,
      false},
-    {PadGroup::DPad, 1, "Croix : bas", "La croix directionnelle, sous le stick.", "D-Pad-D", -1,
+    {int(PadGroup::DPad), 1, "Croix : bas", "La croix directionnelle, sous le stick.", "D-Pad-D", -1,
      false},
-    {PadGroup::DPad, 2, "Croix : gauche", "La croix directionnelle, sous le stick.", "D-Pad-L",
+    {int(PadGroup::DPad), 2, "Croix : gauche", "La croix directionnelle, sous le stick.", "D-Pad-L",
      -1, false},
-    {PadGroup::DPad, 3, "Croix : droite", "La croix directionnelle, sous le stick.", "D-Pad-R",
+    {int(PadGroup::DPad), 3, "Croix : droite", "La croix directionnelle, sous le stick.", "D-Pad-R",
      -1, false},
+};
+
+using WGrp = WiimoteEmu::WiimoteGroup;
+using NGrp = WiimoteEmu::NunchukGroup;
+using CGrp = WiimoteEmu::ClassicGroup;
+
+constexpr SetupStep WIIMOTE_STEPS[] = {
+    {SW(WGrp::Buttons), 0, "Appuie sur A", "Le gros bouton rond de la Wiimote.", "Wii-A", -1, false},
+    {SW(WGrp::Buttons), 1, "Appuie sur B", "La gâchette sous la Wiimote.", "Wii-B", -1, false},
+    {SW(WGrp::Buttons), 2, "Appuie sur 1", "En bas de la Wiimote.", "Wii-1", -1, false},
+    {SW(WGrp::Buttons), 3, "Appuie sur 2", "Tout en bas de la Wiimote.", "Wii-2", -1, false},
+    {SW(WGrp::Buttons), 4, "Appuie sur −", "À gauche du bouton HOME.", "Wii-Minus", -1, false},
+    {SW(WGrp::Buttons), 5, "Appuie sur +", "À droite du bouton HOME.", "Wii-Plus", -1, false},
+    {SW(WGrp::Buttons), 6, "Appuie sur HOME", "Au centre de la Wiimote.", "Wii-Home", -1, false},
+    {SW(WGrp::DPad), 0, "Croix : haut", "La croix en haut de la Wiimote.", "Wii-D-Pad-U", -1, false},
+    {SW(WGrp::DPad), 1, "Croix : bas", "La croix en haut de la Wiimote.", "Wii-D-Pad-D", -1, false},
+    {SW(WGrp::DPad), 2, "Croix : gauche", "La croix en haut de la Wiimote.", "Wii-D-Pad-L", -1,
+     false},
+    {SW(WGrp::DPad), 3, "Croix : droite", "La croix en haut de la Wiimote.", "Wii-D-Pad-R", -1,
+     false},
+    {SW(WGrp::Point), 0, "Pointeur vers le haut", "Le stick qui vise l'écran, à fond puis relâche.",
+     "Wii-Control_Stick-U", 1, true},
+    {SW(WGrp::Point), 3, "Pointeur vers la droite", "Le même stick, vers la droite.",
+     "Wii-Control_Stick-R", 2, true},
+    {SW(WGrp::Shake), 0, "Secouer la Wiimote", "Le bouton qui fera le geste de secouer.",
+     "", 1, false, 2},
+};
+
+constexpr SetupStep NUNCHUK_STEPS[] = {
+    {SN(NGrp::Buttons), 0, "Appuie sur C", "Le petit bouton rond du Nunchuk.", "Wii-C", -1, false},
+    {SN(NGrp::Buttons), 1, "Appuie sur Z", "La grande gâchette du Nunchuk.", "Wii-Z", -1, false},
+    {SN(NGrp::Stick), 0, "Stick du Nunchuk vers le haut", "Pousse-le à fond puis relâche.",
+     "Wii-Control_Stick-U", 1, true},
+    {SN(NGrp::Stick), 3, "Stick du Nunchuk vers la droite", "Pousse-le à fond puis relâche.",
+     "Wii-Control_Stick-R", 2, true},
+};
+
+constexpr SetupStep CLASSIC_STEPS[] = {
+    {SC(CGrp::Buttons), 0, "Appuie sur a", "À droite des quatre boutons.", "WCC-A", -1, false},
+    {SC(CGrp::Buttons), 1, "Appuie sur b", "En bas des quatre boutons.", "WCC-B", -1, false},
+    {SC(CGrp::Buttons), 2, "Appuie sur x", "En haut des quatre boutons.", "WCC-X", -1, false},
+    {SC(CGrp::Buttons), 3, "Appuie sur y", "À gauche des quatre boutons.", "WCC-Y", -1, false},
+    {SC(CGrp::Triggers), 2, "Enfonce L à fond", "La gâchette de gauche.", "WCC-L", 0, false},
+    {SC(CGrp::Triggers), 3, "Enfonce R à fond", "La gâchette de droite.", "WCC-R", 1, false},
+    {SC(CGrp::Buttons), 4, "Appuie sur ZL", "Le bouton à côté de L.", "WCC-ZL", -1, false},
+    {SC(CGrp::Buttons), 5, "Appuie sur ZR", "Le bouton à côté de R.", "WCC-ZR", -1, false},
+    {SC(CGrp::Buttons), 6, "Appuie sur −", "Au centre, à gauche de HOME.", "Wii-Minus", -1, false},
+    {SC(CGrp::Buttons), 7, "Appuie sur +", "Au centre, à droite de HOME.", "Wii-Plus", -1, false},
+    {SC(CGrp::Buttons), 8, "Appuie sur HOME", "Au centre de la manette.", "Wii-Home", -1, false},
+    {SC(CGrp::LeftStick), 0, "Stick gauche vers le haut", "Pousse-le à fond puis relâche.",
+     "Wii-Control_Stick-U", 1, true},
+    {SC(CGrp::LeftStick), 3, "Stick gauche vers la droite", "Pousse-le à fond puis relâche.",
+     "Wii-Control_Stick-R", 2, true},
+    {SC(CGrp::RightStick), 0, "Stick droit vers le haut", "Pousse-le à fond puis relâche.",
+     "Wii-Control_Stick-U", 1, true},
+    {SC(CGrp::RightStick), 3, "Stick droit vers la droite", "Pousse-le à fond puis relâche.",
+     "Wii-Control_Stick-R", 2, true},
+    {SC(CGrp::DPad), 0, "Croix : haut", "La croix de la manette classique.", "Wii-D-Pad-U", -1,
+     false},
+    {SC(CGrp::DPad), 1, "Croix : bas", "La croix de la manette classique.", "Wii-D-Pad-D", -1,
+     false},
+    {SC(CGrp::DPad), 2, "Croix : gauche", "La croix de la manette classique.", "Wii-D-Pad-L", -1,
+     false},
+    {SC(CGrp::DPad), 3, "Croix : droite", "La croix de la manette classique.", "Wii-D-Pad-R", -1,
+     false},
 };
 constexpr int SETUP_STEP_COUNT = static_cast<int>(std::size(SETUP_STEPS));
 
@@ -436,6 +507,9 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
       BeginTransition(0);
       m_mode = Mode::PadTest;
     });
+  };
+  host.configure_wiimote = [this](int port) {
+    QTimer::singleShot(0, this, [this, port] { StartWiiSetup(port); });
   };
   host.check_updates = [this] { QTimer::singleShot(0, this, [this] { CheckUpdates(false); }); };
   host.test_wiimote = [this](int port) {
@@ -2065,7 +2139,71 @@ QFont BigPictureWindow::Font(bool display, int px, int weight) const
   return font;
 }
 
+namespace
+{
+// The Wii Classic Controller look for the GameCube icon names used by the menus
+QString WiiIconName(const QString& name)
+{
+  static const QHash<QString, QString> map = {
+      {QStringLiteral("A"), QStringLiteral("WCC-A")},
+      {QStringLiteral("B"), QStringLiteral("WCC-B")},
+      {QStringLiteral("X"), QStringLiteral("WCC-X")},
+      {QStringLiteral("Y"), QStringLiteral("WCC-Y")},
+      {QStringLiteral("L"), QStringLiteral("WCC-L")},
+      {QStringLiteral("R"), QStringLiteral("WCC-R")},
+      {QStringLiteral("Z"), QStringLiteral("WCC-ZR")},
+      {QStringLiteral("Start-Pause"), QStringLiteral("Wii-Plus")},
+  };
+  if (const auto it = map.constFind(name); it != map.constEnd())
+    return it.value();
+  if (name.startsWith(QStringLiteral("Control_Stick")) || name.startsWith(QStringLiteral("C-Stick")))
+    return QStringLiteral("Wii-Control_Stick");
+  if (name.startsWith(QStringLiteral("D-Pad")))
+    return QStringLiteral("Wii-D-Pad");
+  if (name.startsWith(QStringLiteral("L-")))
+    return QStringLiteral("WCC-L");
+  if (name.startsWith(QStringLiteral("R-")))
+    return QStringLiteral("WCC-R");
+  if (name.startsWith(QStringLiteral("Z-")))
+    return QStringLiteral("WCC-ZR");
+  return name;
+}
+}  // namespace
+
 void BigPictureWindow::DrawIcon(QPainter& painter, const QString& name, const QRectF& rect)
+{
+  // Icon style chosen in the settings (the testers and the remap keep the real buttons)
+  if (m_wii_icons && m_mode != Mode::PadTest && m_mode != Mode::WiiTest &&
+      m_mode != Mode::Remap && m_mode != Mode::Calibrate && m_mode != Mode::Setup)
+  {
+    const QString mapped = WiiIconName(name);
+    if (mapped != name)
+    {
+      DrawIconRaw(painter, mapped, rect);
+      // "D-Pad-UL", "Control_Stick-R"…: dots on the arms the GameCube icon would highlight
+      const qsizetype dash = name.lastIndexOf(QLatin1Char('-'));
+      const QString dir = dash > 0 ? name.mid(dash + 1) : QString();
+      if (!dir.isEmpty() && dir.size() <= 2 &&
+          !dir.contains(QRegularExpression(QStringLiteral("[^UDLR]"))) &&
+          (name.startsWith(QStringLiteral("D-Pad")) || name.contains(QStringLiteral("Stick"))))
+      {
+        const qreal side = std::min(rect.width(), rect.height());
+        for (const QChar ch : dir)
+        {
+          const QPointF v = ch == QLatin1Char('U') ? QPointF(0, -1) :
+                            ch == QLatin1Char('D') ? QPointF(0, 1) :
+                            ch == QLatin1Char('L') ? QPointF(-1, 0) :
+                                                     QPointF(1, 0);
+          DrawDpadDot(painter, rect.center() + v * (side * 0.33), side * 0.1);
+        }
+      }
+      return;
+    }
+  }
+  DrawIconRaw(painter, name, rect);
+}
+
+void BigPictureWindow::DrawIconRaw(QPainter& painter, const QString& name, const QRectF& rect)
 {
   const auto it = m_icons.constFind(name);
   if (it == m_icons.constEnd())
@@ -2088,55 +2226,10 @@ void BigPictureWindow::DrawHints(QPainter& painter,
   const qreal icon = 52 * k;
   const qreal y = height() - 38 * k - icon / 2;
 
-  // Icon style: GameCube or the Wii Classic Controller
-  const bool wii_icons =
-      Settings::GetQSettings().value(QStringLiteral("bigpicture/icons"), 0).toInt() == 1;
-  const auto icon_name = [wii_icons](const QString& name) -> QString {
-    if (!wii_icons)
-      return name;
-    static const QHash<QString, QString> map = {
-        {QStringLiteral("A"), QStringLiteral("WCC-A")},
-        {QStringLiteral("B"), QStringLiteral("WCC-B")},
-        {QStringLiteral("X"), QStringLiteral("WCC-X")},
-        {QStringLiteral("Y"), QStringLiteral("WCC-Y")},
-        {QStringLiteral("L"), QStringLiteral("WCC-L")},
-        {QStringLiteral("R"), QStringLiteral("WCC-R")},
-        {QStringLiteral("Z"), QStringLiteral("WCC-ZR")},
-        {QStringLiteral("Start-Pause"), QStringLiteral("Wii-Plus")},
-    };
-    if (const auto it = map.constFind(name); it != map.constEnd())
-      return it.value();
-    if (name.startsWith(QStringLiteral("Control_Stick")) || name.startsWith(QStringLiteral("C-Stick")))
-      return QStringLiteral("Wii-Control_Stick");
-    if (name.startsWith(QStringLiteral("D-Pad")))
-      return QStringLiteral("Wii-D-Pad");
-    return name;
-  };
-
-  const auto draw_icon = [&](const QString& name, const QRectF& r) {
-    const QString mapped = icon_name(name);
-    DrawIcon(painter, mapped, r);
-    if (mapped == name || !name.contains(QLatin1Char('-')))
-      return;
-    // "D-Pad-UL", "Control_Stick-R"…: dots on the arms the GameCube icon would highlight
-    const QString dir = name.section(QLatin1Char('-'), -1);
-    if (dir.isEmpty() || dir.size() > 2 || dir == QStringLiteral("Pad") ||
-        dir.contains(QRegularExpression(QStringLiteral("[^UDLR]"))))
-      return;
-    for (const QChar ch : dir)
-    {
-      const QPointF v = ch == QLatin1Char('U') ? QPointF(0, -1) :
-                        ch == QLatin1Char('D') ? QPointF(0, 1) :
-                        ch == QLatin1Char('L') ? QPointF(-1, 0) :
-                                                 QPointF(1, 0);
-      DrawDpadDot(painter, r.center() + v * (r.width() * 0.33), r.width() * 0.1);
-    }
-  };
-
   qreal x = 80 * k;
   for (const auto& [btn, label] : left)
   {
-    draw_icon(btn, QRectF(x, y - icon / 2, icon, icon));
+    DrawIcon(painter, btn, QRectF(x, y - icon / 2, icon, icon));
     x += icon + 12 * k;
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x, y - icon / 2, 600 * k, icon), Qt::AlignVCenter, label);
@@ -2150,7 +2243,7 @@ void BigPictureWindow::DrawHints(QPainter& painter,
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x - tw, y - icon / 2, tw + 2, icon), Qt::AlignVCenter, it->second);
     x -= tw + 10 * k + icon;
-    draw_icon(it->first, QRectF(x, y - icon / 2, icon, icon));
+    DrawIcon(painter, it->first, QRectF(x, y - icon / 2, icon, icon));
     x -= 36 * k;
   }
 }
@@ -2219,6 +2312,7 @@ void BigPictureWindow::DrawToast(QPainter& painter)
 
 void BigPictureWindow::paintEvent(QPaintEvent*)
 {
+  m_wii_icons = Settings::GetQSettings().value(QStringLiteral("bigpicture/icons"), 0).toInt() == 1;
   const qreal dpr = devicePixelRatioF();
   const QSize px_size = size() * dpr;
   if (m_frame.size() != px_size)
@@ -3170,37 +3264,44 @@ void BigPictureWindow::DrawList(QPainter& painter)
     painter.drawRoundedRect(QRectF(track_x, thumb_y, 6 * k, thumb_h), 3 * k, 3 * k);
   }
 
-  // ---- Right: details of the selected game
+  // ---- Right: details of the selected game (no cover: the list already shows the banners)
   const qreal px = left + list_w + 80 * k;
   const qreal pw = width() - px - 80 * k;
+  qreal y = top + 10 * k;
+  if (HasResume(*sel))
+  {
+    // The resume point, like the covers view
+    const QPixmap& shot = ResumeShot(*sel);
+    const qreal aspect = shot.isNull() ? 16.0 / 9.0 : qreal(shot.width()) / shot.height();
+    const qreal ch = std::min<qreal>(pw / aspect, 400 * k);
+    const QRectF card(px, y, ch * aspect, ch);
+    DrawResumeCard(painter, *sel, card);
+    y = card.bottom() + 30 * k;
+  }
+  else
+  {
+    // No resume point (or resume turned off): the game's banner, big
+    const qreal e = EaseOut(m_hero_t);
+    painter.save();
+    painter.setOpacity(e);
+    const QRectF br(px, y, pw, pw / 3);
+    QPainterPath bclip;
+    bclip.addRoundedRect(br, 18 * k, 18 * k);
+    painter.fillPath(bclip, RAISED);
+    const QPixmap banner = BannerFor(*sel, br.size().toSize());
+    if (!banner.isNull())
+    {
+      painter.setClipPath(bclip);
+      painter.drawPixmap(br, banner, QRectF(banner.rect()));
+    }
+    painter.restore();
+    y = br.bottom() + 30 * k;
+  }
+
   const qreal e = EaseOut(m_hero_t);
   painter.save();
   painter.setOpacity(e);
   painter.translate((1 - e) * 22 * k, 0);
-  const QSizeF cover_size(300 * k, 420 * k);
-  const QRectF cr(px, top + 10 * k, cover_size.width(), cover_size.height());
-  const QPixmap cover = CoverFor(*sel, cover_size.toSize());
-  QPainterPath cclip;
-  cclip.addRoundedRect(cr, 18 * k, 18 * k);
-  if (!cover.isNull())
-  {
-    painter.save();
-    painter.setClipPath(cclip, Qt::IntersectClip);
-    painter.drawPixmap(cr, cover, QRectF(cover.rect()));
-    painter.restore();
-  }
-  else
-  {
-    painter.fillPath(cclip, RAISED);
-    const QPixmap banner = BannerFor(*sel, QSize(int(cr.width() - 40 * k), int((cr.width() - 40 * k) / 3)));
-    if (!banner.isNull())
-      painter.drawPixmap(QPointF(cr.left() + 20 * k, cr.center().y() - banner.height() / banner.devicePixelRatioF() / 2), banner);
-  }
-  painter.restore();
-  // Title / info / buttons under the cover
-  painter.save();
-  painter.setOpacity(e);
-  qreal y = cr.bottom() + 30 * k;
   QFont tf = Font(true, int(36 * k), 700);
   painter.setFont(tf);
   painter.setPen(TEXT);
@@ -3210,11 +3311,31 @@ void BigPictureWindow::DrawList(QPainter& painter)
                            .boundingRect(tbox, Qt::TextWordWrap | Qt::AlignLeft, sel->title)
                            .height(),
                        96 * k) +
-       12 * k;
+       10 * k;
   painter.setFont(Font(false, int(19 * k), 400));
   painter.setPen(TEXT_SOFT);
-  painter.drawText(QRectF(px, y, pw, 60 * k), Qt::TextWordWrap | Qt::AlignLeft | Qt::AlignTop,
-                   PlayInfo(*sel));
+  painter.drawText(QRectF(px, y, pw, 30 * k), Qt::AlignLeft | Qt::AlignVCenter, PlayInfo(*sel));
+  y += 46 * k;
+
+  // The game's own short description, as on the console's menu
+  const QString maker = QString::fromStdString(sel->game->GetLongMaker()).trimmed();
+  const QString desc = QString::fromStdString(
+                           sel->game->GetDescription(UICommon::GameFile::Variant::LongAndNotCustom))
+                           .simplified();
+  if (!maker.isEmpty())
+  {
+    painter.setFont(Font(false, int(19 * k), 600));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(px, y, pw, 28 * k), Qt::AlignLeft | Qt::AlignVCenter, maker);
+    y += 34 * k;
+  }
+  if (!desc.isEmpty())
+  {
+    painter.setFont(Font(false, int(20 * k), 400));
+    painter.setPen(TEXT_SOFT);
+    const QRectF dbox(px, y, pw, std::max<qreal>(0, height() - 130 * k - y));
+    painter.drawText(dbox, Qt::TextWordWrap | Qt::AlignLeft | Qt::AlignTop, desc);
+  }
   painter.restore();
 
   if (m_mode == Mode::Library)
@@ -3733,14 +3854,18 @@ void BigPictureWindow::DrawPause(QPainter& painter)
 void BigPictureWindow::DrawSetup(QPainter& painter)
 {
   const qreal k = height() / 1080.0;
-  const SetupStep& step = SETUP_STEPS[std::min(m_setup_step, SETUP_STEP_COUNT - 1)];
+  if (m_setup_steps.empty())
+    return;
+  const int step_count = static_cast<int>(m_setup_steps.size());
+  const SetupStep& step = m_setup_steps[std::min(m_setup_step, step_count - 1)];
 
   QFont label_font = Font(false, int(18 * k), 600);
   label_font.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
   painter.setFont(label_font);
   painter.setPen(ACCENT_SOFT);
   painter.drawText(QRectF(0, 110 * k, width(), 30 * k), Qt::AlignCenter,
-                   tr("CONFIGURATION DE LA MANETTE — PORT %1").arg(m_setup_port + 1));
+                   m_setup_wii ? tr("CONFIGURATION DE LA WIIMOTE — JOUEUR %1").arg(m_setup_port + 1) :
+                                 tr("CONFIGURATION DE LA MANETTE — PORT %1").arg(m_setup_port + 1));
 
   painter.setFont(Font(false, int(22 * k), 400));
   painter.setPen(TEXT_SOFT);
@@ -3748,7 +3873,7 @@ void BigPictureWindow::DrawSetup(QPainter& painter)
   if (m_setup_device_chosen)
   {
     device_line = tr("Manette détectée : %1")
-                      .arg(QString::fromStdString(PadController(m_setup_port)->GetDefaultDevice().name));
+                      .arg(QString::fromStdString(SetupController()->GetDefaultDevice().name));
   }
   else
   {
@@ -3765,8 +3890,27 @@ void BigPictureWindow::DrawSetup(QPainter& painter)
   painter.setPen(Qt::NoPen);
   painter.setBrush(SURFACE);
   painter.drawEllipse(c, 150 * k, 150 * k);
-  DrawIcon(painter, QString::fromLatin1(step.icon),
-           QRectF(c.x() - 95 * k, c.y() - 95 * k, 190 * k, 190 * k));
+  {
+    // "Wii-D-Pad-U", "Wii-Control_Stick-R": the Wii icon with a dot on that direction
+    QString icon = QString::fromLatin1(step.icon);
+    QString dir;
+    if (icon.startsWith(QStringLiteral("Wii-D-Pad-")) ||
+        icon.startsWith(QStringLiteral("Wii-Control_Stick-")))
+    {
+      dir = icon.section(QLatin1Char('-'), -1);
+      icon.chop(dir.size() + 1);
+    }
+    const QRectF ir(c.x() - 95 * k, c.y() - 95 * k, 190 * k, 190 * k);
+    DrawIcon(painter, icon, ir);
+    if (!dir.isEmpty())
+    {
+      const QPointF v = dir == QStringLiteral("U") ? QPointF(0, -1) :
+                        dir == QStringLiteral("D") ? QPointF(0, 1) :
+                        dir == QStringLiteral("L") ? QPointF(-1, 0) :
+                                                     QPointF(1, 0);
+      DrawDpadDot(painter, ir.center() + v * (ir.width() * 0.33), ir.width() * 0.08);
+    }
+  }
 
   QFont prompt_font = Font(true, int(64 * k), 700);
   prompt_font.setLetterSpacing(QFont::AbsoluteSpacing, -1.5 * k);
@@ -3783,11 +3927,11 @@ void BigPictureWindow::DrawSetup(QPainter& painter)
   const qreal dot = 14 * k;
   const qreal wide = 40 * k;
   const qreal dgap = 10 * k;
-  const qreal total = (SETUP_STEP_COUNT - 1) * (dot + dgap) + wide;
+  const qreal total = (step_count - 1) * (dot + dgap) + wide;
   qreal x = (width() - total) / 2;
   const qreal dy = 830 * k;
   painter.setPen(Qt::NoPen);
-  for (int i = 0; i < SETUP_STEP_COUNT; ++i)
+  for (int i = 0; i < step_count; ++i)
   {
     const bool current = i == m_setup_step;
     painter.setBrush(i < m_setup_step ? ACCENT_SOFT : (current ? TEXT : LINE));
@@ -3798,9 +3942,9 @@ void BigPictureWindow::DrawSetup(QPainter& painter)
   painter.setFont(Font(false, int(20 * k), 400));
   painter.setPen(TEXT_DIM);
   painter.drawText(QRectF(0, dy + 30 * k, width(), 34 * k), Qt::AlignCenter,
-                   tr("Étape %1 sur %2").arg(m_setup_step + 1).arg(SETUP_STEP_COUNT));
+                   tr("Étape %1 sur %2").arg(m_setup_step + 1).arg(step_count));
 
-  if (!m_setup_device_chosen)
+  if (!m_setup_device_chosen && !m_setup_wii)
   {
     painter.drawText(
         QRectF(240 * k, height() - 150 * k, width() - 480 * k, 70 * k),
@@ -3839,6 +3983,8 @@ void BigPictureWindow::StartSetup(int port)
   m_setup_port = port;
   m_setup_step = 0;
   m_setup_device_chosen = false;
+  m_setup_wii = false;
+  m_setup_steps.assign(std::begin(SETUP_STEPS), std::end(SETUP_STEPS));
   {
     const auto lock = ControllerEmu::EmulatedController::GetStateLock();
     for (PadGroup group : {PadGroup::Buttons, PadGroup::MainStick, PadGroup::CStick,
@@ -3853,12 +3999,59 @@ void BigPictureWindow::StartSetup(int port)
   update();
 }
 
+void BigPictureWindow::StartWiiSetup(int port)
+{
+  if (m_mode != Mode::Setup)
+    m_mode_before_setup = m_mode == Mode::Menu ? Mode::Library : m_mode;
+  BeginTransition(0);
+  m_mode = Mode::Setup;
+  m_setup_port = port;
+  m_setup_step = 0;
+  m_setup_device_chosen = false;
+  m_setup_wii = true;
+  m_setup_steps.clear();
+  const int ext = BigPictureWiiExtension(port);
+  if (ext == 2)
+  {
+    m_setup_steps.assign(std::begin(CLASSIC_STEPS), std::end(CLASSIC_STEPS));
+  }
+  else
+  {
+    m_setup_steps.assign(std::begin(WIIMOTE_STEPS), std::end(WIIMOTE_STEPS));
+    if (ext == 1)
+      m_setup_steps.insert(m_setup_steps.end(), std::begin(NUNCHUK_STEPS), std::end(NUNCHUK_STEPS));
+  }
+  {
+    // Only what the assistant sets is cleared (tilt, swing… keep their mapping)
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    for (const SetupStep& st : m_setup_steps)
+    {
+      auto* group = BigPictureGroup(port, st.group);
+      for (int i : {st.index, st.mirror_index, st.mirror2})
+      {
+        if (i >= 0 && i < int(group->controls.size()))
+          (void)group->controls[i]->control_ref->SetExpression("");
+      }
+    }
+  }
+  StartSetupStep();
+  m_setup_timer->start();
+  update();
+}
+
+ControllerEmu::EmulatedController* BigPictureWindow::SetupController() const
+{
+  if (m_setup_wii && !m_setup_steps.empty())
+    return BigPictureController(m_setup_port, m_setup_steps.front().group);
+  return PadController(m_setup_port);
+}
+
 void BigPictureWindow::StartSetupStep()
 {
   std::vector<std::string> devices;
   if (m_setup_device_chosen)
   {
-    devices.push_back(PadController(m_setup_port)->GetDefaultDevice().ToString());
+    devices.push_back(SetupController()->GetDefaultDevice().ToString());
   }
   else
   {
@@ -3895,7 +4088,7 @@ void BigPictureWindow::UpdateSetup()
     return;
   }
 
-  auto* pad = PadController(m_setup_port);
+  auto* pad = SetupController();
   if (!m_setup_device_chosen)
   {
     ciface::Core::DeviceQualifier dq;
@@ -3908,20 +4101,22 @@ void BigPictureWindow::UpdateSetup()
   const std::string expr = ciface::MappingCommon::BuildExpression(
       results, pad->GetDefaultDevice(), ciface::MappingCommon::Quote::On);
 
-  const SetupStep& step = SETUP_STEPS[m_setup_step];
+  const SetupStep& step = m_setup_steps[m_setup_step];
   {
     const auto lock = ControllerEmu::EmulatedController::GetStateLock();
-    auto* group = Pad::GetGroup(m_setup_port, step.group);
+    auto* group = BigPictureGroup(m_setup_port, step.group);
     (void)group->controls[step.index]->control_ref->SetExpression(expr);
     if (step.mirror_index >= 0)
     {
       (void)group->controls[step.mirror_index]->control_ref->SetExpression(
           step.flip ? FlipAxis(expr) : expr);
     }
+    if (step.mirror2 >= 0)
+      (void)group->controls[step.mirror2]->control_ref->SetExpression(expr);
   }
 
   m_audio->Play(Sound::Confirm);
-  if (++m_setup_step >= SETUP_STEP_COUNT)
+  if (++m_setup_step >= static_cast<int>(m_setup_steps.size()))
   {
     FinishSetup(true);
     return;
@@ -3934,6 +4129,20 @@ void BigPictureWindow::FinishSetup(bool save)
 {
   m_setup_timer->stop();
   m_detector.reset();
+  if (m_setup_wii)
+  {
+    if (save)
+      FinishBigPictureWiiSetup(m_setup_port);
+    else
+      Wiimote::LoadConfig();
+    BeginTransition(0);
+    m_mode = m_mode_before_setup == Mode::Setup ? Mode::Library : m_mode_before_setup;
+    m_prev_held = ~0u;
+    if (save)
+      Toast(tr("Wiimote configurée"));
+    update();
+    return;
+  }
   if (auto* pad = PadController(m_setup_port))
   {
     if (save)
@@ -4306,13 +4515,37 @@ void BigPictureWindow::LoadCard(int slot)
   if (type == ExpansionInterface::EXIDeviceType::MemoryCardFolder)
   {
     // GCI folder: one file per save. Build a card in memory to show them like the others.
-    const std::string folder =
-        Config::GetGCIFolderPath(exi_slot, Config::Get(Config::MAIN_FALLBACK_REGION));
+    // One folder per region: the selected game's region first, then the first one with saves.
+    std::vector<DiscIO::Region> regions;
+    if (const Entry* sel = Selected(); sel && sel->game)
+      regions.push_back(sel->game->GetRegion());
+    regions.push_back(Config::Get(Config::MAIN_FALLBACK_REGION));
+    regions.insert(regions.end(),
+                   {DiscIO::Region::PAL, DiscIO::Region::NTSC_U, DiscIO::Region::NTSC_J});
+    std::string folder = Config::GetGCIFolderPath(exi_slot, regions[1]);
+    for (const DiscIO::Region region : regions)
+    {
+      if (region == DiscIO::Region::Unknown)
+        continue;
+      const std::string candidate = Config::GetGCIFolderPath(exi_slot, region);
+      if (!QDir(QString::fromStdString(candidate))
+               .entryList({QStringLiteral("*.gci")}, QDir::Files)
+               .isEmpty())
+      {
+        folder = candidate;
+        break;
+      }
+    }
     view.folder = true;
     view.path = QString::fromStdString(folder);
     File::CreateFullPath(folder + DIR_SEP);
-    auto card = Memcard::GCMemcard::Create(std::string(), CardFlashId{},
+    // Create() formats and writes the card to its file: use a throwaway one, the view stays in
+    // memory.
+    const QString scratch = QDir(QDir::tempPath())
+                                .filePath(QStringLiteral("dolphin-manette-gci-%1.raw").arg(slot));
+    auto card = Memcard::GCMemcard::Create(scratch.toStdString(), CardFlashId{},
                                            Memcard::MBIT_SIZE_MEMORY_CARD_2043, false, 0, 0, 0);
+    QFile::remove(scratch);
     if (!card)
     {
       view.error = tr("Dossier GCI illisible");
@@ -6306,7 +6539,7 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
   }
   else
   {
-    // Wii Remote: standing on the left, or lying sideways in the middle (D-pad on the left)
+    // Wii Remote: standing on the right, or lying sideways in the middle (D-pad on the left)
     const int b = WGr_code(WGr::Buttons);
     const bool sideways = BigPictureWiiSideways(port);
     painter.save();
@@ -6314,9 +6547,10 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     {
       painter.translate(panel.center().x(), panel.top() + 250 * k);
       painter.rotate(-90);
-      painter.translate(-(panel.left() + 190 * k), -(panel.top() + 330 * k));
+      painter.translate(-(panel.right() - 190 * k), -(panel.top() + 330 * k));
     }
-    const QRectF remote(panel.left() + 90 * k, panel.top() + 40 * k, 200 * k, 580 * k);
+    // The Wii Remote in the right hand, the Nunchuk in the left one
+    const QRectF remote(panel.right() - 290 * k, panel.top() + 40 * k, 200 * k, 580 * k);
     painter.setPen(QPen(LINE, 2 * k));
     painter.setBrush(SURFACE_DEEP);
     painter.drawRoundedRect(remote, 90 * k, 90 * k);
@@ -6331,7 +6565,7 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     button(QPointF(cx, remote.top() + 420 * k), 32 * k, QStringLiteral("Wii-1"), pressed(b, 2));
     button(QPointF(cx, remote.top() + 500 * k), 32 * k, QStringLiteral("Wii-2"), pressed(b, 3));
     // B is underneath: shown beside the remote
-    button(QPointF(remote.right() + 60 * k, remote.top() + 200 * k), 34 * k, QStringLiteral("Wii-B"),
+    button(QPointF(remote.left() - 60 * k, remote.top() + 200 * k), 34 * k, QStringLiteral("Wii-B"),
            pressed(b, 1));
     painter.restore();
 
@@ -6363,13 +6597,16 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     {
     // Pointer
     const int pt = WGr_code(WGr::Point);
-    const qreal px = value(pt, 3) - value(pt, 2), py = value(pt, 0) - value(pt, 1);
+    // The reshaped state, like the game gets it: a round stick reaches the corners
+    const auto cur = static_cast<ControllerEmu::ReshapableInput*>(BigPictureGroup(port, pt))
+                         ->GetReshapableState(true);
+    const qreal px = std::clamp<qreal>(cur.x, -1, 1), py = std::clamp<qreal>(cur.y, -1, 1);
     const QRectF screen_r(panel.center().x() - 300 * k, panel.top() + 80 * k, 600 * k, 340 * k);
     painter.setPen(QPen(LINE, 2 * k));
     painter.setBrush(SURFACE_DEEP);
     painter.drawRoundedRect(screen_r, 18 * k, 18 * k);
-    const QPointF dot(screen_r.center().x() + px * screen_r.width() / 2.2,
-                      screen_r.center().y() - py * screen_r.height() / 2.2);
+    const QPointF dot(screen_r.center().x() + px * (screen_r.width() / 2 - 6 * k),
+                      screen_r.center().y() - py * (screen_r.height() / 2 - 6 * k));
     painter.setPen(QPen(TEXT, 3 * k));
     painter.setBrush(Qt::NoBrush);
     painter.drawEllipse(dot, 18 * k, 18 * k);
@@ -6390,7 +6627,7 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     if (ext == 1)
     {
       const int nb = NGr_code(NGr::Buttons);
-      const QPointF nc(panel.right() - 260 * k, panel.top() + 330 * k);
+      const QPointF nc(panel.left() + 260 * k, panel.top() + 330 * k);
       const auto ns = stick_state(NGr_code(NGr::Stick));
       stick(nc, 120 * k, QStringLiteral("Wii-Control_Stick"), ns.x, ns.y);
       button(nc + QPointF(-60 * k, -200 * k), 34 * k, QStringLiteral("Wii-C"), pressed(nb, 0));
@@ -6407,16 +6644,18 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
 
 void BigPictureWindow::DrawDpadDot(QPainter& painter, QPointF p, qreal r)
 {
-  // Bright yellow with a dark ring: readable on the white cross and on the accent colour
+  // Bright yellow with a soft glow: readable on the white cross and on the accent colour
   QRadialGradient glow(p, r * 2.4);
   glow.setColorAt(0, QColor(255, 214, 40, 200));
   glow.setColorAt(1, QColor(255, 214, 40, 0));
   painter.setPen(Qt::NoPen);
   painter.setBrush(glow);
   painter.drawEllipse(p, r * 2.4, r * 2.4);
-  painter.setPen(QPen(QColor(20, 16, 36), std::max<qreal>(1.5, r * 0.35)));
+  painter.setPen(Qt::NoPen);
   painter.setBrush(QColor(255, 214, 40));
   painter.drawEllipse(p, r, r);
+  painter.setBrush(QColor(255, 250, 220));
+  painter.drawEllipse(p, r * 0.45, r * 0.45);
 }
 
 void BigPictureWindow::SyncSaves(bool announce)

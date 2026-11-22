@@ -79,6 +79,19 @@ public:
   void OnSystemSuspend();
   void OnSystemResume();
 
+  // One step of the button-by-button assistant (group code as in BigPictureGroup)
+  struct WizardStep
+  {
+    int group;
+    int index;
+    const char* prompt;
+    const char* help;
+    const char* icon;
+    int mirror_index;  // opposite direction for sticks, digital twin for triggers (-1 = none)
+    bool flip;         // mirror by flipping the axis sign
+    int mirror2 = -1;  // one more control getting the same input (shake X / Y / Z)
+  };
+
   // Esc / the "Stop" hotkey during a game: quit with a resume point. False if not in a game.
   bool QuitFromHotkey();
 
@@ -207,7 +220,9 @@ private:
 
   // ---- controller setup wizard
   void StartSetup(int port);
+  void StartWiiSetup(int port);
   void StartSetupStep();
+  ControllerEmu::EmulatedController* SetupController() const;
   void UpdateSetup();
   void FinishSetup(bool save);
   bool NeedsSetup() const;
@@ -301,6 +316,7 @@ private:
 
   // ---- drawing
   QFont Font(bool display, int px, int weight) const;
+  void DrawIconRaw(QPainter& painter, const QString& name, const QRectF& rect);
   void DrawIcon(QPainter& painter, const QString& name, const QRectF& rect);
   void DrawHints(QPainter& painter, const std::vector<std::pair<QString, QString>>& left,
                  const std::vector<std::pair<QString, QString>>& right);
@@ -396,6 +412,8 @@ private:
   int m_setup_port = 0;
   int m_setup_step = 0;
   bool m_setup_device_chosen = false;
+  bool m_setup_wii = false;
+  std::vector<WizardStep> m_setup_steps;
   std::unique_ptr<ciface::Core::InputDetector> m_detector;
   QTimer* m_setup_timer = nullptr;
   QTimer* m_setup_check_timer = nullptr;
@@ -494,6 +512,7 @@ private:
   bool m_ws_confirm = false;
   qint64 m_home_down_since = -1;
   bool m_slept_in_game = false;
+  bool m_wii_icons = false;
   int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
   void TakeSleepInhibitor();
   void QuitGame();

@@ -41,6 +41,7 @@
 #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
 #include "InputCommon/ControllerEmu/ControllerEmu.h"
 #include "InputCommon/ControllerEmu/Setting/NumericSetting.h"
+#include "InputCommon/ControllerEmu/StickGate.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/ControllerInterface/CoreDevice.h"
 #include "InputCommon/InputConfig.h"
@@ -1694,6 +1695,20 @@ void BigPictureSetWiiSideways(int port, bool sideways)
   Wiimote::GetConfig()->SaveConfig();
 }
 
+void FinishBigPictureWiiSetup(int port)
+{
+  auto* wm = Wiimote::GetConfig()->GetController(port);
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    static_cast<ControllerEmu::ReshapableInput*>(
+        Wiimote::GetWiimoteGroup(port, WiimoteEmu::WiimoteGroup::Point))
+        ->SetCalibrationFromGate(ControllerEmu::RoundStickGate(1.0));
+    wm->UpdateReferences(g_controller_interface);
+  }
+  Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::Emulated);
+  Wiimote::GetConfig()->SaveConfig();
+}
+
 bool ApplyWiiProfile(int port, int extension, bool sideways)
 {
   using WGr = WiimoteEmu::WiimoteGroup;
@@ -1835,6 +1850,10 @@ bool ApplyWiiProfile(int port, int extension, bool sideways)
       ->SetSelectedAttachment(static_cast<u32>(extension));
   if (auto* setting = SidewaysSetting(port))
     setting->SetValue(sideways);
+  // A round stick drives the pointer: stretch its circle to the square screen, so the
+  // diagonals reach the corners
+  static_cast<ControllerEmu::ReshapableInput*>(BigPictureGroup(port, WG(WGr::Point)))
+      ->SetCalibrationFromGate(ControllerEmu::RoundStickGate(1.0));
   wm->UpdateReferences(g_controller_interface);
   Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::Emulated);
   Wiimote::GetConfig()->SaveConfig();
@@ -1934,6 +1953,13 @@ std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPi
                                  notify(ok ? Tr("Wiimote réglée à l'horizontale") :
                                              Tr("Configure d'abord la manette de ce joueur"));
                              }));
+  }
+  {
+    const auto configure = host.configure_wiimote;
+    c.items.push_back(Action(Tr("Assistant bouton par bouton"),
+                             Tr("Chaque bouton de la Wiimote et du Nunchuk, ou de la manette "
+                                "classique, selon l'accessoire choisi."),
+                             [configure, port] { configure(*port); }));
   }
   {
     const auto test = host.test_wiimote;

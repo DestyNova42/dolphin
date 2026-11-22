@@ -53,6 +53,7 @@ struct BigPictureSettingsHost
   std::function<void()> check_updates;
   std::function<void()> install_drivers;
   std::function<void(int port)> test_wiimote;
+  std::function<void(int port)> configure_wiimote;  // button-by-button assistant
   std::function<void()> sync_now;
   std::function<void(const QString&)> notify;  // short message on screen
   std::function<void()> open_classic;
@@ -155,6 +156,8 @@ int BigPictureWiiExtension(int port);  // 0 none, 1 Nunchuk, 2 Classic Controlle
 // Sideways Wii Remote (the Dolphin option of this player)
 bool BigPictureWiiSideways(int port);
 void BigPictureSetWiiSideways(int port, bool sideways);
+// After the Wii assistant: emulated source, round pointer, saved.
+void FinishBigPictureWiiSetup(int port);
 bool ApplyWiiProfile(int port, int extension, bool sideways = false);
 std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPictureSettingsHost& host);
 
