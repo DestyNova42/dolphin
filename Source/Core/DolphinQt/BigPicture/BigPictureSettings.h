@@ -52,6 +52,8 @@ struct BigPictureSettingsHost
   std::function<void(int port)> test_controller;
   std::function<void()> check_updates;
   std::function<void()> install_drivers;
+  std::function<void(int port)> test_wiimote;
+  std::function<void()> sync_now;
   std::function<void(const QString&)> notify;  // short message on screen
   std::function<void()> open_classic;
   std::function<void()> interface_changed;  // a controller-mode preference changed
@@ -138,6 +140,29 @@ void SaveBigPicturePads();
 bool ApplyGameCubeProfile(int port, const std::string& device);
 bool IsSwitch2GameCube(const std::string& device);
 bool LoadBigPictureDeviceProfile(int port, const std::string& device);
+
+// Control groups of every emulated controller: code = kind * 100 + group
+// (kind 0 GameCube pad / PadGroup, 1 Wii Remote, 2 Nunchuk, 3 Classic Controller).
+namespace ControllerEmu
+{
+class ControlGroup;
+class EmulatedController;
+}  // namespace ControllerEmu
+ControllerEmu::EmulatedController* BigPictureController(int port, int code);
+ControllerEmu::ControlGroup* BigPictureGroup(int port, int code);
+int BigPictureWiiExtension(int port);  // 0 none, 1 Nunchuk, 2 Classic Controller
+// Wii Remote (+ Nunchuk) or Classic Controller on the controller of the same player.
+bool ApplyWiiProfile(int port, int extension);
+std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPictureSettingsHost& host);
+
+// Per game: HD textures and controller profile.
+bool HasTexturePack(const std::string& game_id);
+std::vector<BigPictureSettingCategory>
+BuildBigPictureGameExtras(const std::shared_ptr<Config::Layer>& layer, const std::string& game_id,
+                          const QString& title, std::function<void(const QString&)> notify);
+
+// "Portable" / "TV" presets, applied for the next game (current-run settings only).
+void ApplyBigPictureDisplayPreset(int screen_height);
 
 // Writes changed settings to disk.
 void SaveBigPictureSettings();

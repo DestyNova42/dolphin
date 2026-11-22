@@ -10,7 +10,13 @@
 #include <utility>
 
 #include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
+#include <QDirIterator>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QRegularExpression>
+#include <QUrl>
 #include <QProcess>
 #include <QFile>
 #include <QSettings>
@@ -48,6 +54,10 @@
 #include "Core/HW/EXI/EXI_Device.h"
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/Wiimote.h"
+#include "Core/HW/WiimoteEmu/Extension/Classic.h"
+#include "Core/HW/WiimoteEmu/Extension/Nunchuk.h"
+#include "Core/HW/WiimoteEmu/WiimoteEmu.h"
+#include "InputCommon/ControllerEmu/ControlGroup/Attachments.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "DolphinQt/Settings.h"
 #include "VideoCommon/VideoBackendBase.h"
@@ -285,6 +295,71 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  QStringLiteral("bigpicture/sort"),
                                  {Tr("Nom"), Tr("Dernière partie"), Tr("Temps de jeu")}, 0,
                                  changed));
+    c.items.push_back(PrefChoice(Tr("Préréglage d'affichage"),
+                                 Tr("Automatique : « Portable » sur un petit écran (Ally, Deck), "
+                                    "« TV » sur un grand. Remplace les réglages graphiques pendant "
+                                    "le jeu."),
+                                 QStringLiteral("bigpicture/preset"),
+                                 {Tr("Désactivé"), Tr("Automatique"), Tr("Portable"), Tr("TV")}, 0,
+                                 changed));
+    c.items.push_back(PrefToggle(Tr("Mise en veille propre"),
+                                 Tr("Avant la veille du PC ou de la console, le jeu est mis en "
+                                    "pause et sauvegardé ; au réveil, le menu pause s'ouvre."),
+                                 QStringLiteral("bigpicture/sleep_save"), true, {}));
+    {
+      // Sync folder: cycles through the usual cloud / Syncthing folders, A to pick another
+      Item item;
+      item.label = Tr("Synchroniser les sauvegardes");
+      item.help = Tr("Cartes mémoire, sauvegardes Wii et reprises, dans un dossier partagé "
+                     "(OneDrive, Syncthing, Nextcloud…) : les plus récentes gagnent.");
+      item.kind = Item::Kind::Choice;
+      const auto candidates = [] {
+        QStringList list{QString()};
+        const QString home = QDir::homePath();
+        const QString onedrive = qEnvironmentVariable("OneDrive");
+        for (const QString& d : {onedrive, home + QStringLiteral("/OneDrive"),
+                                 home + QStringLiteral("/Sync"), home + QStringLiteral("/Nextcloud"),
+                                 home + QStringLiteral("/Dropbox")})
+        {
+          if (!d.isEmpty() && QFileInfo(d).isDir() && !list.contains(d))
+            list << d;
+        }
+        const QString cur =
+            Settings::GetQSettings().value(QStringLiteral("bigpicture/sync_dir")).toString();
+        if (!cur.isEmpty() && !list.contains(cur))
+          list << cur;
+        return list;
+      };
+      item.value = [] {
+        const QString cur =
+            Settings::GetQSettings().value(QStringLiteral("bigpicture/sync_dir")).toString();
+        if (cur.isEmpty())
+          return Tr("Désactivée");
+        return QDir::toNativeSeparators(cur).section(QDir::separator(), -2);
+      };
+      item.change = [candidates](int dir) {
+        const QStringList list = candidates();
+        const QString cur =
+            Settings::GetQSettings().value(QStringLiteral("bigpicture/sync_dir")).toString();
+        int i = static_cast<int>(list.indexOf(cur));
+        if (i < 0)
+          i = 0;
+        const int n = static_cast<int>(list.size());
+        Settings::GetQSettings().setValue(QStringLiteral("bigpicture/sync_dir"),
+                                          list[(i + dir + n) % n]);
+      };
+      item.activate = [] {
+        const QString dir = QFileDialog::getExistingDirectory(
+            nullptr, Tr("Dossier partagé pour les sauvegardes"), QDir::homePath());
+        if (!dir.isEmpty())
+          Settings::GetQSettings().setValue(QStringLiteral("bigpicture/sync_dir"), dir);
+      };
+      c.items.push_back(std::move(item));
+    }
+    {
+      const auto sync = host.sync_now;
+      c.items.push_back(Action(Tr("Synchroniser maintenant"), {}, [sync] { sync(); }));
+    }
     c.items.push_back(PrefToggle(Tr("Reprendre"),
                                  Tr("En quittant un jeu depuis le menu pause, Dolphin le "
                                     "sauvegarde pour reprendre exactement au même endroit."),
@@ -1028,6 +1103,10 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     cats.push_back(std::move(c));
   }
 
+  // ---- Wii controllers
+  for (auto& wc : BuildBigPictureWiiControllers(host))
+    cats.push_back(std::move(wc));
+
   // ---- Advanced
   {
     BigPictureSettingCategory c{Tr("Avancé"), {}};
@@ -1469,6 +1548,7 @@ std::vector<BigPictureSettingCategory> BuildBigPictureCheatSettings(const std::s
 void SaveBigPicturePads()
 {
   Pad::GetConfig()->SaveConfig();
+  Wiimote::GetConfig()->SaveConfig();
   for (int port = 0; port < 4; ++port)
   {
     if (port == 0 || Config::Get(Config::GetInfoForSIDevice(port)) != SerialInterface::SIDEVICE_NONE)
@@ -1518,4 +1598,559 @@ bool ApplyGameCubeProfile(int port, const std::string& device)
   set(PadGroup::Rumble, 0, "`Motor`");
   pad->UpdateReferences(g_controller_interface);
   return true;
+}
+
+// ---------------------------------------------------------------- generic control groups
+
+ControllerEmu::EmulatedController* BigPictureController(int port, int code)
+{
+  if (code / 100 == 0)
+    return Pad::GetConfig()->GetController(port);
+  return Wiimote::GetConfig()->GetController(port);
+}
+
+ControllerEmu::ControlGroup* BigPictureGroup(int port, int code)
+{
+  const int g = code % 100;
+  switch (code / 100)
+  {
+  case 1:
+    return Wiimote::GetWiimoteGroup(port, static_cast<WiimoteEmu::WiimoteGroup>(g));
+  case 2:
+    return Wiimote::GetNunchukGroup(port, static_cast<WiimoteEmu::NunchukGroup>(g));
+  case 3:
+    return Wiimote::GetClassicGroup(port, static_cast<WiimoteEmu::ClassicGroup>(g));
+  default:
+    return Pad::GetGroup(port, static_cast<PadGroup>(g));
+  }
+}
+
+int BigPictureWiiExtension(int port)
+{
+  auto* att = static_cast<ControllerEmu::Attachments*>(
+      Wiimote::GetWiimoteGroup(port, WiimoteEmu::WiimoteGroup::Attachments));
+  return static_cast<int>(att->GetSelectedAttachment());
+}
+
+namespace
+{
+constexpr int W = 100, N = 200, C = 300;
+constexpr int WG(WiimoteEmu::WiimoteGroup g)
+{
+  return W + static_cast<int>(g);
+}
+constexpr int NG(WiimoteEmu::NunchukGroup g)
+{
+  return N + static_cast<int>(g);
+}
+constexpr int CG(WiimoteEmu::ClassicGroup g)
+{
+  return C + static_cast<int>(g);
+}
+}  // namespace
+
+bool ApplyWiiProfile(int port, int extension)
+{
+  using WGr = WiimoteEmu::WiimoteGroup;
+  using NGr = WiimoteEmu::NunchukGroup;
+  using CGr = WiimoteEmu::ClassicGroup;
+  // The Wii Remote uses the controller of the same player.
+  auto* gc = Pad::GetConfig()->GetController(port);
+  auto* wm = Wiimote::GetConfig()->GetController(port);
+  if (!gc || !wm)
+    return false;
+  const std::string device = gc->GetDefaultDevice().ToString();
+  if (device.empty())
+    return false;
+  const bool gcpad = IsSwitch2GameCube(device);
+  const bool xinput = device.rfind("XInput/", 0) == 0;
+
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  wm->SetDefaultDevice(device);
+  for (int code : {WG(WGr::Buttons), WG(WGr::DPad), WG(WGr::Point), WG(WGr::Shake), WG(WGr::Tilt),
+                   WG(WGr::Swing), NG(NGr::Buttons), NG(NGr::Stick), NG(NGr::Shake),
+                   CG(CGr::Buttons), CG(CGr::Triggers), CG(CGr::DPad), CG(CGr::LeftStick),
+                   CG(CGr::RightStick)})
+  {
+    for (auto& control : BigPictureGroup(port, code)->controls)
+      (void)control->control_ref->SetExpression("");
+  }
+  const auto set = [port](int code, int index, const char* expr) {
+    auto* group = BigPictureGroup(port, code);
+    if (index < static_cast<int>(group->controls.size()))
+      (void)group->controls[index]->control_ref->SetExpression(expr);
+  };
+  const auto stick = [&set](int code, const char* up, const char* down, const char* left,
+                            const char* right) {
+    set(code, 0, up);
+    set(code, 1, down);
+    set(code, 2, left);
+    set(code, 3, right);
+  };
+  const int dpad = extension == 2 ? CG(CGr::DPad) : WG(WGr::DPad);
+  stick(dpad, "`Pad N`", "`Pad S`", "`Pad W`", "`Pad E`");
+  set(WG(WGr::Rumble), 0, xinput ? "`Motor L`" : "`Motor`");
+
+  if (extension == 2)
+  {
+    // Classic Controller: Nintendo layout (A on the right)
+    const int b = CG(CGr::Buttons);
+    if (gcpad)
+    {
+      set(b, 0, "`Button S`");  // A
+      set(b, 1, "`Button W`");  // B
+      set(b, 2, "`Button E`");  // X
+      set(b, 3, "`Button N`");  // Y
+      set(b, 4, "`Shoulder L`");  // ZL
+      set(b, 5, "`Shoulder R`");  // ZR = Z
+      set(b, 6, "`Misc 2`");      // - = C
+      set(CG(CGr::Triggers), 0, "`Misc 3`");
+      set(CG(CGr::Triggers), 1, "`Misc 4`");
+      set(CG(CGr::Triggers), 2, "`Trigger L`");
+      set(CG(CGr::Triggers), 3, "`Trigger R`");
+    }
+    else
+    {
+      set(b, 0, "`Button B`");
+      set(b, 1, "`Button A`");
+      set(b, 2, "`Button Y`");
+      set(b, 3, "`Button X`");
+      set(b, 4, "`Trigger L`");
+      set(b, 5, "`Trigger R`");
+      set(b, 6, "`Back`");
+      set(CG(CGr::Triggers), 0, "`Shoulder L`");
+      set(CG(CGr::Triggers), 1, "`Shoulder R`");
+      set(CG(CGr::Triggers), 2, "`Shoulder L`");
+      set(CG(CGr::Triggers), 3, "`Shoulder R`");
+    }
+    set(b, 7, "`Start`");
+    set(b, 8, "`Guide`");
+    stick(CG(CGr::LeftStick), "`Left Y+`", "`Left Y-`", "`Left X-`", "`Left X+`");
+    stick(CG(CGr::RightStick), "`Right Y+`", "`Right Y-`", "`Right X-`", "`Right X+`");
+  }
+  else
+  {
+    // Wii Remote (+ Nunchuk): pointer on the right stick
+    const int b = WG(WGr::Buttons);
+    if (gcpad)
+    {
+      set(b, 0, "`Button S`");    // A
+      set(b, 1, "`Trigger R`");   // B = R
+      set(b, 2, "`Button E`");    // 1 = X
+      set(b, 3, "`Button N`");    // 2 = Y
+      set(b, 4, "`Shoulder L`");  // - = ZL
+      for (int i = 0; i < 3; ++i)
+        set(WG(WGr::Shake), i, "`Button W`");  // shake = B
+      set(NG(NGr::Buttons), 0, "`Shoulder R`");  // C = Z
+      set(NG(NGr::Buttons), 1, "`Trigger L`");   // Z = L
+    }
+    else
+    {
+      set(b, 0, "`Button A`");
+      set(b, 1, "`Trigger R`");
+      set(b, 2, "`Button X`");
+      set(b, 3, "`Button Y`");
+      set(b, 4, "`Back`");
+      for (int i = 0; i < 3; ++i)
+        set(WG(WGr::Shake), i, "`Button B`");
+      set(NG(NGr::Buttons), 0, "`Shoulder L`");
+      set(NG(NGr::Buttons), 1, "`Trigger L`");
+      for (int i = 0; i < 3; ++i)
+        set(NG(NGr::Shake), i, "`Thumb L`");
+      set(WG(WGr::Point), 5, "`Thumb R`");  // recenter
+    }
+    set(b, 5, "`Start`");
+    set(b, 6, "`Guide`");
+    stick(WG(WGr::Point), "`Right Y+`", "`Right Y-`", "`Right X-`", "`Right X+`");
+    stick(NG(NGr::Stick), "`Left Y+`", "`Left Y-`", "`Left X-`", "`Left X+`");
+  }
+
+  static_cast<ControllerEmu::Attachments*>(BigPictureGroup(port, WG(WGr::Attachments)))
+      ->SetSelectedAttachment(static_cast<u32>(extension));
+  wm->UpdateReferences(g_controller_interface);
+  Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::Emulated);
+  Wiimote::GetConfig()->SaveConfig();
+  return true;
+}
+
+std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPictureSettingsHost& host)
+{
+  using WGr = WiimoteEmu::WiimoteGroup;
+  using NGr = WiimoteEmu::NunchukGroup;
+  using CGr = WiimoteEmu::ClassicGroup;
+  BigPictureSettingCategory c{Tr("Manettes Wii"), {}};
+  auto port = std::make_shared<int>(0);
+  {
+    Item item;
+    item.label = Tr("Wiimote");
+    item.help = Tr("Les réglages ci-dessous s'appliquent à cette Wiimote.");
+    item.kind = Item::Kind::Choice;
+    item.value = [port] { return Tr("Joueur %1").arg(*port + 1); };
+    item.change = [port](int dir) { *port = (*port + dir + 4) % 4; };
+    item.activate = [port] { *port = (*port + 1) % 4; };
+    c.items.push_back(std::move(item));
+  }
+  {
+    Item item;
+    item.label = Tr("Source");
+    item.help = Tr("Émulée : ta manette fait la Wiimote. Vraie : une Wiimote connectée au PC.");
+    item.kind = Item::Kind::Choice;
+    item.value = [port] {
+      switch (Config::Get(Config::GetInfoForWiimoteSource(*port)))
+      {
+      case WiimoteSource::Emulated:
+        return Tr("Émulée (ta manette)");
+      case WiimoteSource::Real:
+        return Tr("Vraie Wiimote");
+      default:
+        return Tr("Aucune");
+      }
+    };
+    item.change = [port](int dir) {
+      const int cur = static_cast<int>(Config::Get(Config::GetInfoForWiimoteSource(*port)));
+      Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(*port),
+                               static_cast<WiimoteSource>((cur + dir + 3) % 3));
+    };
+    item.activate = [change = item.change] { change(1); };
+    c.items.push_back(std::move(item));
+  }
+  {
+    Item item;
+    item.label = Tr("Accessoire");
+    item.help = Tr("Branché sur la Wiimote émulée.");
+    item.kind = Item::Kind::Choice;
+    item.value = [port] {
+      switch (BigPictureWiiExtension(*port))
+      {
+      case 1:
+        return Tr("Nunchuk");
+      case 2:
+        return Tr("Manette classique");
+      case 0:
+        return Tr("Aucun");
+      default:
+        return Tr("Autre");
+      }
+    };
+    item.change = [port](int dir) {
+      const int cur = std::clamp(BigPictureWiiExtension(*port), 0, 2);
+      const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+      static_cast<ControllerEmu::Attachments*>(BigPictureGroup(*port, WG(WGr::Attachments)))
+          ->SetSelectedAttachment(static_cast<u32>((cur + dir + 3) % 3));
+    };
+    item.activate = [change = item.change] { change(1); };
+    c.items.push_back(std::move(item));
+  }
+  {
+    const auto notify = host.notify;
+    c.items.push_back(Action(Tr("Réglage automatique"),
+                             Tr("Wiimote (+ Nunchuk) : pointeur au stick droit, secouer avec B. "
+                                "Manette classique : disposition Nintendo."),
+                             [port, notify] {
+                               const int ext = std::clamp(BigPictureWiiExtension(*port), 0, 2);
+                               const bool ok = ApplyWiiProfile(*port, ext);
+                               if (notify)
+                                 notify(ok ? Tr("Wiimote réglée") :
+                                             Tr("Configure d'abord la manette de ce joueur"));
+                             }));
+  }
+  {
+    const auto test = host.test_wiimote;
+    c.items.push_back(Action(Tr("Tester la Wiimote"),
+                             Tr("Boutons, pointeur, Nunchuk et manette classique."),
+                             [test, port] { test(*port); }));
+  }
+  {
+    const auto notify = host.notify;
+    c.items.push_back(Action(Tr("Connecter une vraie Wiimote"),
+                             Tr("Appuie sur 1 + 2 (ou sur le bouton Sync) de la Wiimote. Sous "
+                                "Windows, appaire-la d'abord dans les paramètres Bluetooth."),
+                             [port, notify] {
+                               Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(*port),
+                                                        WiimoteSource::Real);
+                               Config::SetBaseOrCurrent(Config::MAIN_WIIMOTE_CONTINUOUS_SCANNING,
+                                                        true);
+                               WiimoteReal::Refresh();
+                               if (notify)
+                                 notify(Tr("Recherche… appuie sur 1 + 2 de la Wiimote"));
+                             }));
+  }
+
+  struct Ctl
+  {
+    int code;
+    int index;
+    int mirror;
+    bool flip;
+    const char* label;
+  };
+  static const Ctl controls[] = {
+      {WG(WGr::Buttons), 0, -1, false, "Wiimote : A"},
+      {WG(WGr::Buttons), 1, -1, false, "Wiimote : B"},
+      {WG(WGr::Buttons), 2, -1, false, "Wiimote : 1"},
+      {WG(WGr::Buttons), 3, -1, false, "Wiimote : 2"},
+      {WG(WGr::Buttons), 4, -1, false, "Wiimote : −"},
+      {WG(WGr::Buttons), 5, -1, false, "Wiimote : +"},
+      {WG(WGr::Buttons), 6, -1, false, "Wiimote : HOME"},
+      {WG(WGr::DPad), 0, -1, false, "Wiimote : croix haut"},
+      {WG(WGr::DPad), 1, -1, false, "Wiimote : croix bas"},
+      {WG(WGr::DPad), 2, -1, false, "Wiimote : croix gauche"},
+      {WG(WGr::DPad), 3, -1, false, "Wiimote : croix droite"},
+      {WG(WGr::Point), 0, 1, true, "Pointeur : haut / bas"},
+      {WG(WGr::Point), 3, 2, true, "Pointeur : droite / gauche"},
+      {WG(WGr::Shake), 0, 1, false, "Secouer la Wiimote"},
+      {NG(NGr::Buttons), 0, -1, false, "Nunchuk : C"},
+      {NG(NGr::Buttons), 1, -1, false, "Nunchuk : Z"},
+      {NG(NGr::Stick), 0, 1, true, "Nunchuk : stick haut / bas"},
+      {NG(NGr::Stick), 3, 2, true, "Nunchuk : stick droite / gauche"},
+      {NG(NGr::Shake), 0, 1, false, "Secouer le Nunchuk"},
+      {CG(CGr::Buttons), 0, -1, false, "Classique : a"},
+      {CG(CGr::Buttons), 1, -1, false, "Classique : b"},
+      {CG(CGr::Buttons), 2, -1, false, "Classique : x"},
+      {CG(CGr::Buttons), 3, -1, false, "Classique : y"},
+      {CG(CGr::Buttons), 4, -1, false, "Classique : ZL"},
+      {CG(CGr::Buttons), 5, -1, false, "Classique : ZR"},
+      {CG(CGr::Triggers), 2, 0, false, "Classique : L"},
+      {CG(CGr::Triggers), 3, 1, false, "Classique : R"},
+      {CG(CGr::Buttons), 6, -1, false, "Classique : −"},
+      {CG(CGr::Buttons), 7, -1, false, "Classique : +"},
+      {CG(CGr::Buttons), 8, -1, false, "Classique : HOME"},
+      {CG(CGr::LeftStick), 0, 1, true, "Classique : stick gauche haut / bas"},
+      {CG(CGr::LeftStick), 3, 2, true, "Classique : stick gauche droite / gauche"},
+      {CG(CGr::RightStick), 0, 1, true, "Classique : stick droit haut / bas"},
+      {CG(CGr::RightStick), 3, 2, true, "Classique : stick droit droite / gauche"},
+  };
+  const auto remap = host.remap_control;
+  for (const Ctl& ctl : controls)
+  {
+    Item item;
+    item.label = Tr(ctl.label);
+    item.help = Tr("A : appuie ensuite sur la touche voulue. X : effacer.");
+    item.kind = Item::Kind::Action;
+    item.value = [port, ctl] {
+      std::string expr =
+          BigPictureGroup(*port, ctl.code)->controls[ctl.index]->control_ref->GetExpression();
+      std::erase(expr, '`');
+      QString q = QString::fromStdString(expr);
+      if (q.size() > 22)
+        q = q.left(20) + QStringLiteral("…");
+      return q.isEmpty() ? Tr("—") : q;
+    };
+    item.activate = [remap, port, ctl] {
+      remap(*port, ctl.code, ctl.index, ctl.mirror, ctl.flip, Tr(ctl.label));
+    };
+    item.change = [](int) {};
+    item.clear = [port, ctl] {
+      const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+      auto* group = BigPictureGroup(*port, ctl.code);
+      (void)group->controls[ctl.index]->control_ref->SetExpression("");
+      if (ctl.mirror >= 0)
+        (void)group->controls[ctl.mirror]->control_ref->SetExpression("");
+      Wiimote::GetConfig()->GetController(*port)->UpdateReferences(g_controller_interface);
+    };
+    c.items.push_back(std::move(item));
+  }
+  const auto calibrate = host.calibrate_stick;
+  c.items.push_back(Action(Tr("Étalonner le stick du Nunchuk"), {},
+                           [calibrate, port] { calibrate(*port, NG(NGr::Stick)); }));
+  c.items.push_back(Action(Tr("Étalonner le stick gauche (classique)"), {},
+                           [calibrate, port] { calibrate(*port, CG(CGr::LeftStick)); }));
+  c.items.push_back(Action(Tr("Étalonner le stick droit (classique)"), {},
+                           [calibrate, port] { calibrate(*port, CG(CGr::RightStick)); }));
+  c.items.push_back(Toggle(Tr("Bluetooth direct (vraies Wiimotes)"),
+                           Tr("Donne une clé Bluetooth entière à la Wii émulée (avancé)."),
+                           Config::MAIN_BLUETOOTH_PASSTHROUGH_ENABLED));
+  std::vector<BigPictureSettingCategory> cats;
+  cats.push_back(std::move(c));
+  return cats;
+}
+
+// ---------------------------------------------------------------- per game: textures, controls
+
+namespace
+{
+std::string TexturePackDir(const std::string& game_id)
+{
+  const std::string root = File::GetUserPath(D_HIRESTEXTURES_IDX);
+  for (const std::string& id : {game_id, game_id.substr(0, 3)})
+  {
+    if (!id.empty() && File::IsDirectory(root + id))
+      return root + id;
+  }
+  return {};
+}
+
+QStringList ProfileNames(InputConfig* config)
+{
+  const QDir dir(QString::fromStdString(config->GetUserProfileDirectoryPath()));
+  QStringList names;
+  for (const QFileInfo& f : dir.entryInfoList({QStringLiteral("*.ini")}, QDir::Files, QDir::Name))
+    names << f.completeBaseName();
+  return names;
+}
+
+Item GameProfileChoice(const QString& label, const QString& help, const std::string& game_id,
+                       const char* key, InputConfig* config)
+{
+  Item item;
+  item.label = label;
+  item.help = help;
+  item.kind = Item::Kind::Choice;
+  const std::string ini_path = File::GetUserPath(D_GAMESETTINGS_IDX) + game_id + ".ini";
+  const auto read = [ini_path, key]() -> QString {
+    Common::IniFile ini;
+    ini.Load(ini_path);
+    std::string value;
+    if (auto* section = ini.GetSection("Controls"))
+      section->Get(key, &value);
+    return QString::fromStdString(value);
+  };
+  const auto write = [ini_path, key](const QString& value) {
+    Common::IniFile ini;
+    ini.Load(ini_path);
+    auto* section = ini.GetOrCreateSection("Controls");
+    if (value.isEmpty())
+      section->Delete(key);
+    else
+      section->Set(key, value.toStdString());
+    File::CreateFullPath(ini_path);
+    ini.Save(ini_path);
+  };
+  item.value = [read] {
+    const QString v = read();
+    return v.isEmpty() ? Tr("Manette habituelle") : v;
+  };
+  item.change = [read, write, config](int dir) {
+    QStringList options = ProfileNames(config);
+    options.prepend(QString());
+    int i = static_cast<int>(options.indexOf(read()));
+    if (i < 0)
+      i = 0;
+    const int n = static_cast<int>(options.size());
+    write(options[(i + dir + n) % n]);
+  };
+  item.activate = [change = item.change] { change(1); };
+  return item;
+}
+}  // namespace
+
+bool HasTexturePack(const std::string& game_id)
+{
+  return !TexturePackDir(game_id).empty();
+}
+
+std::vector<BigPictureSettingCategory>
+BuildBigPictureGameExtras(const std::shared_ptr<Config::Layer>& layer, const std::string& game_id,
+                          const QString& title, std::function<void(const QString&)> notify)
+{
+  std::vector<BigPictureSettingCategory> cats;
+  {
+    BigPictureSettingCategory c{Tr("Textures HD"), {}};
+    {
+      Item item;
+      item.label = Tr("Pack de textures");
+      item.help = Tr("Mets le pack dans le dossier Load/Textures/%1 de Dolphin.")
+                      .arg(QString::fromStdString(game_id));
+      item.kind = Item::Kind::Action;
+      item.value = [game_id] {
+        const std::string dir = TexturePackDir(game_id);
+        if (dir.empty())
+          return Tr("Aucun");
+        qint64 files = 0, bytes = 0;
+        QDirIterator it(QString::fromStdString(dir), QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext() && files < 200000)
+        {
+          it.next();
+          ++files;
+          bytes += it.fileInfo().size();
+        }
+        return Tr("Installé · %1 fichiers · %2 Mo").arg(files).arg(bytes / (1024 * 1024));
+      };
+      item.activate = [game_id] {
+        std::string dir = TexturePackDir(game_id);
+        if (dir.empty())
+        {
+          dir = File::GetUserPath(D_HIRESTEXTURES_IDX) + game_id;
+          File::CreateFullPath(dir + DIR_SEP);
+        }
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(dir)));
+      };
+      item.change = [](int) {};
+      c.items.push_back(std::move(item));
+    }
+    c.items.push_back(GameBool(layer, Tr("Utiliser les textures HD"),
+                               Tr("Charge le pack de textures de ce jeu."),
+                               Config::GFX_HIRES_TEXTURES));
+    c.items.push_back(GameBool(layer, Tr("Précharger les textures"),
+                               Tr("Évite les saccades, mais demande beaucoup de mémoire."),
+                               Config::GFX_CACHE_HIRES_TEXTURES));
+    cats.push_back(std::move(c));
+  }
+  {
+    BigPictureSettingCategory c{Tr("Manette pour ce jeu"), {}};
+    c.items.push_back(GameProfileChoice(Tr("Profil GameCube (joueur 1)"),
+                                        Tr("Chargé au lancement de ce jeu à la place des réglages "
+                                           "habituels."),
+                                        game_id, "PadProfile1", Pad::GetConfig()));
+    c.items.push_back(GameProfileChoice(Tr("Profil Wiimote (joueur 1)"), {}, game_id,
+                                        "WiimoteProfile1", Wiimote::GetConfig()));
+    c.items.push_back(Action(
+        Tr("Créer un profil avec la manette actuelle"),
+        Tr("Enregistre les réglages actuels du joueur 1 et les associe à ce jeu."),
+        [game_id, title, notify] {
+          QString name = title;
+          name.remove(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|]")));
+          name = name.left(60).trimmed();
+          const std::string path = Pad::GetConfig()->GetUserProfileDirectoryPath() +
+                                   name.toStdString() + ".ini";
+          File::CreateFullPath(path);
+          Common::IniFile ini;
+          {
+            const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+            Pad::GetConfig()->GetController(0)->SaveConfig(ini.GetOrCreateSection("Profile"));
+          }
+          ini.Save(path);
+          const std::string game_ini = File::GetUserPath(D_GAMESETTINGS_IDX) + game_id + ".ini";
+          Common::IniFile gini;
+          gini.Load(game_ini);
+          gini.GetOrCreateSection("Controls")->Set("PadProfile1", name.toStdString());
+          File::CreateFullPath(game_ini);
+          gini.Save(game_ini);
+          if (notify)
+            notify(Tr("Profil « %1 » associé à ce jeu").arg(name));
+        }));
+    cats.push_back(std::move(c));
+  }
+  return cats;
+}
+
+// ---------------------------------------------------------------- display presets
+
+void ApplyBigPictureDisplayPreset(int screen_height)
+{
+  int preset = Settings::GetQSettings().value(QStringLiteral("bigpicture/preset"), 0).toInt();
+  if (preset == 0)
+    return;
+  if (preset == 1)  // automatic: small screens are handhelds
+    preset = screen_height <= 1200 ? 2 : 3;
+  if (preset == 2)
+  {
+    // Portable (ROG Xbox Ally, Steam Deck…): smooth and light on the battery
+    Config::SetCurrent(Config::GFX_EFB_SCALE, 2);
+    Config::SetCurrent(Config::GFX_MSAA, 1u);
+    Config::SetCurrent(Config::GFX_SSAA, false);
+    Config::SetCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY, AnisotropicFilteringMode::Force2x);
+    Config::SetCurrent(Config::GFX_VSYNC, true);
+  }
+  else
+  {
+    // TV: sharp picture at the TV's resolution (1080p: 3x, 1440p: 4x, 4K: 5x)
+    const int scale = std::clamp(static_cast<int>(std::lround(screen_height / 480.0 + 0.5)), 2, 6);
+    Config::SetCurrent(Config::GFX_EFB_SCALE, scale);
+    Config::SetCurrent(Config::GFX_MSAA, 4u);
+    Config::SetCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY, AnisotropicFilteringMode::Force16x);
+  }
+  // Shaders compiled in the background: no stutter the first time an effect shows up
+  Config::SetCurrent(Config::GFX_SHADER_COMPILATION_MODE,
+                     ShaderCompilationMode::AsynchronousUberShaders);
 }

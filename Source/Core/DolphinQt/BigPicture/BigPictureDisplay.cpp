@@ -3,6 +3,10 @@
 
 #include "DolphinQt/BigPicture/BigPictureDisplay.h"
 
+#include <QAbstractNativeEventFilter>
+#include <QByteArray>
+#include <QCoreApplication>
+
 #ifdef _WIN32
 #include <Windows.h>
 
@@ -193,6 +197,41 @@ void MatchHdr(bool hdr)
   }
 }
 
+namespace
+{
+class PowerFilter final : public QAbstractNativeEventFilter
+{
+public:
+  explicit PowerFilter(std::function<void(bool)> cb) : m_cb(std::move(cb)) {}
+  bool nativeEventFilter(const QByteArray& type, void* message, qintptr*) override
+  {
+    if (type != "windows_generic_MSG")
+      return false;
+    const MSG* msg = static_cast<const MSG*>(message);
+    if (msg->message == WM_POWERBROADCAST)
+    {
+      if (msg->wParam == PBT_APMSUSPEND)
+        m_cb(true);
+      else if (msg->wParam == PBT_APMRESUMEAUTOMATIC || msg->wParam == PBT_APMRESUMESUSPEND)
+        m_cb(false);
+    }
+    return false;
+  }
+
+private:
+  std::function<void(bool)> m_cb;
+};
+}  // namespace
+
+void InstallPowerNotifications(std::function<void(bool)> on_power)
+{
+  static PowerFilter* s_filter = nullptr;
+  if (s_filter)
+    return;
+  s_filter = new PowerFilter(std::move(on_power));
+  QCoreApplication::instance()->installNativeEventFilter(s_filter);
+}
+
 void RestoreHdr()
 {
   for (const Saved& s : s_saved)
@@ -210,6 +249,9 @@ void MatchHdr(bool)
 {
 }
 void RestoreHdr()
+{
+}
+void InstallPowerNotifications(std::function<void(bool)>)
 {
 }
 

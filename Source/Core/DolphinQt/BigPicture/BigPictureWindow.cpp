@@ -16,8 +16,11 @@
 #include <variant>
 #include <numbers>
 
+#include <fmt/format.h>
+
 #include <QDateTime>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QFile>
 #include <QGuiApplication>
@@ -28,6 +31,14 @@
 #include <QFontMetrics>
 #include <QImage>
 #include <QKeyEvent>
+#ifdef HAVE_BIGPICTURE_DBUS
+#include <QDBusConnection>
+#include <QDBusInterface>
+#include <QDBusReply>
+#include <QDBusUnixFileDescriptor>
+#include <unistd.h>
+#endif
+#include <QStandardPaths>
 #include <QLocale>
 #include <QPainter>
 #include <QPainterPath>
@@ -59,6 +70,15 @@
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/GCPadEmu.h"
+#include "Core/HW/Wiimote.h"
+#include "Core/HW/WiimoteEmu/Extension/Classic.h"
+#include "Core/HW/WiimoteEmu/Extension/Nunchuk.h"
+#include "Core/HW/WiimoteEmu/WiimoteEmu.h"
+#include "Core/HW/WiiSave.h"
+#include "Core/IOS/FS/FileSystem.h"
+#include "Core/IOS/IOS.h"
+#include "DiscIO/WiiSaveBanner.h"
+#include "InputCommon/ControllerEmu/ControlGroup/Cursor.h"
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HotkeyManager.h"
 #include "Core/State.h"
@@ -67,6 +87,7 @@
 #include "DiscIO/Enums.h"
 #include "DolphinQt/BigPicture/BigPictureAudio.h"
 #include "DolphinQt/BigPicture/BigPictureDriver.h"
+#include "DolphinQt/BigPicture/BigPictureSync.h"
 #include "DolphinQt/BigPicture/BigPictureUpdater.h"
 #include "DolphinQt/GameList/GameListModel.h"
 #include "DolphinQt/QtUtils/ImageConverter.h"
@@ -406,6 +427,16 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
     });
   };
   host.check_updates = [this] { QTimer::singleShot(0, this, [this] { CheckUpdates(false); }); };
+  host.test_wiimote = [this](int port) {
+    QTimer::singleShot(0, this, [this, port] {
+      m_test_port = port;
+      m_test_start_since = -1;
+      m_mode_before_players = m_mode;
+      BeginTransition(0);
+      m_mode = Mode::WiiTest;
+    });
+  };
+  host.sync_now = [this] { QTimer::singleShot(0, this, [this] { SyncSaves(true); }); };
   host.install_drivers = [this] {
     QTimer::singleShot(0, this, [this] {
       if (BigPictureDriver::DevicesNeedingDriver().empty())
@@ -431,6 +462,21 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
           &BigPictureWindow::OnDevicesChanged);
   for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
     m_known_devices << QString::fromStdString(d);
+
+  // Sleep of the PC / console: pause and save the game first
+  BigPictureDisplay::InstallPowerNotifications([this](bool suspend) {
+    if (suspend)
+      OnSystemSuspend();
+    else
+      OnSystemResume();
+  });
+#ifdef HAVE_BIGPICTURE_DBUS
+  QDBusConnection::systemBus().connect(
+      QStringLiteral("org.freedesktop.login1"), QStringLiteral("/org/freedesktop/login1"),
+      QStringLiteral("org.freedesktop.login1.Manager"), QStringLiteral("PrepareForSleep"), this,
+      SLOT(OnPrepareForSleep(bool)));
+  TakeSleepInhibitor();
+#endif
 
   m_notifier = new NotifierWidget([this](QPainter& p) {
     const qreal a = std::min<qreal>(1, std::min(m_notify_t / 0.3, (3.0 - m_notify_t) / 0.25));
@@ -538,11 +584,16 @@ void BigPictureWindow::ApplyPreferences()
 void BigPictureWindow::Open()
 {
   unsetCursor();
+  QTimer::singleShot(1200, this, [this] {
+    if (m_active && Core::IsUninitialized(Core::System::GetInstance()))
+      SyncSaves(false);
+  });
   // The controller mode's CRT shaders were removed: don't leave Dolphin pointing at them.
   if (Config::Get(Config::GFX_ENHANCE_POST_SHADER).rfind("crt_manette", 0) == 0)
     Config::SetBaseOrCurrent(Config::GFX_ENHANCE_POST_SHADER, std::string());
   m_resume_known.clear();
   m_resume_shot_path.clear();
+  m_hd_known.clear();
   static bool s_cleaned_up = false;
   if (!s_cleaned_up)
   {
@@ -841,7 +892,7 @@ void BigPictureWindow::PollController()
   if (m_mode == Mode::Setup || m_mode == Mode::InGame || m_mode == Mode::Remap ||
       m_mode == Mode::Launching || m_mode == Mode::FadingOut || m_mode == Mode::Closing)
     return;
-  if (m_mode == Mode::PadTest)
+  if (m_mode == Mode::PadTest || m_mode == Mode::WiiTest)
   {
     // Every button is being tested: hold START for one second to leave.
     const GCPadStatus st = Pad::GetStatus(m_test_port);
@@ -940,8 +991,27 @@ void BigPictureWindow::PollInGame()
     }
   }
   const GCPadStatus status = Pad::GetStatus(0);
-  home |= (status.button & PAD_BUTTON_START) && (status.button & PAD_TRIGGER_Z);
+  const bool combo = (status.button & PAD_BUTTON_START) && (status.button & PAD_TRIGGER_Z);
 
+  if (system.IsWii())
+  {
+    // The Wii has its own HOME menu: a short press goes to the game, hold to open ours.
+    const qint64 now = m_clock.elapsed();
+    if (home && m_home_down_since < 0)
+      m_home_down_since = now;
+    if (!home)
+      m_home_down_since = -1;
+    const bool held = m_home_down_since >= 0 && now - m_home_down_since > 700;
+    if ((held || combo) && !m_home_was_down)
+    {
+      m_home_was_down = true;
+      OpenPause();
+      return;
+    }
+    m_home_was_down = held || combo;
+    return;
+  }
+  home |= combo;
   if (home && !m_home_was_down)
     OpenPause();
   m_home_was_down = home;
@@ -961,7 +1031,7 @@ void BigPictureWindow::keyPressEvent(QKeyEvent* event)
       FinishRemap(false);
     return;
   }
-  if (m_mode == Mode::PadTest)
+  if (m_mode == Mode::PadTest || m_mode == Mode::WiiTest)
   {
     if (event->key() == Qt::Key_Escape && !event->isAutoRepeat())
     {
@@ -1070,6 +1140,9 @@ void BigPictureWindow::HandleAction(Action action)
     break;
   case Mode::Memcard:
     HandleMemcard(action);
+    break;
+  case Mode::WiiSaves:
+    HandleWiiSaves(action);
     break;
   case Mode::Players:
     if (action == Action::Back || action == Action::Menu)
@@ -1439,7 +1512,7 @@ void BigPictureWindow::HandleSettings(Action action)
 
 void BigPictureWindow::HandleMenu(Action action)
 {
-  constexpr int ITEMS = 7;
+  constexpr int ITEMS = 9;
   switch (action)
   {
   case Action::Down:
@@ -1471,15 +1544,21 @@ void BigPictureWindow::HandleMenu(Action action)
       m_mode = Mode::Players;
       break;
     case 3:
-      OpenMemcards();
+      LaunchWiiMenu();
       break;
     case 4:
-      StartSetup(0);
+      OpenMemcards();
       break;
     case 5:
-      emit ClassicRequested();
+      OpenWiiSaves();
       break;
     case 6:
+      StartSetup(0);
+      break;
+    case 7:
+      emit ClassicRequested();
+      break;
+    case 8:
       SetMode(Mode::ConfirmQuit);
       break;
     default:
@@ -2164,6 +2243,20 @@ void BigPictureWindow::DrawScene(QPainter& painter)
     DrawPadTest(painter);
     return;
   }
+  if (m_mode == Mode::WiiTest)
+  {
+    DrawBackground(painter);
+    DrawWiiTest(painter);
+    return;
+  }
+  if (m_mode == Mode::WiiSaves)
+  {
+    DrawBackground(painter);
+    DrawTopBar(painter);
+    DrawWiiSaves(painter);
+    DrawToast(painter);
+    return;
+  }
   if (m_mode == Mode::ChooseDisc)
   {
     DrawBackground(painter);
@@ -2838,6 +2931,23 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
     painter.setOpacity(1.0);
     if (m_favorites.contains(e.path))
       DrawStar(painter, QPointF(r.right() - 26 * k, r.top() + 26 * k), k);
+    {
+      // "HD" when a texture pack is installed for this game
+      const QString id = QString::fromStdString(e.game->GetGameID());
+      auto hd = m_hd_known.find(id);
+      if (hd == m_hd_known.end())
+        hd = m_hd_known.insert(id, HasTexturePack(e.game->GetGameID()));
+      if (hd.value())
+      {
+        const QRectF chip(r.left() + 10 * k, r.top() + 10 * k, 44 * k, 26 * k);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(10, 8, 20, 200));
+        painter.drawRoundedRect(chip, 8 * k, 8 * k);
+        painter.setFont(Font(false, int(14 * k), 800));
+        painter.setPen(QColor(255, 255, 255));
+        painter.drawText(chip, Qt::AlignCenter, QStringLiteral("HD"));
+      }
+    }
     if (f > 0.01)
     {
       const qreal pulse = 0.75 + 0.25 * std::sin(m_time * 3.2);
@@ -3239,7 +3349,9 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
   painter.translate(-(1 - e) * 120 * k, 0);
   painter.setOpacity(e);
   const QRectF panel(0, 0, 700 * k, height());
-  painter.fillRect(panel, QColor(23, 20, 43, 245));
+  QColor panel_color = SURFACE;
+  panel_color.setAlpha(245);
+  painter.fillRect(panel, panel_color);
 
   QFont label = Font(false, int(18 * k), 600);
   label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
@@ -3252,34 +3364,35 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
                    QStringLiteral("Dolphin"));
 
   const QString items[] = {tr("Retour à la bibliothèque"), tr("Réglages"),
-                           tr("Joueurs"),                 tr("Cartes mémoire"),
+                           tr("Joueurs"),                 tr("Menu Wii"),
+                           tr("Cartes mémoire"),          tr("Sauvegardes Wii"),
                            tr("Configurer la manette"),   tr("Interface classique"),
                            tr("Quitter Dolphin")};
-  qreal y = 220 * k;
-  for (int i = 0; i < 7; ++i)
+  qreal y = 205 * k;
+  for (int i = 0; i < 9; ++i)
   {
-    if (i == 6)
+    if (i == 8)
     {
       painter.fillRect(QRectF(64 * k, y + 4 * k, 572 * k, 1 * k), LINE);
       y += 20 * k;
     }
     // items slide in one after the other
     const qreal ie = EaseOut((m_overlay_t - i * 0.06) / 0.7);
-    const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 74 * k);
+    const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 62 * k);
     const bool active = i == m_menu_index;
     painter.setOpacity(e * ie);
     if (active)
     {
       painter.setPen(Qt::NoPen);
-      painter.setBrush(TEXT);
+      painter.setBrush(ACCENT);
       painter.drawRoundedRect(r, 16 * k, 16 * k);
       DrawIcon(painter, QStringLiteral("A"),
                QRectF(r.right() - 28 * k - 38 * k, r.center().y() - 19 * k, 38 * k, 38 * k));
     }
-    painter.setFont(Font(false, int(26 * k), active ? 600 : 500));
-    painter.setPen(active ? BG : (i == 6 ? DANGER : TEXT));
+    painter.setFont(Font(false, int(24 * k), active ? 600 : 500));
+    painter.setPen(active ? BG : (i == 8 ? DANGER : TEXT));
     painter.drawText(r.adjusted(28 * k, 0, 0, 0), Qt::AlignVCenter, items[i]);
-    y += 82 * k;
+    y += 68 * k;
   }
   painter.setOpacity(e);
 
@@ -3770,7 +3883,12 @@ void BigPictureWindow::OpenGameSettingsFor(const Entry& entry, bool cheats_only)
       ConfigLoaders::GenerateLocalGameConfigLoader(id, rev));
   m_game_settings.clear();
   if (!cheats_only)
+  {
     m_game_settings = BuildBigPictureGameSettings(m_game_layer);
+    for (auto& cat : BuildBigPictureGameExtras(m_game_layer, id, entry.title,
+                                               [this](const QString& t) { Toast(t); }))
+      m_game_settings.push_back(std::move(cat));
+  }
   for (auto& cat : BuildBigPictureCheatSettings(id, rev))
     m_game_settings.push_back(std::move(cat));
   m_game_settings_title = cheats_only ? tr("Codes de triche — %1").arg(entry.title) :
@@ -3811,7 +3929,7 @@ void BigPictureWindow::StartRemap(int port, int group, int index, int mirror, bo
 void BigPictureWindow::StartRemapDetection()
 {
   std::vector<std::string> devices;
-  auto* pad = PadController(m_remap_port);
+  auto* pad = BigPictureController(m_remap_port, m_remap_group);
   if (g_controller_interface.FindDevice(pad->GetDefaultDevice()))
   {
     devices.push_back(pad->GetDefaultDevice().ToString());
@@ -3852,7 +3970,7 @@ void BigPictureWindow::UpdateRemap()
     return;
   }
 
-  auto* pad = PadController(m_remap_port);
+  auto* pad = BigPictureController(m_remap_port, m_remap_group);
   if (!g_controller_interface.FindDevice(pad->GetDefaultDevice()))
   {
     ciface::Core::DeviceQualifier dq;
@@ -3864,7 +3982,7 @@ void BigPictureWindow::UpdateRemap()
       results, pad->GetDefaultDevice(), ciface::MappingCommon::Quote::On);
   {
     const auto lock = ControllerEmu::EmulatedController::GetStateLock();
-    auto* group = Pad::GetGroup(m_remap_port, static_cast<PadGroup>(m_remap_group));
+    auto* group = BigPictureGroup(m_remap_port, m_remap_group);
     (void)group->controls[m_remap_index]->control_ref->SetExpression(expr);
     if (m_remap_mirror >= 0)
     {
@@ -3946,7 +4064,7 @@ void BigPictureWindow::UpdateCalibration()
   if (!m_calibrator)
     return;
   auto* stick = static_cast<ControllerEmu::ReshapableInput*>(
-      Pad::GetGroup(m_cal_port, static_cast<PadGroup>(m_cal_group)));
+      BigPictureGroup(m_cal_port, m_cal_group));
   const auto lock = ControllerEmu::EmulatedController::GetStateLock();
   const auto point = stick->GetReshapableState(false);
   m_cal_x = point.x;
@@ -3971,7 +4089,7 @@ void BigPictureWindow::FinishCalibration(bool apply)
   if (apply && m_calibrator->IsCalibrationDataSensible())
   {
     auto* stick = static_cast<ControllerEmu::ReshapableInput*>(
-        Pad::GetGroup(m_cal_port, static_cast<PadGroup>(m_cal_group)));
+        BigPictureGroup(m_cal_port, m_cal_group));
     const auto lock = ControllerEmu::EmulatedController::GetStateLock();
     m_calibrator->ApplyResults(stick);
     SaveBigPicturePads();
@@ -4002,7 +4120,9 @@ void BigPictureWindow::DrawCalibration(QPainter& painter)
   painter.setFont(label);
   painter.setPen(ACCENT_SOFT);
   painter.drawText(QRectF(0, 110 * k, width(), 30 * k), Qt::AlignCenter,
-                   is_main ? tr("ÉTALONNAGE DU STICK PRINCIPAL") : tr("ÉTALONNAGE DU STICK C"));
+                   m_cal_group >= 100 ? tr("ÉTALONNAGE DU STICK") :
+                   is_main            ? tr("ÉTALONNAGE DU STICK PRINCIPAL") :
+                                        tr("ÉTALONNAGE DU STICK C"));
 
   const QPointF c(width() / 2.0, 470 * k);
   const qreal radius = 230 * k;
@@ -4621,6 +4741,7 @@ void BigPictureWindow::PollDevices()
   case Mode::Remap:
   case Mode::Calibrate:
   case Mode::PadTest:
+  case Mode::WiiTest:
   case Mode::Launching:
   case Mode::Closing:
     return;
@@ -5244,6 +5365,12 @@ void BigPictureWindow::Launch(const Entry& entry, int disc, bool resume)
   const QString state = resume ? ResumeStatePath(id) : QString();
 
   m_audio->Play(Sound::Launch);
+  SyncSaves(false);  // latest saves from the other machine
+  {
+    const QScreen* scr = screen();
+    const int h = scr ? int(scr->geometry().height() * scr->devicePixelRatio()) : 1080;
+    ApplyBigPictureDisplayPreset(h);
+  }
   Settings::GetQSettings().setValue(LastPlayedKey(entry.path), QDateTime::currentSecsSinceEpoch());
   m_running_entry = entry;
   m_disc = disc;
@@ -5297,7 +5424,7 @@ const QPixmap& BigPictureWindow::ResumeShot(const Entry& entry)
 void BigPictureWindow::SaveResume()
 {
   const std::string id = SConfig::GetInstance().GetGameID();
-  if (id.empty() ||
+  if (id.empty() || !m_running_entry.game ||
       !Settings::GetQSettings().value(QStringLiteral("bigpicture/resume"), true).toBool())
     return;
   Settings::GetQSettings().setValue(
@@ -5639,4 +5766,575 @@ qreal BigPictureWindow::ResumeAspect(const Entry& entry) const
                              4.0 / 3.0)
                       .toDouble();
   return std::clamp<qreal>(a, 1.0, 2.5);
+}
+
+// ================================================================== Wii
+
+namespace
+{
+constexpr int WGr_code(WiimoteEmu::WiimoteGroup g)
+{
+  return 100 + static_cast<int>(g);
+}
+constexpr int NGr_code(WiimoteEmu::NunchukGroup g)
+{
+  return 200 + static_cast<int>(g);
+}
+constexpr int CGr_code(WiimoteEmu::ClassicGroup g)
+{
+  return 300 + static_cast<int>(g);
+}
+}  // namespace
+
+bool BigPictureWindow::WiiMenuInstalled() const
+{
+  return QFileInfo::exists(QString::fromStdString(File::GetUserPath(D_WIIROOT_IDX)) +
+                           QStringLiteral("/title/00000001/00000002/content/title.tmd"));
+}
+
+void BigPictureWindow::LaunchWiiMenu()
+{
+  if (!WiiMenuInstalled())
+  {
+    m_audio->Play(Sound::Error);
+    Toast(tr("Menu Wii non installé (interface classique › Outils › Mettre à jour la console)"));
+    return;
+  }
+  m_audio->Play(Sound::Launch);
+  m_running_entry = Entry{};
+  m_disc = 0;
+  setCursor(Qt::BlankCursor);
+  m_audio->StopMusic();
+  BeginTransition(0);
+  m_mode = Mode::Launching;
+  m_fade_in = 1;
+  QTimer::singleShot(350, this, [this] { emit LaunchRequested(QStringLiteral("wii-menu:"), {}); });
+}
+
+void BigPictureWindow::OpenWiiSaves()
+{
+  if (!Core::IsUninitialized(Core::System::GetInstance()))
+  {
+    m_audio->Play(Sound::Error);
+    Toast(tr("Quitte le jeu pour gérer les sauvegardes Wii"));
+    return;
+  }
+  m_wii_saves.clear();
+  const QString root =
+      QString::fromStdString(File::GetUserPath(D_WIIROOT_IDX)) + QStringLiteral("/title/");
+  for (const QString& hi : {QStringLiteral("00010000"), QStringLiteral("00010001"),
+                            QStringLiteral("00010004"), QStringLiteral("00010005")})
+  {
+    const QDir dir(root + hi);
+    for (const QString& lo : dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot))
+    {
+      const QString data = dir.filePath(lo) + QStringLiteral("/data");
+      if (!QFileInfo::exists(data + QStringLiteral("/banner.bin")))
+        continue;
+      bool ok1 = false, ok2 = false;
+      const u64 tid = (u64(hi.toUInt(&ok1, 16)) << 32) | lo.toUInt(&ok2, 16);
+      if (!ok1 || !ok2)
+        continue;
+      DiscIO::WiiSaveBanner banner(tid);
+      if (!banner.IsValid())
+        continue;
+      WiiSaveEntry e;
+      e.title_id = tid;
+      e.path = data;
+      e.name = QString::fromStdString(banner.GetName()).trimmed();
+      e.description = QString::fromStdString(banner.GetDescription()).trimmed();
+      u32 w = 0, h = 0;
+      const std::vector<u32> pixels = banner.GetBanner(&w, &h);
+      if (!pixels.empty())
+      {
+        const QImage img(reinterpret_cast<const uchar*>(pixels.data()), int(w), int(h),
+                         QImage::Format_ARGB32);
+        e.banner = QPixmap::fromImage(img.copy());
+      }
+      QDirIterator it(data, QDir::Files, QDirIterator::Subdirectories);
+      while (it.hasNext())
+      {
+        it.next();
+        e.bytes += it.fileInfo().size();
+      }
+      m_wii_saves.push_back(std::move(e));
+    }
+  }
+  std::sort(m_wii_saves.begin(), m_wii_saves.end(),
+            [](const WiiSaveEntry& a, const WiiSaveEntry& b) {
+              return a.name.localeAwareCompare(b.name) < 0;
+            });
+  m_ws_index = 0;
+  m_ws_actions = false;
+  m_ws_confirm = false;
+  BeginTransition(0);
+  m_mode = Mode::WiiSaves;
+}
+
+void BigPictureWindow::HandleWiiSaves(Action action)
+{
+  const int count = static_cast<int>(m_wii_saves.size());
+  if (m_ws_actions)
+  {
+    const int items = m_ws_confirm ? 2 : 3;
+    switch (action)
+    {
+    case Action::Up:
+    case Action::Down:
+      m_ws_action = (m_ws_action + (action == Action::Down ? 1 : items - 1)) % items;
+      m_audio->Play(Sound::Move);
+      break;
+    case Action::Back:
+      m_ws_actions = false;
+      m_ws_confirm = false;
+      m_audio->Play(Sound::Back);
+      break;
+    case Action::Accept:
+    {
+      if (count == 0)
+        break;
+      const WiiSaveEntry& e = m_wii_saves[std::clamp(m_ws_index, 0, count - 1)];
+      if (m_ws_confirm)
+      {
+        if (m_ws_action == 0)
+        {
+          // Empty the save folder through the Wii's file system (keeps it consistent)
+          IOS::HLE::Kernel ios;
+          const auto fs = ios.GetFS();
+          const std::string path = fmt::format("/title/{:08x}/{:08x}/data",
+                                               static_cast<u32>(e.title_id >> 32),
+                                               static_cast<u32>(e.title_id));
+          if (const auto entries = fs->ReadDirectory(0, 0, path))
+          {
+            for (const std::string& name : *entries)
+              (void)fs->Delete(0, 0, path + "/" + name);
+          }
+          m_audio->Play(Sound::Erase);
+          Toast(tr("Sauvegarde effacée"));
+          m_ws_actions = false;
+          m_ws_confirm = false;
+          const int keep = m_ws_index;
+          OpenWiiSaves();
+          m_ws_index = std::clamp(keep, 0, std::max(0, int(m_wii_saves.size()) - 1));
+        }
+        else
+        {
+          m_audio->Play(Sound::Cancel);
+          m_ws_actions = false;
+          m_ws_confirm = false;
+        }
+        break;
+      }
+      if (m_ws_action == 0)
+      {
+        const QString out =
+            QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
+                .filePath(QStringLiteral("Sauvegardes Wii"));
+        QDir().mkpath(out);
+        const auto result = WiiSave::Export(e.title_id, out.toStdString());
+        m_audio->Play(result == WiiSave::CopyResult::Success ? Sound::SaveState : Sound::Error);
+        Toast(result == WiiSave::CopyResult::Success ?
+                  tr("Exportée dans Documents › Sauvegardes Wii") :
+                  tr("Export impossible"));
+        m_ws_actions = false;
+      }
+      else if (m_ws_action == 1)
+      {
+        m_ws_confirm = true;
+        m_ws_action = 1;  // "Annuler" selected by default
+        m_audio->Play(Sound::MenuOpen);
+      }
+      else
+      {
+        m_ws_actions = false;
+        m_audio->Play(Sound::Back);
+      }
+      break;
+    }
+    default:
+      break;
+    }
+    return;
+  }
+  switch (action)
+  {
+  case Action::Up:
+  case Action::Down:
+  {
+    const int next = std::clamp(m_ws_index + (action == Action::Down ? 1 : -1), 0,
+                                std::max(0, count - 1));
+    if (next != m_ws_index)
+    {
+      m_ws_index = next;
+      m_audio->Play(Sound::Move);
+    }
+    break;
+  }
+  case Action::Accept:
+    if (count > 0)
+    {
+      m_ws_actions = true;
+      m_ws_action = 0;
+      m_audio->Play(Sound::MenuOpen);
+    }
+    break;
+  case Action::Back:
+  case Action::Menu:
+    m_audio->Play(Sound::Back);
+    BeginTransition(0);
+    m_mode = Mode::Library;
+    break;
+  default:
+    break;
+  }
+}
+
+void BigPictureWindow::DrawWiiSaves(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(80 * k, 170 * k, 1200 * k, 30 * k), Qt::AlignVCenter,
+                   tr("SAUVEGARDES WII · %1").arg(m_wii_saves.size()));
+  if (m_wii_saves.empty())
+  {
+    painter.setFont(Font(true, int(36 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(0, 400 * k, width(), 60 * k), Qt::AlignCenter,
+                     tr("Aucune sauvegarde Wii pour l'instant"));
+    DrawHints(painter, {}, {{QStringLiteral("B"), tr("Retour")}});
+    return;
+  }
+  const qreal row_h = 96 * k, top = 220 * k;
+  const int visible = std::max(1, int((height() - top - 140 * k) / row_h));
+  const int first = std::clamp(m_ws_index - visible / 2, 0,
+                               std::max(0, int(m_wii_saves.size()) - visible));
+  for (int i = first; i < std::min<int>(first + visible, int(m_wii_saves.size())); ++i)
+  {
+    const WiiSaveEntry& e = m_wii_saves[i];
+    const QRectF r(80 * k, top + (i - first) * row_h, width() - 160 * k, row_h - 12 * k);
+    const bool on = i == m_ws_index;
+    painter.setPen(on ? QPen(ACCENT, 3 * k) : QPen(LINE, 1 * k));
+    painter.setBrush(on ? RAISED : SURFACE);
+    painter.drawRoundedRect(r, 18 * k, 18 * k);
+    const QRectF br(r.left() + 14 * k, r.top() + 10 * k, (r.height() - 20 * k) * 3, r.height() - 20 * k);
+    if (!e.banner.isNull())
+      painter.drawPixmap(br, e.banner, QRectF(e.banner.rect()));
+    painter.setFont(Font(false, int(22 * k), 600));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(br.right() + 20 * k, r.top() + 12 * k, r.width() - br.width() - 260 * k,
+                            34 * k),
+                     Qt::AlignVCenter, e.name);
+    painter.setFont(Font(false, int(17 * k), 400));
+    painter.setPen(TEXT_SOFT);
+    painter.drawText(QRectF(br.right() + 20 * k, r.top() + 46 * k, r.width() - br.width() - 260 * k,
+                            28 * k),
+                     Qt::AlignVCenter, e.description);
+    painter.setPen(TEXT_DIM);
+    painter.drawText(QRectF(r.right() - 220 * k, r.top(), 200 * k, r.height()),
+                     Qt::AlignVCenter | Qt::AlignRight,
+                     e.bytes >= 1024 * 1024 ? tr("%1 Mo").arg(e.bytes / (1024.0 * 1024.0), 0, 'f', 1) :
+                                              tr("%1 Ko").arg(std::max<qint64>(1, e.bytes / 1024)));
+  }
+
+  if (m_ws_actions)
+  {
+    const QStringList items = m_ws_confirm ?
+                                  QStringList{tr("Effacer définitivement"), tr("Annuler")} :
+                                  QStringList{tr("Exporter (Documents)"), tr("Effacer"), tr("Annuler")};
+    const qreal w = 520 * k, h = 90 * k + items.size() * 70 * k;
+    const QRectF panel((width() - w) / 2, (height() - h) / 2, w, h);
+    painter.fillRect(rect(), QColor(0, 0, 0, 140));
+    painter.setPen(QPen(LINE, 2 * k));
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(panel, 26 * k, 26 * k);
+    painter.setFont(Font(false, int(20 * k), 600));
+    painter.setPen(ACCENT_SOFT);
+    painter.drawText(QRectF(panel.left(), panel.top() + 20 * k, w, 40 * k), Qt::AlignCenter,
+                     m_wii_saves[m_ws_index].name);
+    for (int i = 0; i < items.size(); ++i)
+    {
+      const QRectF r(panel.left() + 30 * k, panel.top() + 76 * k + i * 70 * k, w - 60 * k, 58 * k);
+      const bool on = i == m_ws_action;
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(on ? ACCENT : RAISED);
+      painter.drawRoundedRect(r, 14 * k, 14 * k);
+      painter.setFont(Font(false, int(22 * k), on ? 600 : 500));
+      painter.setPen(on ? BG : (m_ws_confirm && i == 0 ? DANGER : TEXT));
+      painter.drawText(r, Qt::AlignCenter, items[i]);
+    }
+  }
+  DrawHints(painter, {{QStringLiteral("Control_Stick"), tr("Choisir")}},
+            {{QStringLiteral("A"), tr("Options")}, {QStringLiteral("B"), tr("Retour")}});
+}
+
+void BigPictureWindow::DrawWiiTest(QPainter& painter)
+{
+  using WGr = WiimoteEmu::WiimoteGroup;
+  using NGr = WiimoteEmu::NunchukGroup;
+  using CGr = WiimoteEmu::ClassicGroup;
+  const qreal k = height() / 1080.0;
+  const int port = m_test_port;
+  const int ext = BigPictureWiiExtension(port);
+
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  const auto pressed = [port](int code, int index) {
+    auto* g = BigPictureGroup(port, code);
+    return index < int(g->controls.size()) &&
+           g->controls[index]->control_ref->GetState<ControlState>() > 0.5;
+  };
+  const auto value = [port](int code, int index) {
+    auto* g = BigPictureGroup(port, code);
+    return index < int(g->controls.size()) ?
+               std::clamp<ControlState>(g->controls[index]->control_ref->GetState<ControlState>(),
+                                        0, 1) :
+               0.0;
+  };
+  const auto stick_state = [port](int code) {
+    return static_cast<ControllerEmu::ReshapableInput*>(BigPictureGroup(port, code))
+        ->GetReshapableState(true);
+  };
+
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(0, 90 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("TEST DE LA WIIMOTE — JOUEUR %1").arg(port + 1));
+  painter.setFont(Font(true, int(40 * k), 700));
+  painter.setPen(TEXT);
+  painter.drawText(QRectF(0, 125 * k, width(), 60 * k), Qt::AlignCenter,
+                   ext == 1 ? tr("Wiimote + Nunchuk") :
+                   ext == 2 ? tr("Manette classique") :
+                              tr("Wiimote"));
+
+  const auto button = [&](QPointF c, qreal r, const QString& icon, bool on) {
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(on ? ACCENT : SURFACE_DEEP);
+    painter.drawEllipse(c, r, r);
+    painter.setOpacity(on ? 1.0 : 0.65);
+    DrawIcon(painter, icon, QRectF(c.x() - r * 0.8, c.y() - r * 0.8, r * 1.6, r * 1.6));
+    painter.setOpacity(1.0);
+  };
+  const auto stick = [&](QPointF c, qreal r, const QString& icon, qreal x, qreal y) {
+    QPolygonF oct;
+    for (int i = 0; i < 8; ++i)
+    {
+      const qreal a = i * std::numbers::pi / 4;
+      oct << QPointF(c.x() + std::cos(a) * r, c.y() - std::sin(a) * r);
+    }
+    painter.setPen(QPen(LINE, 2 * k));
+    painter.setBrush(SURFACE_DEEP);
+    painter.drawPolygon(oct);
+    const QPointF p(c.x() + std::clamp<qreal>(x, -1.1, 1.1) * r,
+                    c.y() - std::clamp<qreal>(y, -1.1, 1.1) * r);
+    painter.setPen(QPen(TEXT, 3 * k));
+    painter.drawLine(c, p);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(TEXT);
+    painter.drawEllipse(p, 13 * k, 13 * k);
+    DrawIcon(painter, icon, QRectF(c.x() - r - 56 * k, c.y() + r - 44 * k, 44 * k, 44 * k));
+  };
+  const auto dpad_icon = [&](QPointF c, qreal size, int code) {
+    const bool any = pressed(code, 0) || pressed(code, 1) || pressed(code, 2) || pressed(code, 3);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(any ? ACCENT : SURFACE_DEEP);
+    painter.drawEllipse(c, size * 0.62, size * 0.62);
+    DrawIcon(painter, QStringLiteral("Wii-D-Pad"),
+             QRectF(c.x() - size / 2, c.y() - size / 2, size, size));
+  };
+
+  const QRectF panel(width() / 2.0 - 780 * k, 220 * k, 1560 * k, 660 * k);
+  painter.setPen(QPen(LINE, 2 * k));
+  painter.setBrush(SURFACE);
+  painter.drawRoundedRect(panel, 56 * k, 56 * k);
+
+  if (ext == 2)
+  {
+    // Classic Controller
+    const int b = CGr_code(CGr::Buttons), t = CGr_code(CGr::Triggers);
+    const auto bar = [&](QRectF r, const QString& icon, qreal v, bool click) {
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(SURFACE_DEEP);
+      painter.drawRoundedRect(r, r.height() / 2, r.height() / 2);
+      painter.setBrush(click ? ACCENT_SOFT : ACCENT);
+      painter.drawRoundedRect(QRectF(r.left(), r.top(), r.width() * v, r.height()), r.height() / 2,
+                              r.height() / 2);
+      DrawIcon(painter, icon, QRectF(r.left() - 90 * k, r.center().y() - 22 * k, 80 * k, 44 * k));
+    };
+    bar(QRectF(panel.left() + 170 * k, panel.top() + 50 * k, 380 * k, 30 * k),
+        QStringLiteral("WCC-L"), value(t, 2), pressed(t, 0));
+    bar(QRectF(panel.right() - 550 * k, panel.top() + 50 * k, 380 * k, 30 * k),
+        QStringLiteral("WCC-R"), value(t, 3), pressed(t, 1));
+    button(QPointF(panel.left() + 300 * k, panel.top() + 140 * k), 34 * k, QStringLiteral("WCC-ZL"),
+           pressed(b, 4));
+    button(QPointF(panel.right() - 300 * k, panel.top() + 140 * k), 34 * k,
+           QStringLiteral("WCC-ZR"), pressed(b, 5));
+    dpad_icon(QPointF(panel.left() + 260 * k, panel.top() + 300 * k), 120 * k, CGr_code(CGr::DPad));
+    const QPointF face(panel.right() - 260 * k, panel.top() + 300 * k);
+    button(face + QPointF(72 * k, 0), 40 * k, QStringLiteral("WCC-A"), pressed(b, 0));
+    button(face + QPointF(0, 72 * k), 40 * k, QStringLiteral("WCC-B"), pressed(b, 1));
+    button(face + QPointF(0, -72 * k), 40 * k, QStringLiteral("WCC-X"), pressed(b, 2));
+    button(face + QPointF(-72 * k, 0), 40 * k, QStringLiteral("WCC-Y"), pressed(b, 3));
+    const QPointF mid(panel.center().x(), panel.top() + 300 * k);
+    button(mid + QPointF(-90 * k, 0), 30 * k, QStringLiteral("Wii-Minus"), pressed(b, 6));
+    button(mid, 30 * k, QStringLiteral("Wii-Home"), pressed(b, 8));
+    button(mid + QPointF(90 * k, 0), 30 * k, QStringLiteral("Wii-Plus"), pressed(b, 7));
+    const auto ls = stick_state(CGr_code(CGr::LeftStick));
+    const auto rs = stick_state(CGr_code(CGr::RightStick));
+    stick(QPointF(panel.center().x() - 240 * k, panel.top() + 500 * k), 100 * k,
+          QStringLiteral("Wii-Control_Stick"), ls.x, ls.y);
+    stick(QPointF(panel.center().x() + 240 * k, panel.top() + 500 * k), 100 * k,
+          QStringLiteral("Wii-Control_Stick"), rs.x, rs.y);
+  }
+  else
+  {
+    // Wii Remote, standing, on the left
+    const int b = WGr_code(WGr::Buttons);
+    const QRectF remote(panel.left() + 90 * k, panel.top() + 40 * k, 200 * k, 580 * k);
+    painter.setPen(QPen(LINE, 2 * k));
+    painter.setBrush(SURFACE_DEEP);
+    painter.drawRoundedRect(remote, 90 * k, 90 * k);
+    const qreal cx = remote.center().x();
+    dpad_icon(QPointF(cx, remote.top() + 90 * k), 100 * k, WGr_code(WGr::DPad));
+    button(QPointF(cx, remote.top() + 200 * k), 44 * k, QStringLiteral("Wii-A"), pressed(b, 0));
+    button(QPointF(cx - 60 * k, remote.top() + 300 * k), 24 * k, QStringLiteral("Wii-Minus"),
+           pressed(b, 4));
+    button(QPointF(cx, remote.top() + 300 * k), 24 * k, QStringLiteral("Wii-Home"), pressed(b, 6));
+    button(QPointF(cx + 60 * k, remote.top() + 300 * k), 24 * k, QStringLiteral("Wii-Plus"),
+           pressed(b, 5));
+    button(QPointF(cx, remote.top() + 420 * k), 32 * k, QStringLiteral("Wii-1"), pressed(b, 2));
+    button(QPointF(cx, remote.top() + 500 * k), 32 * k, QStringLiteral("Wii-2"), pressed(b, 3));
+    // B is underneath: shown beside the remote
+    button(QPointF(remote.right() + 60 * k, remote.top() + 200 * k), 34 * k, QStringLiteral("Wii-B"),
+           pressed(b, 1));
+
+    // Pointer
+    const int pt = WGr_code(WGr::Point);
+    const qreal px = value(pt, 3) - value(pt, 2), py = value(pt, 0) - value(pt, 1);
+    const QRectF screen_r(panel.center().x() - 300 * k, panel.top() + 80 * k, 600 * k, 340 * k);
+    painter.setPen(QPen(LINE, 2 * k));
+    painter.setBrush(SURFACE_DEEP);
+    painter.drawRoundedRect(screen_r, 18 * k, 18 * k);
+    const QPointF dot(screen_r.center().x() + px * screen_r.width() / 2.2,
+                      screen_r.center().y() - py * screen_r.height() / 2.2);
+    painter.setPen(QPen(TEXT, 3 * k));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawEllipse(dot, 18 * k, 18 * k);
+    painter.drawLine(dot - QPointF(28 * k, 0), dot + QPointF(28 * k, 0));
+    painter.drawLine(dot - QPointF(0, 28 * k), dot + QPointF(0, 28 * k));
+    painter.setFont(Font(false, int(17 * k), 500));
+    painter.setPen(TEXT_DIM);
+    painter.drawText(QRectF(screen_r.left(), screen_r.bottom() + 10 * k, screen_r.width(), 26 * k),
+                     Qt::AlignCenter, tr("Pointeur"));
+    const bool shake = pressed(WGr_code(WGr::Shake), 0) || pressed(WGr_code(WGr::Shake), 1) ||
+                       pressed(WGr_code(WGr::Shake), 2);
+    painter.setFont(Font(false, int(20 * k), 600));
+    painter.setPen(shake ? ACCENT_SOFT : TEXT_DIM);
+    painter.drawText(QRectF(screen_r.left(), screen_r.bottom() + 60 * k, screen_r.width(), 30 * k),
+                     Qt::AlignCenter, shake ? tr("Secoué !") : tr("Secouer : —"));
+
+    if (ext == 1)
+    {
+      const int nb = NGr_code(NGr::Buttons);
+      const QPointF nc(panel.right() - 260 * k, panel.top() + 330 * k);
+      const auto ns = stick_state(NGr_code(NGr::Stick));
+      stick(nc, 120 * k, QStringLiteral("Wii-Control_Stick"), ns.x, ns.y);
+      button(nc + QPointF(-60 * k, -200 * k), 34 * k, QStringLiteral("Wii-C"), pressed(nb, 0));
+      button(nc + QPointF(60 * k, -200 * k), 34 * k, QStringLiteral("Wii-Z"), pressed(nb, 1));
+    }
+  }
+
+  painter.setFont(Font(false, int(20 * k), 400));
+  painter.setPen(TEXT_SOFT);
+  painter.drawText(QRectF(0, panel.bottom() + 40 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("Maintiens START pour quitter"));
+}
+
+void BigPictureWindow::SyncSaves(bool announce)
+{
+  if (BigPictureSync::Folder().isEmpty())
+  {
+    if (announce)
+      Toast(tr("Choisis d'abord un dossier partagé dans Réglages › Mode manette"));
+    return;
+  }
+  if (!Core::IsUninitialized(Core::System::GetInstance()))
+    return;
+  const int n = BigPictureSync::SyncNow();
+  if (n < 0)
+    Toast(tr("Dossier de synchronisation introuvable"));
+  else if (n > 0)
+    Toast(tr("%1 sauvegarde(s) synchronisée(s)").arg(n));
+  else if (announce)
+    Toast(tr("Sauvegardes déjà à jour"));
+}
+
+// ================================================================== sleep
+
+void BigPictureWindow::OnSystemSuspend()
+{
+  if (!m_active || m_slept_in_game ||
+      !Settings::GetQSettings().value(QStringLiteral("bigpicture/sleep_save"), true).toBool())
+    return;
+  auto& system = Core::System::GetInstance();
+  if (Core::IsUninitialized(system))
+    return;
+  m_slept_in_game = true;
+  // Pause right away (no sound during sleep), and keep a resume point in case of power loss.
+  Core::SetState(system, Core::State::Paused);
+  if (m_running_entry.game)
+    SaveResume();
+}
+
+void BigPictureWindow::OnSystemResume()
+{
+  if (!m_slept_in_game)
+    return;
+  m_slept_in_game = false;
+  if (m_mode == Mode::InGame)
+    QTimer::singleShot(800, this, [this] {
+      if (m_mode == Mode::InGame)
+        OpenPause();
+    });
+}
+
+void BigPictureWindow::TakeSleepInhibitor()
+{
+#ifdef HAVE_BIGPICTURE_DBUS
+  if (m_sleep_fd >= 0)
+    return;
+  // A "delay" lock gives Dolphin a moment to pause and save before the system sleeps.
+  QDBusInterface login(QStringLiteral("org.freedesktop.login1"),
+                       QStringLiteral("/org/freedesktop/login1"),
+                       QStringLiteral("org.freedesktop.login1.Manager"),
+                       QDBusConnection::systemBus());
+  const QDBusReply<QDBusUnixFileDescriptor> reply =
+      login.call(QStringLiteral("Inhibit"), QStringLiteral("sleep"), QStringLiteral("Dolphin"),
+                 QStringLiteral("Sauvegarde du jeu avant la veille"), QStringLiteral("delay"));
+  if (reply.isValid() && reply.value().isValid())
+    m_sleep_fd = ::dup(reply.value().fileDescriptor());
+#endif
+}
+
+void BigPictureWindow::OnPrepareForSleep(bool start)
+{
+  if (start)
+  {
+    OnSystemSuspend();
+#ifdef HAVE_BIGPICTURE_DBUS
+    if (m_sleep_fd >= 0)
+    {
+      ::close(m_sleep_fd);  // done: the system can sleep now
+      m_sleep_fd = -1;
+    }
+#endif
+  }
+  else
+  {
+    TakeSleepInhibitor();
+    OnSystemResume();
+  }
 }

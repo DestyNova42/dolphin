@@ -75,12 +75,19 @@ public:
   // Called by the main window for every emulation state change.
   void OnEmulationStateChanged(Core::State state);
 
+  // The PC / console goes to sleep or wakes up.
+  void OnSystemSuspend();
+  void OnSystemResume();
+
 signals:
   void LaunchRequested(const QString& path, const QString& savestate);
   void ClassicRequested();
   void QuitRequested();
   void StopRequested();    // "Quitter le jeu" in the pause menu
   void ResumeRequested();  // the game gets the focus back
+
+private slots:
+  void OnPrepareForSleep(bool start);  // logind (Linux)
 
 protected:
   void paintEvent(QPaintEvent* event) override;
@@ -125,6 +132,8 @@ private:
     ConfirmUpdate, // an update is available
     ConfirmDriver, // USB driver of Switch 2 controllers
     ChooseDisc,    // multi-disc game: which disc to start
+    WiiTest,       // live view of an emulated Wii Remote
+    WiiSaves,      // Wii save manager
   };
 
   struct SaveIcon
@@ -257,6 +266,15 @@ private:
   void DrawResumeCard(QPainter& painter, const Entry& sel, const QRectF& rect);
   void DrawChooseDisc(QPainter& painter);
   void DrawControllerChips(QPainter& painter, qreal right, qreal cy);
+
+  // ---- Wii
+  void LaunchWiiMenu();
+  bool WiiMenuInstalled() const;
+  void OpenWiiSaves();
+  void HandleWiiSaves(Action action);
+  void DrawWiiSaves(QPainter& painter);
+  void DrawWiiTest(QPainter& painter);
+  void SyncSaves(bool announce);
 
   // ---- USB driver (instead of Zadig)
   void CheckDrivers();
@@ -457,6 +475,25 @@ private:
   QPixmap m_resume_shot;
   int m_choose_disc = 0;
   Entry m_choose_entry;
+
+  // Wii saves
+  struct WiiSaveEntry
+  {
+    u64 title_id = 0;
+    QString name, description, path;
+    QPixmap banner;
+    qint64 bytes = 0;
+  };
+  std::vector<WiiSaveEntry> m_wii_saves;
+  int m_ws_index = 0;
+  bool m_ws_actions = false;
+  int m_ws_action = 0;
+  bool m_ws_confirm = false;
+  qint64 m_home_down_since = -1;
+  bool m_slept_in_game = false;
+  int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
+  void TakeSleepInhibitor();
+  QHash<QString, bool> m_hd_known;
 
   // USB driver
   QStringList m_driver_asked;

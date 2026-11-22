@@ -423,6 +423,15 @@ void MainWindow::LaunchFromBigPicture(const QString& path, const QString& savest
   emit Settings::Instance().CursorVisibilityChanged();
   m_bp_stage->setCursor(Qt::BlankCursor);
 
+  // The Wii Menu (from the controller mode's Start menu)
+  if (path == QStringLiteral("wii-menu:"))
+  {
+    if (Settings::GetQSettings().value(QStringLiteral("bigpicture/auto_hdr"), true).toBool())
+      BigPictureDisplay::MatchHdr(Config::Get(Config::GFX_ENHANCE_HDR_OUTPUT));
+    BootWiiSystemMenu();
+    return;
+  }
+
   // Real GameCube boot animation, when the console's BIOS is there (not when resuming).
   bool use_ipl = false;
   if (savestate.isEmpty() &&

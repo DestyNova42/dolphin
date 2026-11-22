@@ -45,6 +45,8 @@ add_executable(dolphin-emu
   BigPicture/BigPictureDriver.h
   BigPicture/BigPictureSettings.cpp
   BigPicture/BigPictureSettings.h
+  BigPicture/BigPictureSync.cpp
+  BigPicture/BigPictureSync.h
   BigPicture/BigPictureUpdater.cpp
   BigPicture/BigPictureUpdater.h
   BigPicture/BigPictureWindow.cpp
@@ -496,6 +498,15 @@ if(ENABLE_CUBEB)
     target_link_libraries(dolphin-emu PRIVATE cubeb)
   endif()
   target_compile_definitions(dolphin-emu PRIVATE HAVE_BIGPICTURE_CUBEB)
+endif()
+
+# Controller mode: sleep notifications from logind (Linux)
+if(UNIX AND NOT APPLE)
+  find_package(Qt6 QUIET COMPONENTS DBus)
+  if(TARGET Qt6::DBus)
+    target_link_libraries(dolphin-emu PRIVATE Qt6::DBus)
+    target_compile_definitions(dolphin-emu PRIVATE HAVE_BIGPICTURE_DBUS)
+  endif()
 endif()
 
 # Controller mode updates: the CI passes the commit it builds.
