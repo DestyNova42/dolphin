@@ -152,6 +152,9 @@ ControllerEmu::EmulatedController* BigPictureController(int port, int code);
 ControllerEmu::ControlGroup* BigPictureGroup(int port, int code);
 int BigPictureWiiExtension(int port);  // 0 none, 1 Nunchuk, 2 Classic Controller
 // Wii Remote (+ Nunchuk) or Classic Controller on the controller of the same player.
+// Sideways Wii Remote (the Dolphin option of this player)
+bool BigPictureWiiSideways(int port);
+void BigPictureSetWiiSideways(int port, bool sideways);
 bool ApplyWiiProfile(int port, int extension, bool sideways = false);
 std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPictureSettingsHost& host);
 

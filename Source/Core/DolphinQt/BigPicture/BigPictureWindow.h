@@ -497,6 +497,7 @@ private:
   int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
   void TakeSleepInhibitor();
   void QuitGame();
+  void DrawDpadDot(QPainter& painter, QPointF p, qreal r);
   QHash<QString, bool> m_hd_known;
 
   // USB driver

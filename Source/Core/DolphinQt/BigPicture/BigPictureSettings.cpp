@@ -1662,6 +1662,38 @@ constexpr int CG(WiimoteEmu::ClassicGroup g)
 }
 }  // namespace
 
+namespace
+{
+ControllerEmu::NumericSetting<bool>* SidewaysSetting(int port)
+{
+  for (auto& setting :
+       Wiimote::GetWiimoteGroup(port, WiimoteEmu::WiimoteGroup::Options)->numeric_settings)
+  {
+    if (std::string_view(setting->GetININame()) == WiimoteEmu::Wiimote::SIDEWAYS_OPTION)
+      return static_cast<ControllerEmu::NumericSetting<bool>*>(setting.get());
+  }
+  return nullptr;
+}
+}  // namespace
+
+bool BigPictureWiiSideways(int port)
+{
+  const auto* setting = SidewaysSetting(port);
+  return setting && setting->GetValue();
+}
+
+void BigPictureSetWiiSideways(int port, bool sideways)
+{
+  auto* setting = SidewaysSetting(port);
+  if (!setting)
+    return;
+  {
+    const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    setting->SetValue(sideways);
+  }
+  Wiimote::GetConfig()->SaveConfig();
+}
+
 bool ApplyWiiProfile(int port, int extension, bool sideways)
 {
   using WGr = WiimoteEmu::WiimoteGroup;
@@ -1801,11 +1833,8 @@ bool ApplyWiiProfile(int port, int extension, bool sideways)
 
   static_cast<ControllerEmu::Attachments*>(BigPictureGroup(port, WG(WGr::Attachments)))
       ->SetSelectedAttachment(static_cast<u32>(extension));
-  for (auto& setting : BigPictureGroup(port, WG(WGr::Options))->numeric_settings)
-  {
-    if (std::string_view(setting->GetININame()) == WiimoteEmu::Wiimote::SIDEWAYS_OPTION)
-      static_cast<ControllerEmu::NumericSetting<bool>*>(setting.get())->SetValue(sideways);
-  }
+  if (auto* setting = SidewaysSetting(port))
+    setting->SetValue(sideways);
   wm->UpdateReferences(g_controller_interface);
   Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::Emulated);
   Wiimote::GetConfig()->SaveConfig();
@@ -2032,6 +2061,16 @@ std::string TexturePackDir(const std::string& game_id)
   return {};
 }
 
+void SetGameControlsProfile(const std::string& game_id, const char* key, const std::string& name)
+{
+  const std::string game_ini = File::GetUserPath(D_GAMESETTINGS_IDX) + game_id + ".ini";
+  Common::IniFile gini;
+  gini.Load(game_ini);
+  gini.GetOrCreateSection("Controls")->Set(key, name);
+  File::CreateFullPath(game_ini);
+  gini.Save(game_ini);
+}
+
 QStringList ProfileNames(InputConfig* config)
 {
   const QDir dir(QString::fromStdString(config->GetUserProfileDirectoryPath()));
@@ -2170,6 +2209,67 @@ BuildBigPictureGameExtras(const std::shared_ptr<Config::Layer>& layer, const std
           gini.Save(game_ini);
           if (notify)
             notify(Tr("Profil « %1 » associé à ce jeu").arg(name));
+        }));
+    c.items.push_back(Action(
+        Tr("Créer un profil Wiimote avec les réglages actuels"),
+        Tr("Enregistre la Wiimote du joueur 1 (accessoire, orientation, boutons) et l'associe à "
+           "ce jeu."),
+        [game_id, title, notify] {
+          QString name = title;
+          name.remove(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|]")));
+          name = name.left(60).trimmed() + QStringLiteral(" (Wii)");
+          const std::string path = Wiimote::GetConfig()->GetUserProfileDirectoryPath() +
+                                   name.toStdString() + ".ini";
+          File::CreateFullPath(path);
+          Common::IniFile ini;
+          {
+            const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+            Wiimote::GetConfig()->GetController(0)->SaveConfig(ini.GetOrCreateSection("Profile"));
+          }
+          ini.Save(path);
+          SetGameControlsProfile(game_id, "WiimoteProfile1", name.toStdString());
+          if (notify)
+            notify(Tr("Profil « %1 » associé à ce jeu").arg(name));
+        }));
+    c.items.push_back(Action(
+        Tr("Charger un fichier .ini pour la Wiimote"),
+        Tr("Un profil Dolphin (Config/Profiles/Wiimote) ou un WiimoteNew.ini : il est copié dans "
+           "tes profils et associé à ce jeu."),
+        [game_id, notify] {
+          const QString file = QFileDialog::getOpenFileName(
+              nullptr, Tr("Configuration de Wiimote pour ce jeu"), QDir::homePath(),
+              Tr("Configuration Dolphin (*.ini)"));
+          if (file.isEmpty())
+            return;
+          Common::IniFile src;
+          if (!src.Load(file.toStdString()))
+          {
+            if (notify)
+              notify(Tr("Fichier illisible"));
+            return;
+          }
+          // A profile has a [Profile] section; WiimoteNew.ini has [Wiimote1]…[Wiimote4].
+          const Common::IniFile::Section* section = src.GetSection("Profile");
+          if (!section || section->GetValues().empty())
+            section = src.GetSection("Wiimote1");
+          if (!section || section->GetValues().empty())
+          {
+            if (notify)
+              notify(Tr("Ce fichier n'est pas une configuration de Wiimote"));
+            return;
+          }
+          const std::string name = QFileInfo(file).completeBaseName().toStdString();
+          const std::string path =
+              Wiimote::GetConfig()->GetUserProfileDirectoryPath() + name + ".ini";
+          Common::IniFile out;
+          auto* dst = out.GetOrCreateSection("Profile");
+          for (const auto& [key, value] : section->GetValues())
+            dst->Set(key, value);
+          File::CreateFullPath(path);
+          out.Save(path);
+          SetGameControlsProfile(game_id, "WiimoteProfile1", name);
+          if (notify)
+            notify(Tr("« %1 » chargé pour ce jeu").arg(QString::fromStdString(name)));
         }));
     cats.push_back(std::move(c));
   }

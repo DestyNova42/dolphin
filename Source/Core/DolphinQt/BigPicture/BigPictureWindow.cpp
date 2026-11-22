@@ -44,9 +44,11 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QRadialGradient>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QTime>
 #include <QTimer>
+#include <QTransform>
 
 #include "Common/Config/Config.h"
 #include "Common/Config/Layer.h"
@@ -921,6 +923,13 @@ void BigPictureWindow::PollController()
     }
     else
     {
+      // A short press on START turns the Wii Remote (sideways / standing)
+      if (m_mode == Mode::WiiTest && m_test_start_since >= 0 && t - m_test_start_since < 400 &&
+          BigPictureWiiExtension(m_test_port) != 2)
+      {
+        BigPictureSetWiiSideways(m_test_port, !BigPictureWiiSideways(m_test_port));
+        m_audio->Play(Sound::Toggle);
+      }
       m_test_start_since = -1;
     }
     return;
@@ -2104,10 +2113,30 @@ void BigPictureWindow::DrawHints(QPainter& painter,
     return name;
   };
 
+  const auto draw_icon = [&](const QString& name, const QRectF& r) {
+    const QString mapped = icon_name(name);
+    DrawIcon(painter, mapped, r);
+    if (mapped == name || !name.contains(QLatin1Char('-')))
+      return;
+    // "D-Pad-UL", "Control_Stick-R"…: dots on the arms the GameCube icon would highlight
+    const QString dir = name.section(QLatin1Char('-'), -1);
+    if (dir.isEmpty() || dir.size() > 2 || dir == QStringLiteral("Pad") ||
+        dir.contains(QRegularExpression(QStringLiteral("[^UDLR]"))))
+      return;
+    for (const QChar ch : dir)
+    {
+      const QPointF v = ch == QLatin1Char('U') ? QPointF(0, -1) :
+                        ch == QLatin1Char('D') ? QPointF(0, 1) :
+                        ch == QLatin1Char('L') ? QPointF(-1, 0) :
+                                                 QPointF(1, 0);
+      DrawDpadDot(painter, r.center() + v * (r.width() * 0.33), r.width() * 0.1);
+    }
+  };
+
   qreal x = 80 * k;
   for (const auto& [btn, label] : left)
   {
-    DrawIcon(painter, icon_name(btn), QRectF(x, y - icon / 2, icon, icon));
+    draw_icon(btn, QRectF(x, y - icon / 2, icon, icon));
     x += icon + 12 * k;
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x, y - icon / 2, 600 * k, icon), Qt::AlignVCenter, label);
@@ -2121,7 +2150,7 @@ void BigPictureWindow::DrawHints(QPainter& painter,
     painter.setPen(TEXT_SOFT);
     painter.drawText(QRectF(x - tw, y - icon / 2, tw + 2, icon), Qt::AlignVCenter, it->second);
     x -= tw + 10 * k + icon;
-    DrawIcon(painter, icon_name(it->first), QRectF(x, y - icon / 2, icon, icon));
+    draw_icon(it->first, QRectF(x, y - icon / 2, icon, icon));
     x -= 36 * k;
   }
 }
@@ -5116,10 +5145,11 @@ void BigPictureWindow::DrawPadTest(QPainter& painter)
                     c.y() - std::clamp<qreal>(y, -1.15, 1.15) * r);
     painter.setPen(QPen(col, 3 * k));
     painter.drawLine(c, p);
+    // The stick's own icon is the knob
     painter.setPen(Qt::NoPen);
-    painter.setBrush(col);
-    painter.drawEllipse(p, 15 * k, 15 * k);
-    DrawIcon(painter, icon, QRectF(c.x() - r - 70 * k, c.y() + r - 52 * k, 52 * k, 52 * k));
+    painter.setBrush(QColor(0, 0, 0, 90));
+    painter.drawEllipse(p + QPointF(0, 4 * k), 30 * k, 30 * k);
+    DrawIcon(painter, icon, QRectF(p.x() - 32 * k, p.y() - 32 * k, 64 * k, 64 * k));
     painter.setFont(Font(false, int(16 * k), 500));
     painter.setPen(TEXT_DIM);
     painter.drawText(QRectF(c.x() - r, c.y() + r + 8 * k, 2 * r, 24 * k), Qt::AlignCenter,
@@ -6206,31 +6236,28 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     painter.setPen(QPen(TEXT, 3 * k));
     painter.drawLine(c, p);
     painter.setPen(Qt::NoPen);
-    painter.setBrush(TEXT);
-    painter.drawEllipse(p, 13 * k, 13 * k);
-    DrawIcon(painter, icon, QRectF(c.x() - r - 56 * k, c.y() + r - 44 * k, 44 * k, 44 * k));
+    painter.setBrush(QColor(0, 0, 0, 90));
+    painter.drawEllipse(p + QPointF(0, 4 * k), 26 * k, 26 * k);
+    DrawIcon(painter, icon, QRectF(p.x() - 28 * k, p.y() - 28 * k, 56 * k, 56 * k));
   };
   const auto dpad_icon = [&](QPointF c, qreal size, int code) {
-    // Up, Down, Left, Right
-    const qreal dx = (pressed(code, 3) ? 1 : 0) - (pressed(code, 2) ? 1 : 0);
-    const qreal dy = (pressed(code, 1) ? 1 : 0) - (pressed(code, 0) ? 1 : 0);
     const bool any = pressed(code, 0) || pressed(code, 1) || pressed(code, 2) || pressed(code, 3);
     painter.setPen(Qt::NoPen);
     painter.setBrush(any ? ACCENT : SURFACE_DEEP);
     painter.drawEllipse(c, size * 0.62, size * 0.62);
     DrawIcon(painter, QStringLiteral("Wii-D-Pad"),
              QRectF(c.x() - size / 2, c.y() - size / 2, size, size));
-    if (dx != 0 || dy != 0)
+    // Up, Down, Left, Right are screen directions: on a sideways remote they land on the arm
+    // that really points that way.
+    const QTransform inv = painter.worldTransform().inverted();
+    const QPointF origin = inv.map(QPointF(0, 0));
+    const QPointF dirs[] = {{0, -1}, {0, 1}, {-1, 0}, {1, 0}};
+    for (int d = 0; d < 4; ++d)
     {
-      // A glowing dot on the pressed arm(s), like the GameCube D-pad icons
-      const QPointF p(c.x() + dx * size * 0.33, c.y() + dy * size * 0.33);
-      QRadialGradient glow(p, size * 0.2);
-      glow.setColorAt(0, QColor(255, 255, 255, 220));
-      glow.setColorAt(1, QColor(255, 255, 255, 0));
-      painter.setBrush(glow);
-      painter.drawEllipse(p, size * 0.2, size * 0.2);
-      painter.setBrush(ACCENT_SOFT);
-      painter.drawEllipse(p, size * 0.08, size * 0.08);
+      if (!pressed(code, d))
+        continue;
+      const QPointF v = inv.map(dirs[d]) - origin;
+      DrawDpadDot(painter, c + v * (size * 0.34), size * 0.11);
     }
   };
 
@@ -6279,8 +6306,16 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
   }
   else
   {
-    // Wii Remote, standing, on the left
+    // Wii Remote: standing on the left, or lying sideways in the middle (D-pad on the left)
     const int b = WGr_code(WGr::Buttons);
+    const bool sideways = BigPictureWiiSideways(port);
+    painter.save();
+    if (sideways)
+    {
+      painter.translate(panel.center().x(), panel.top() + 250 * k);
+      painter.rotate(-90);
+      painter.translate(-(panel.left() + 190 * k), -(panel.top() + 330 * k));
+    }
     const QRectF remote(panel.left() + 90 * k, panel.top() + 40 * k, 200 * k, 580 * k);
     painter.setPen(QPen(LINE, 2 * k));
     painter.setBrush(SURFACE_DEEP);
@@ -6298,7 +6333,34 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     // B is underneath: shown beside the remote
     button(QPointF(remote.right() + 60 * k, remote.top() + 200 * k), 34 * k, QStringLiteral("Wii-B"),
            pressed(b, 1));
+    painter.restore();
 
+    if (sideways)
+    {
+      // Tilt (steering), the way sideways games use it
+      const int tl = WGr_code(WGr::Tilt);
+      const qreal tilt = value(tl, 3) - value(tl, 2);
+      const QRectF bar(panel.center().x() - 300 * k, panel.top() + 470 * k, 600 * k, 22 * k);
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(SURFACE_DEEP);
+      painter.drawRoundedRect(bar, 11 * k, 11 * k);
+      painter.setBrush(ACCENT);
+      const qreal half = bar.width() / 2;
+      painter.drawRoundedRect(QRectF(bar.center().x() + std::min<qreal>(0, tilt) * half, bar.top(),
+                                     std::abs(tilt) * half, bar.height()),
+                              11 * k, 11 * k);
+      painter.setBrush(TEXT);
+      painter.drawEllipse(QPointF(bar.center().x() + tilt * half, bar.center().y()), 16 * k, 16 * k);
+      const bool shake_s = pressed(WGr_code(WGr::Shake), 0) || pressed(WGr_code(WGr::Shake), 1) ||
+                           pressed(WGr_code(WGr::Shake), 2);
+      painter.setFont(Font(false, int(20 * k), 600));
+      painter.setPen(shake_s ? ACCENT_SOFT : TEXT_DIM);
+      painter.drawText(QRectF(bar.left(), bar.bottom() + 18 * k, bar.width(), 30 * k),
+                       Qt::AlignCenter,
+                       shake_s ? tr("Secoué !") : tr("Inclinaison  ·  Secouer : —"));
+    }
+    else
+    {
     // Pointer
     const int pt = WGr_code(WGr::Point);
     const qreal px = value(pt, 3) - value(pt, 2), py = value(pt, 0) - value(pt, 1);
@@ -6323,6 +6385,7 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
     painter.setPen(shake ? ACCENT_SOFT : TEXT_DIM);
     painter.drawText(QRectF(screen_r.left(), screen_r.bottom() + 60 * k, screen_r.width(), 30 * k),
                      Qt::AlignCenter, shake ? tr("Secoué !") : tr("Secouer : —"));
+    }
 
     if (ext == 1)
     {
@@ -6338,7 +6401,22 @@ void BigPictureWindow::DrawWiiTest(QPainter& painter)
   painter.setFont(Font(false, int(20 * k), 400));
   painter.setPen(TEXT_SOFT);
   painter.drawText(QRectF(0, panel.bottom() + 40 * k, width(), 30 * k), Qt::AlignCenter,
-                   tr("Maintiens START pour quitter"));
+                   ext == 2 ? tr("Maintiens START pour quitter") :
+                              tr("START : tourner la Wiimote  ·  Maintiens START pour quitter"));
+}
+
+void BigPictureWindow::DrawDpadDot(QPainter& painter, QPointF p, qreal r)
+{
+  // Bright yellow with a dark ring: readable on the white cross and on the accent colour
+  QRadialGradient glow(p, r * 2.4);
+  glow.setColorAt(0, QColor(255, 214, 40, 200));
+  glow.setColorAt(1, QColor(255, 214, 40, 0));
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(glow);
+  painter.drawEllipse(p, r * 2.4, r * 2.4);
+  painter.setPen(QPen(QColor(20, 16, 36), std::max<qreal>(1.5, r * 0.35)));
+  painter.setBrush(QColor(255, 214, 40));
+  painter.drawEllipse(p, r, r);
 }
 
 void BigPictureWindow::SyncSaves(bool announce)
