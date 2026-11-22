@@ -11,6 +11,7 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QProcess>
 #include <QFile>
 #include <QSettings>
 #include <QStandardPaths>
@@ -342,9 +343,39 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
           [notify] {
             const QString desktop =
                 QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
+#ifdef _WIN32
             const QString link = QDir(desktop).filePath(QStringLiteral("Dolphin (mode manette).lnk"));
             QFile::remove(link);
             const bool ok = QFile::link(QCoreApplication::applicationFilePath(), link);
+#else
+            // Linux: a .desktop launcher (on the desktop and in the applications menu, where
+            // Steam's "Add a non-Steam game" finds it).
+            const QString appimage = qEnvironmentVariable("APPIMAGE");
+            const QString exe =
+                appimage.isEmpty() ? QCoreApplication::applicationFilePath() : appimage;
+            const QString entry = QStringLiteral("[Desktop Entry]\nType=Application\n"
+                                                 "Name=Dolphin (mode manette)\n"
+                                                 "Exec=\"%1\"\nIcon=dolphin-emu\n"
+                                                 "Categories=Game;Emulator;\nTerminal=false\n")
+                                      .arg(exe);
+            bool ok = false;
+            const QString apps =
+                QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation);
+            for (const QString& dir : {desktop, apps})
+            {
+              if (dir.isEmpty())
+                continue;
+              QDir().mkpath(dir);
+              QFile f(QDir(dir).filePath(QStringLiteral("dolphin-manette.desktop")));
+              if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+              {
+                f.write(entry.toUtf8());
+                f.close();
+                f.setPermissions(f.permissions() | QFileDevice::ExeOwner | QFileDevice::ExeUser);
+                ok = true;
+              }
+            }
+#endif
             Settings::GetQSettings().setValue(QStringLiteral("bigpicture/onstart"), true);
             if (notify)
               notify(ok ? Tr("Raccourci créé sur le Bureau") : Tr("Impossible de créer le raccourci"));
@@ -779,6 +810,37 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Action(Tr("Assistant bouton par bouton"),
                              Tr("Pour les manettes peu courantes."),
                              [configure, port] { configure(*port); }));
+#ifdef __linux__
+    {
+      const auto notify = host.notify;
+      c.items.push_back(Action(
+          Tr("Autoriser les manettes Nintendo en USB"),
+          Tr("Une seule fois : manette GameCube Switch 2, adaptateur GameCube Wii U / Switch. "
+             "Le système demande ton mot de passe."),
+          [notify] {
+            const QString rules = QStringLiteral(
+                "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"057e\", ATTRS{idProduct}==\"0337\", MODE=\"0666\"\n"
+                "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"057e\", ATTRS{idProduct}==\"20[67][0-9a-f]\", MODE=\"0666\"\n"
+                "KERNEL==\"hidraw*\", ATTRS{idVendor}==\"057e\", ATTRS{idProduct}==\"20[67][0-9a-f]\", MODE=\"0666\"\n"
+                "KERNEL==\"hidraw*\", ATTRS{idVendor}==\"057e\", ATTRS{idProduct}==\"0337\", MODE=\"0666\"\n");
+            QProcess p;
+            p.start(QStringLiteral("pkexec"),
+                    {QStringLiteral("sh"), QStringLiteral("-c"),
+                     QStringLiteral("cat > /etc/udev/rules.d/51-dolphin-manette.rules && "
+                                    "udevadm control --reload-rules && udevadm trigger")});
+            p.waitForStarted();
+            p.write(rules.toUtf8());
+            p.closeWriteChannel();
+            p.waitForFinished(120000);
+            const bool ok = p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0;
+            if (ok)
+              g_controller_interface.RefreshDevices();
+            if (notify)
+              notify(ok ? Tr("Manettes autorisées : rebranche-les") : Tr("Autorisation refusée"));
+          }));
+    }
+#endif
+#ifdef _WIN32
     {
       const auto install = host.install_drivers;
       c.items.push_back(Action(Tr("Pilote USB des manettes Switch 2"),
@@ -786,6 +848,7 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                   "USB (remplace Zadig). Windows demande une confirmation."),
                                [install] { install(); }));
     }
+#endif
     {
       const auto notify = host.notify;
       Item bt = Action(

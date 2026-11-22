@@ -1,0 +1,102 @@
+name: Build Linux AppImage (mode manette)
+
+# SteamOS / Bazzite / any recent Linux: one AppImage, updated from the controller mode.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build cmake pkg-config gettext file libfuse2t64 \
+            libxi-dev libxrandr-dev libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libudev-dev libevdev-dev libsystemd-dev libbluetooth-dev libusb-1.0-0-dev \
+            libasound2-dev libpulse-dev libgl1-mesa-dev libegl1-mesa-dev libdrm-dev libgbm-dev \
+            libwayland-dev libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          -DENABLE_TESTS=OFF -DENABLE_AUTOUPDATE=OFF -DENABLE_ANALYTICS=OFF
+          -DENABLE_LLVM=OFF -DENCODE_FRAMEDUMPS=OFF -DENABLE_NOGUI=OFF -DENABLE_CLI_TOOL=OFF
+          -DBP_BUILD_ID=${{ github.sha }}
+
+      - name: Build
+        run: cmake --build build --target dolphin-emu -- -k 0
+
+      - name: AppImage
+        run: |
+          set -e
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/scalable/apps
+          cp build/Binaries/dolphin-emu AppDir/usr/bin/
+          cp -r Data/Sys AppDir/usr/bin/Sys
+          cp Data/dolphin-emu.svg AppDir/usr/share/icons/hicolor/scalable/apps/dolphin-emu.svg
+          cat > AppDir/usr/share/applications/dolphin-manette.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Dolphin (mode manette)
+          GenericName=GameCube Emulator
+          Exec=dolphin-emu
+          Icon=dolphin-emu
+          Terminal=false
+          Categories=Game;Emulator;
+          DESKTOP
+          sed -i 's/^ *//' AppDir/usr/share/applications/dolphin-manette.desktop
+          curl -fsSL -o linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o linuxdeploy-plugin-qt https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy linuxdeploy-plugin-qt
+          mv linuxdeploy-plugin-qt linuxdeploy-plugin-qt-x86_64.AppImage
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export LD_LIBRARY_PATH="$QT_ROOT_DIR/lib:$LD_LIBRARY_PATH"
+          export OUTPUT=Dolphin-Manette-x86_64.AppImage
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          ./linuxdeploy --appdir AppDir --plugin qt \
+            --desktop-file AppDir/usr/share/applications/dolphin-manette.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/dolphin-emu.svg \
+            --output appimage
+          ls -la *.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-Manette-Linux
+          path: Dolphin-Manette-x86_64.AppImage
+
+      - name: Publish release
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete manette-linux-latest --yes --cleanup-tag || true
+          gh release create manette-linux-latest Dolphin-Manette-x86_64.AppImage \
+            --target "${{ github.sha }}" --title "${{ github.sha }}" --latest=false \
+            --notes "Dolphin mode manette (Linux, SteamOS, Bazzite) - build ${{ github.sha }}"

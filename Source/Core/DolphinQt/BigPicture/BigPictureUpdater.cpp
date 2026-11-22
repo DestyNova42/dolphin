@@ -19,6 +19,8 @@
 #include <QProcess>
 #include <QStandardPaths>
 
+#include <cstdio>
+
 #include "Common/HttpRequest.h"
 
 #ifndef BP_BUILD_ID
@@ -27,9 +29,15 @@
 
 namespace
 {
+#ifdef _WIN32
 constexpr char RELEASE_API[] =
     "https://api.github.com/repos/DestyNova42/dolphin/releases/tags/manette-latest";
 constexpr char ASSET_NAME[] = "Dolphin-Manette-Windows.zip";
+#else
+constexpr char RELEASE_API[] =
+    "https://api.github.com/repos/DestyNova42/dolphin/releases/tags/manette-linux-latest";
+constexpr char ASSET_NAME[] = "Dolphin-Manette-x86_64.AppImage";
+#endif
 
 template <typename F>
 void Post(QObject* context, F&& fn)
@@ -98,7 +106,21 @@ void Install(QObject* context, const QString& url, std::function<void(bool, cons
     const auto response =
         request.Get(url.toStdString(), {{"User-Agent", "Dolphin-Manette"}});
     const QString temp = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+#ifdef _WIN32
     const QString zip = QDir(temp).filePath(QStringLiteral("Dolphin-Manette-update.zip"));
+#else
+    // Linux: the new AppImage is written next to the running one, then replaces it.
+    const QString appimage = qEnvironmentVariable("APPIMAGE");
+    const QString zip = appimage.isEmpty() ? QString() : appimage + QStringLiteral(".new");
+    if (zip.isEmpty())
+    {
+      Post(context, [on_ready] {
+        on_ready(false, QCoreApplication::translate("BigPicture",
+                                                    "Mise à jour possible seulement avec l'AppImage"));
+      });
+      return;
+    }
+#endif
     bool ok = false;
     QString error;
     if (!response || response->empty())
@@ -122,6 +144,27 @@ void Install(QObject* context, const QString& url, std::function<void(bool, cons
         on_ready(false, error);
         return;
       }
+#ifndef _WIN32
+      {
+        const QString target = qEnvironmentVariable("APPIMAGE");
+        QFile::setPermissions(zip, QFile::permissions(zip) | QFileDevice::ExeOwner |
+                                       QFileDevice::ExeUser | QFileDevice::ExeGroup |
+                                       QFileDevice::ExeOther);
+        // Replacing a running AppImage is fine on Linux: it keeps running from the old file.
+        const bool replaced = ::rename(zip.toLocal8Bit().constData(),
+                                       target.toLocal8Bit().constData()) == 0;
+        if (replaced)
+        {
+          QProcess::startDetached(QStringLiteral("sh"),
+                                  {QStringLiteral("-c"),
+                                   QStringLiteral("sleep 2; exec \"$0\""), target});
+        }
+        on_ready(replaced, replaced ? QString() :
+                                      QCoreApplication::translate("BigPicture",
+                                                                  "Remplacement impossible"));
+        return;
+      }
+#endif
       // Script run after Dolphin quits: unpack over the installation, then restart.
       const QString script = QDir(temp).filePath(QStringLiteral("Dolphin-Manette-update.ps1"));
       QFile ps1(script);
