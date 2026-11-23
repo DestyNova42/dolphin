@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <string>
 #include <utility>
 
@@ -280,6 +283,138 @@ void SaveBigPictureSettings()
 }
 
 // ---------------------------------------------------------------- the list
+
+// The settings are built by origin, then shown grouped by what the player looks for.
+// {category, label}: one item; {category, "*"}: what is left of that category.
+static std::vector<BigPictureSettingCategory> Regroup(std::vector<BigPictureSettingCategory> cats)
+{
+  struct Pick
+  {
+    const char* from;
+    const char* label;
+    const char* rename = nullptr;
+  };
+  struct Group
+  {
+    const char* name;
+    std::vector<Pick> picks;
+  };
+  const std::vector<Group> groups = {
+      {"Interface",
+       {{"Mode manette", "Affichage des jeux"},
+        {"Mode manette", "Trier les jeux"},
+        {"Mode manette", "Thème de couleur"},
+        {"Mode manette", "Icônes des boutons"},
+        {"Mode manette", "Inverser A/B et X/Y dans les menus"},
+        {"Mode manette", "Transitions"},
+        {"Mode manette", "Animation de démarrage"},
+        {"Mode manette", "Style de l'animation"},
+        {"Mode manette", "Musique du menu"},
+        {"Mode manette", "Démarrer Dolphin en mode manette"}}},
+      {"Bibliothèque",
+       {{"Mode manette", "Reprendre"},
+        {"Mode manette", "Synchroniser les sauvegardes"},
+        {"Mode manette", "Synchroniser maintenant"},
+        {"GameCube", "Gestionnaire des cartes mémoire"},
+        {"Mode manette", "Télécharger les jaquettes"},
+        {"Mode manette", "Rafraîchir la bibliothèque"},
+        {"Général", "Suivi du temps de jeu"},
+        {"Général", "Codes de triche"},
+        {"Général", "Changement de disque automatique"}}},
+      {"Manettes",
+       {{"Manettes", "*"},
+        {"Mode manette", "Bouton du menu en jeu"},
+        {"Mode manette", "Manettes Switch d'autres marques"},
+        {"Mode manette", "Diagnostic des manettes"}}},
+      {"Manettes Wii", {{"Manettes Wii", "*"}}},
+      {"Graphismes", {{"Mode manette", "Préréglage d'affichage"}, {"Graphismes", "*"}}},
+      {"Améliorations", {{"Améliorations", "*"}}},
+      {"Son", {{"Son", "*"}}},
+      {"GameCube et Wii",
+       {{"GameCube", "Langue du système", "GameCube : langue"},
+        {"GameCube", "*"},
+        {"Wii", "Langue", "Wii : langue"},
+        {"Wii", "*"}}},
+      {"Système",
+       {{"Général", "*"},
+        {"Mode manette", "Mise en veille propre"},
+        {"Mode manette", "Rechercher les mises à jour au démarrage"},
+        {"Mode manette", "Rechercher une mise à jour"},
+        {"Avancé", "Interface classique"}}},
+      {"Avancé", {{"Général", "Double cœur"}, {"Avancé", "*"}}},
+      {"Hacks graphiques", {{"Hacks graphiques", "*"}}},
+  };
+
+  // Every item, still in place; taken ones become empty
+  std::map<QString, std::vector<std::optional<BigPictureSettingItem>>> pool;
+  std::vector<QString> order;
+  for (auto& c : cats)
+  {
+    order.push_back(c.name);
+    auto& v = pool[c.name];
+    for (auto& item : c.items)
+      v.emplace_back(std::move(item));
+  }
+  // Explicit picks first, so a "*" never takes an item that goes elsewhere
+  std::vector<std::vector<std::vector<BigPictureSettingItem>>> placed(groups.size());
+  for (size_t g = 0; g < groups.size(); ++g)
+  {
+    placed[g].resize(groups[g].picks.size());
+    for (size_t i = 0; i < groups[g].picks.size(); ++i)
+    {
+      const Pick& pick = groups[g].picks[i];
+      if (std::string_view(pick.label) == "*")
+        continue;
+      for (auto& item : pool[Tr(pick.from)])
+      {
+        if (item && item->label == Tr(pick.label))
+        {
+          if (pick.rename)
+            item->label = Tr(pick.rename);
+          placed[g][i].push_back(std::move(*item));
+          item.reset();
+          break;
+        }
+      }
+    }
+  }
+  for (size_t g = 0; g < groups.size(); ++g)
+  {
+    for (size_t i = 0; i < groups[g].picks.size(); ++i)
+    {
+      if (std::string_view(groups[g].picks[i].label) != "*")
+        continue;
+      for (auto& item : pool[Tr(groups[g].picks[i].from)])
+      {
+        if (item)
+        {
+          placed[g][i].push_back(std::move(*item));
+          item.reset();
+        }
+      }
+    }
+  }
+  std::vector<BigPictureSettingCategory> out;
+  for (size_t g = 0; g < groups.size(); ++g)
+  {
+    BigPictureSettingCategory c{Tr(groups[g].name), {}};
+    for (auto& slot : placed[g])
+      for (auto& item : slot)
+        c.items.push_back(std::move(item));
+    out.push_back(std::move(c));
+  }
+  // Anything not placed (a new setting): back in "Système", never lost
+  for (const QString& name : order)
+  {
+    for (auto& item : pool[name])
+    {
+      if (item)
+        out[8].items.push_back(std::move(*item));
+    }
+  }
+  std::erase_if(out, [](const BigPictureSettingCategory& c) { return c.items.empty(); });
+  return out;
+}
 
 std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureSettingsHost& host)
 {
@@ -572,8 +707,8 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
           Tr("Préréglage : Fidélité"),
           Tr("Privilégie la justesse de l'émulation à la vitesse : simple cœur, accès CPU à "
              "l'EFB, copies EFB/XFB vers la RAM, cache de textures sûr, bounding box. Plus "
-             "lent ; corrige des effets manquants dans certains jeux. Le préréglage "
-             "d'affichage du mode manette doit être Désactivé pour le garder en jeu."),
+             "lent ; corrige des effets manquants dans certains jeux. Le « Préréglage "
+             "d'affichage » juste au-dessus doit être sur Désactivé pour le garder en jeu."),
           [done] {
             Config::SetBase(Config::MAIN_CPU_THREAD, false);
             Config::SetBase(Config::MAIN_SYNC_GPU, false);
@@ -1288,7 +1423,7 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     cats.push_back(std::move(c));
   }
 
-  return cats;
+  return Regroup(std::move(cats));
 }
 
 // ---------------------------------------------------------------- standard gamepad profile

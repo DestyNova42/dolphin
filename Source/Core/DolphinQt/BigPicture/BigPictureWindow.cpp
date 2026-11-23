@@ -1993,7 +1993,12 @@ void BigPictureWindow::HandlePause(Action action)
       BeginTransition(1);
       m_pause_settings = true;
       m_quick = false;
-      m_settings_cat = 2;  // Graphics
+      m_settings_cat = 0;
+      for (size_t i = 0; i < m_settings.size(); ++i)
+      {
+        if (m_settings[i].name == tr("Graphismes"))
+          m_settings_cat = static_cast<int>(i);
+      }
       m_settings_in_items = false;
       break;
     case PAUSE_DISC:
@@ -2325,17 +2330,7 @@ QString WiiIconName(const QString& name)
 
 void BigPictureWindow::DrawIcon(QPainter& painter, const QString& name_in, const QRectF& rect)
 {
-  // A/B and X/Y swapped in the menus: the hints show the button that really does it
-  QString name = name_in;
-  if (m_swap_menu_buttons && m_mode != Mode::PadTest && m_mode != Mode::WiiTest &&
-      m_mode != Mode::Remap && m_mode != Mode::Calibrate && m_mode != Mode::Setup &&
-      m_mode != Mode::DeviceDiag)
-  {
-    static const QHash<QString, QString> swapped = {
-        {QStringLiteral("A"), QStringLiteral("B")}, {QStringLiteral("B"), QStringLiteral("A")},
-        {QStringLiteral("X"), QStringLiteral("Y")}, {QStringLiteral("Y"), QStringLiteral("X")}};
-    name = swapped.value(name, name);
-  }
+  const QString& name = name_in;
   // Icon style chosen in the settings (the testers and the remap keep the real buttons)
   if (m_wii_icons && m_mode != Mode::PadTest && m_mode != Mode::WiiTest &&
       m_mode != Mode::Remap && m_mode != Mode::Calibrate && m_mode != Mode::Setup)
