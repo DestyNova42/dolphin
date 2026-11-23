@@ -312,6 +312,43 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
         {Tr("Automatique"), Tr("Guide / Home"), Tr("Select (View)"), Tr("Les deux sticks (L3 + R3)"),
          Tr("START + Z")},
         0, {}));
+    {
+      // Third-party "Pro Controllers" (8BitDo…): how SDL reads them. For GameCube and Wii alike.
+      static const Config::Info<std::string> HIDAPI_SWITCH{
+          {Config::System::Main, "SDL_Hints", "SDL_JOYSTICK_HIDAPI_SWITCH"}, ""};
+      const auto mode = [] {
+        if (Config::Get(HIDAPI_SWITCH) == "0")
+          return 2;
+        return Config::Get(Config::MAIN_SDL_HINT_JOYSTICK_ENHANCED_REPORTS) == "0" ? 1 : 0;
+      };
+      const auto names = std::make_shared<std::vector<QString>>(std::vector<QString>{
+          Tr("Normal"), Tr("Rapports simples"), Tr("Manette standard")});
+      Item item;
+      item.label = Tr("Manettes Switch d'autres marques");
+      item.help = Tr("Pour une manette vue comme « Nintendo Switch Pro Controller » (8BitDo…) "
+                     "qui ne répond pas ou se comporte bizarrement. Rapports simples : la "
+                     "manette envoie ses boutons sans le gyroscope. Manette standard : lue "
+                     "comme une manette ordinaire. Redémarre Dolphin après un changement.");
+      item.kind = Item::Kind::Choice;
+      item.value = [mode, names] { return (*names)[mode()]; };
+      item.change = [mode, notify = host.notify](int dir) {
+        const int m = (mode() + 3 + (dir < 0 ? -1 : 1)) % 3;
+        Config::SetBase(HIDAPI_SWITCH, m == 2 ? "0" : "1");
+        Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_ENHANCED_REPORTS, m == 1 ? "0" : "1");
+        Config::Save();
+        if (notify)
+          notify(Tr("Redémarre Dolphin pour appliquer"));
+      };
+      item.activate = [change = item.change] { change(1); };
+      c.items.push_back(std::move(item));
+    }
+    {
+      const auto diag = host.device_diagnostic;
+      c.items.push_back(Action(Tr("Diagnostic des manettes"),
+                               Tr("Chaque bouton et axe de chaque manette, en direct, tel que "
+                                  "Dolphin le reçoit."),
+                               [diag] { diag(); }));
+    }
     c.items.push_back(PrefChoice(Tr("Icônes des boutons"),
                                  Tr("Les boutons affichés en bas de l'écran."),
                                  QStringLiteral("bigpicture/icons"),
@@ -869,28 +906,6 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  Tr("La dernière manette utilisée devient celle du joueur 1, avec "
                                     "ses propres réglages."),
                                  QStringLiteral("bigpicture/autoswitch"), true, {}));
-    {
-      // Third-party "Pro Controllers" (8BitDo…) that SDL's Switch driver can't talk to
-      static const Config::Info<std::string> HIDAPI_SWITCH{
-          {Config::System::Main, "SDL_Hints", "SDL_JOYSTICK_HIDAPI_SWITCH"}, ""};
-      Item item;
-      item.label = Tr("Manettes Switch d'autres marques");
-      item.help = Tr("Pour une manette vue comme « Nintendo Switch Pro Controller » qui ne "
-                     "répond pas (8BitDo…) : Dolphin la lit alors comme une manette standard. "
-                     "Redémarre Dolphin après le changement. Les vraies manettes Pro perdent "
-                     "le gyroscope.");
-      item.kind = Item::Kind::Toggle;
-      item.is_on = [] { return Config::Get(HIDAPI_SWITCH) == "0"; };
-      item.change = [notify = host.notify](int) {
-        const bool on = Config::Get(HIDAPI_SWITCH) == "0";
-        Config::SetBase(HIDAPI_SWITCH, on ? "1" : "0");
-        Config::Save();
-        if (notify)
-          notify(Tr("Redémarre Dolphin pour appliquer"));
-      };
-      item.activate = [change = item.change] { change(1); };
-      c.items.push_back(std::move(item));
-    }
     {
       const auto test = host.test_controller;
       c.items.push_back(Action(Tr("Tester la manette"),

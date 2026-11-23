@@ -154,6 +154,7 @@ private:
     ChooseDisc,    // multi-disc game: which disc to start
     WiiTest,       // live view of an emulated Wii Remote
     WiiSaves,      // Wii save manager
+    DeviceDiag,    // raw inputs of every controller
   };
 
   struct SaveIcon
@@ -520,6 +521,8 @@ private:
   int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
   void TakeSleepInhibitor();
   void QuitGame();
+  void DrawDeviceDiag(QPainter& painter);
+  int m_diag_index = 0;
   // Mouse: clickable areas, rebuilt with each frame
   struct Hit
   {

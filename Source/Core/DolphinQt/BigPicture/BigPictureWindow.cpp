@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <set>
 #include <cctype>
 #include <functional>
 #include <chrono>
@@ -516,6 +517,15 @@ BigPictureWindow::BigPictureWindow(const GameListModel& model, QWidget* parent)
       m_mode = Mode::PadTest;
     });
   };
+  host.device_diagnostic = [this] {
+    QTimer::singleShot(0, this, [this] {
+      m_test_port = 0;
+      m_test_start_since = -1;
+      m_mode_before_players = m_mode;
+      BeginTransition(0);
+      m_mode = Mode::DeviceDiag;
+    });
+  };
   host.configure_wiimote = [this](int port) {
     QTimer::singleShot(0, this, [this, port] { StartWiiSetup(port); });
   };
@@ -985,7 +995,7 @@ void BigPictureWindow::PollController()
   if (m_mode == Mode::Setup || m_mode == Mode::InGame || m_mode == Mode::Remap ||
       m_mode == Mode::Launching || m_mode == Mode::FadingOut || m_mode == Mode::Closing)
     return;
-  if (m_mode == Mode::PadTest || m_mode == Mode::WiiTest)
+  if (m_mode == Mode::PadTest || m_mode == Mode::WiiTest || m_mode == Mode::DeviceDiag)
   {
     // Every button is being tested: hold START for one second to leave.
     const GCPadStatus st = Pad::GetStatus(m_test_port);
@@ -1195,7 +1205,13 @@ void BigPictureWindow::keyPressEvent(QKeyEvent* event)
       FinishRemap(false);
     return;
   }
-  if (m_mode == Mode::PadTest || m_mode == Mode::WiiTest)
+  if (m_mode == Mode::DeviceDiag && (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right))
+  {
+    m_diag_index += event->key() == Qt::Key_Right ? 1 : -1;
+    update();
+    return;
+  }
+  if (m_mode == Mode::PadTest || m_mode == Mode::WiiTest || m_mode == Mode::DeviceDiag)
   {
     if (event->key() == Qt::Key_Escape && !event->isAutoRepeat())
     {
@@ -2224,6 +2240,42 @@ void BigPictureWindow::DrawIcon(QPainter& painter, const QString& name, const QR
       m_mode != Mode::Remap && m_mode != Mode::Calibrate && m_mode != Mode::Setup)
   {
     const QString mapped = WiiIconName(name);
+    const bool stick = mapped == QStringLiteral("WCC-LS") || mapped == QStringLiteral("WCC-RS");
+    if (stick)
+    {
+      // "l" / "r" with arrows beside them: the directions this stick does here
+      const qsizetype dash = name.lastIndexOf(QLatin1Char('-'));
+      QString dir = dash > 0 ? name.mid(dash + 1) : QString();
+      if (dir.isEmpty() || dir.contains(QRegularExpression(QStringLiteral("[^UDLR]"))) ||
+          dir.size() > 2)
+        dir = QStringLiteral("LR");  // no direction given: left / right
+      const qreal side = std::min(rect.width(), rect.height());
+      const QRectF ir(rect.center().x() - side * 0.32, rect.center().y() - side * 0.32,
+                      side * 0.64, side * 0.64);
+      DrawIconRaw(painter, mapped, ir);
+      painter.save();
+      painter.setPen(QPen(QColor(230, 226, 245), std::max<qreal>(2.0, side * 0.06), Qt::SolidLine,
+                          Qt::RoundCap, Qt::RoundJoin));
+      painter.setBrush(Qt::NoBrush);
+      const qreal a = side * 0.07;  // half-size of a chevron
+      for (const QChar ch : dir)
+      {
+        const QPointF c = rect.center();
+        const qreal off = side * 0.43;
+        QPointF tip, b1, b2;
+        if (ch == QLatin1Char('L'))
+          tip = c + QPointF(-off - a * 0.5, 0), b1 = tip + QPointF(a, -a), b2 = tip + QPointF(a, a);
+        else if (ch == QLatin1Char('R'))
+          tip = c + QPointF(off + a * 0.5, 0), b1 = tip + QPointF(-a, -a), b2 = tip + QPointF(-a, a);
+        else if (ch == QLatin1Char('U'))
+          tip = c + QPointF(0, -off - a * 0.5), b1 = tip + QPointF(-a, a), b2 = tip + QPointF(a, a);
+        else
+          tip = c + QPointF(0, off + a * 0.5), b1 = tip + QPointF(-a, -a), b2 = tip + QPointF(a, -a);
+        painter.drawPolyline(QPolygonF({b1, tip, b2}));
+      }
+      painter.restore();
+      return;
+    }
     if (mapped != name)
     {
       DrawIconRaw(painter, mapped, rect);
@@ -2524,6 +2576,14 @@ void BigPictureWindow::DrawScene(QPainter& painter)
   {
     DrawBackground(painter);
     DrawWiiTest(painter);
+    return;
+  }
+  if (m_mode == Mode::DeviceDiag)
+  {
+    DrawBackground(painter);
+    DrawDeviceDiag(painter);
+    DrawToast(painter);
+    update();  // live
     return;
   }
   if (m_mode == Mode::WiiSaves)
@@ -5158,19 +5218,48 @@ bool IsPressInput(const std::string& name)
   return false;
 }
 
+// Devices with a NEW press since the last poll. A press is a clear edge (below 25 %, then above
+// 75 %): an input stuck down, or one hovering around the middle (a trigger read as an axis,
+// a noisy pad), never counts, so such a controller can't keep taking player 1 over.
+std::set<std::string> s_new_press;
+std::map<std::string, bool> s_input_down;
+
+void UpdateNewPresses()
+{
+  s_new_press.clear();
+  std::set<std::string> seen;
+  for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+  {
+    ciface::Core::DeviceQualifier dq;
+    dq.FromString(d);
+    const auto device = g_controller_interface.FindDevice(dq);
+    if (!device)
+      continue;
+    for (const auto* input : device->Inputs())
+    {
+      if (!IsPressInput(input->GetName()))
+        continue;
+      const std::string key = d + '|' + input->GetName();
+      seen.insert(key);
+      const ControlState v = input->GetState();
+      const auto it = s_input_down.find(key);
+      if (it == s_input_down.end())
+      {
+        s_input_down[key] = v > 0.5;  // first look: just the baseline
+        continue;
+      }
+      const bool down = it->second ? v > 0.25 : v > 0.75;
+      if (down && !it->second)
+        s_new_press.insert(d);
+      it->second = down;
+    }
+  }
+  std::erase_if(s_input_down, [&seen](const auto& kv) { return !seen.contains(kv.first); });
+}
+
 bool DeviceHasPress(const std::string& device_string)
 {
-  ciface::Core::DeviceQualifier dq;
-  dq.FromString(device_string);
-  const auto device = g_controller_interface.FindDevice(dq);
-  if (!device)
-    return false;
-  for (const auto* input : device->Inputs())
-  {
-    if (IsPressInput(input->GetName()) && input->GetState() > 0.6)
-      return true;
-  }
-  return false;
+  return s_new_press.contains(device_string);
 }
 
 QString DeviceDisplayName(const std::string& device_string)
@@ -5238,6 +5327,7 @@ void BigPictureWindow::PollDevices()
   case Mode::Calibrate:
   case Mode::PadTest:
   case Mode::WiiTest:
+  case Mode::DeviceDiag:
   case Mode::Launching:
   case Mode::Closing:
     return;
@@ -5245,6 +5335,7 @@ void BigPictureWindow::PollDevices()
     break;
   }
   const qint64 now = m_clock.elapsed();
+  UpdateNewPresses();
 
   // Devices already in use on some port.
   std::vector<std::string> used;
@@ -7076,4 +7167,101 @@ void BigPictureWindow::DrawJumpLetter(QPainter& painter)
   painter.drawText(r, Qt::AlignCenter, m_jump_letter);
   painter.restore();
   update();
+}
+
+// ================================================================== controller diagnostic
+
+void BigPictureWindow::DrawDeviceDiag(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  std::vector<std::string> devices;
+  for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+  {
+    if (!IsIgnoredDevice(d))
+      devices.push_back(d);
+  }
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(0, 70 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("DIAGNOSTIC DES MANETTES"));
+  if (devices.empty())
+  {
+    painter.setFont(Font(true, int(36 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(0, 400 * k, width(), 60 * k), Qt::AlignCenter, tr("Aucune manette"));
+    return;
+  }
+  const int n = static_cast<int>(devices.size());
+  m_diag_index = ((m_diag_index % n) + n) % n;
+  const std::string& dev = devices[m_diag_index];
+
+  // Device name with arrows (keyboard ← →, or a click)
+  painter.setFont(Font(true, int(36 * k), 700));
+  painter.setPen(TEXT);
+  const QRectF title(200 * k, 105 * k, width() - 400 * k, 56 * k);
+  painter.drawText(title, Qt::AlignCenter, DeviceDisplayName(dev));
+  painter.setFont(Font(false, int(18 * k), 400));
+  painter.setPen(TEXT_SOFT);
+  painter.drawText(QRectF(0, 162 * k, width(), 28 * k), Qt::AlignCenter,
+                   tr("%1 / %2   ·   %3").arg(m_diag_index + 1).arg(n).arg(QString::fromStdString(dev)));
+  for (int side = 0; side < 2; ++side)
+  {
+    const QRectF r(side == 0 ? 120 * k : width() - 200 * k, 100 * k, 80 * k, 80 * k);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(RAISED);
+    painter.drawEllipse(r);
+    painter.setPen(QPen(TEXT, 5 * k, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    const qreal cx = r.center().x(), cy = r.center().y(), d = side == 0 ? -1 : 1;
+    painter.drawLine(QPointF(cx - d * 8 * k, cy - 14 * k), QPointF(cx + d * 8 * k, cy));
+    painter.drawLine(QPointF(cx + d * 8 * k, cy), QPointF(cx - d * 8 * k, cy + 14 * k));
+    AddHit(r, [this, side] {
+      m_diag_index += side == 0 ? -1 : 1;
+      m_audio->Play(Sound::Move);
+    });
+  }
+
+  ciface::Core::DeviceQualifier dq;
+  dq.FromString(dev);
+  const auto device = g_controller_interface.FindDevice(dq);
+  if (!device)
+    return;
+  // Every input with its live value; lit above 50 %
+  const int cols = 6;
+  const qreal gx = 80 * k, gy = 210 * k, gw = width() - 160 * k;
+  const qreal cw = (gw - (cols - 1) * 12 * k) / cols, ch = 54 * k;
+  const int max_rows = int((height() - gy - 120 * k) / (ch + 10 * k));
+  int i = 0;
+  for (const auto* input : device->Inputs())
+  {
+    if (i >= cols * max_rows)
+      break;
+    const ControlState v = std::clamp<ControlState>(input->GetState(), 0, 1);
+    const QRectF r(gx + (i % cols) * (cw + 12 * k), gy + (i / cols) * (ch + 10 * k), cw, ch);
+    const bool on = v > 0.5;
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(on ? ACCENT : SURFACE);
+    painter.drawRoundedRect(r, 12 * k, 12 * k);
+    if (!on && v > 0.02)
+    {
+      painter.setBrush(RAISED);
+      painter.drawRoundedRect(QRectF(r.left(), r.top(), r.width() * v, r.height()), 12 * k, 12 * k);
+    }
+    painter.setFont(Font(false, int(17 * k), on ? 700 : 500));
+    painter.setPen(on ? BG : TEXT);
+    painter.drawText(r.adjusted(14 * k, 0, -60 * k, 0), Qt::AlignVCenter,
+                     QFontMetricsF(painter.font())
+                         .elidedText(QString::fromStdString(input->GetName()), Qt::ElideRight,
+                                     r.width() - 74 * k));
+    painter.setPen(on ? BG : TEXT_DIM);
+    painter.drawText(r.adjusted(0, 0, -14 * k, 0), Qt::AlignVCenter | Qt::AlignRight,
+                     QString::number(int(v * 100)));
+    ++i;
+  }
+  painter.setFont(Font(false, int(20 * k), 400));
+  painter.setPen(TEXT_SOFT);
+  painter.drawText(QRectF(0, height() - 70 * k, width(), 30 * k), Qt::AlignCenter,
+                   tr("Sans toucher la manette, rien ne devrait s'allumer   ·   ← → : autre manette   ·   "
+                      "Maintiens START ou Échap pour quitter"));
 }

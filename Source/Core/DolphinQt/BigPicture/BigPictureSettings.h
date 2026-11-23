@@ -54,6 +54,7 @@ struct BigPictureSettingsHost
   std::function<void()> install_drivers;
   std::function<void(int port)> test_wiimote;
   std::function<void(int port)> configure_wiimote;  // button-by-button assistant
+  std::function<void()> device_diagnostic;
   std::function<void()> sync_now;
   std::function<void(const QString&)> notify;  // short message on screen
   std::function<void()> open_classic;
