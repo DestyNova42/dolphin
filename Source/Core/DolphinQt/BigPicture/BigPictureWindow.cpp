@@ -5190,10 +5190,50 @@ void BigPictureWindow::DrawMemcards(QPainter& painter)
 
 namespace
 {
+bool Contains(const std::string& s, const char* what)
+{
+  std::string a = s, b = what;
+  const auto lower = [](std::string& x) {
+    std::transform(x.begin(), x.end(), x.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  };
+  lower(a);
+  lower(b);
+  return a.find(b) != std::string::npos;
+}
+
+// A Switch-protocol controller (Pro Controller, Joy-Con, 8BitDo and others in Switch mode) is
+// read properly by SDL. Windows also shows it through DirectInput and Windows.Gaming.Input,
+// which can't decode its reports: those twins send phantom presses (buttons flickering, axes
+// stuck at 100 %). While SDL has such a controller, they are ignored.
+bool IsSwitchTwin(const std::string& d)
+{
+  const bool dinput = d.rfind("DInput/", 0) == 0, wgi = d.rfind("WGInput/", 0) == 0;
+  if (!dinput && !wgi)
+    return false;
+  bool sdl_switch = false;
+  for (const std::string& other : g_controller_interface.GetAllDeviceStrings())
+  {
+    if (other.rfind("SDL/", 0) == 0 &&
+        (Contains(other, "Switch") || Contains(other, "Pro Controller") ||
+         Contains(other, "Joy-Con")))
+    {
+      sdl_switch = true;
+      break;
+    }
+  }
+  if (!sdl_switch)
+    return false;
+  return Contains(d, "Pro Controller") || Contains(d, "Joy-Con") ||
+         Contains(d, "Wireless Gamepad") || Contains(d, "Switch") ||
+         (wgi && (Contains(d, "HID") || Contains(d, "Contrôleur de jeu") ||
+                  Contains(d, "game controller")));
+}
+
 bool IsIgnoredDevice(const std::string& d)
 {
   return d.find("Keyboard") != std::string::npos || d.find("Mouse") != std::string::npos ||
-         d.rfind("DSUClient", 0) == 0 || d.rfind("Android", 0) == 0;
+         d.rfind("DSUClient", 0) == 0 || d.rfind("Android", 0) == 0 || IsSwitchTwin(d);
 }
 
 int SourcePriority(const std::string& d)
@@ -5336,6 +5376,24 @@ void BigPictureWindow::PollDevices()
   }
   const qint64 now = m_clock.elapsed();
   UpdateNewPresses();
+
+  // Player 1 on a Windows twin of a Switch-protocol controller: move it to the SDL one.
+  if (auto* pad0 = PadController(0); pad0 && now - m_last_switch > 1500)
+  {
+    const std::string current = pad0->GetDefaultDevice().ToString();
+    if (IsSwitchTwin(current))
+    {
+      for (const std::string& d : g_controller_interface.GetAllDeviceStrings())
+      {
+        if (d.rfind("SDL/", 0) == 0 && !IsIgnoredDevice(d) &&
+            (Contains(d, "Switch") || Contains(d, "Pro Controller") || Contains(d, "Joy-Con")))
+        {
+          SwitchPort(0, d, true);
+          break;
+        }
+      }
+    }
+  }
 
   // Devices already in use on some port.
   std::vector<std::string> used;
