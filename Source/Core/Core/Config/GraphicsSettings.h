@@ -40,6 +40,8 @@ extern const Info<float> GFX_WIDESCREEN_HEURISTIC_ASPECT_RATIO_SLOP;
 extern const Info<float> GFX_WIDESCREEN_HEURISTIC_STANDARD_RATIO;
 extern const Info<float> GFX_WIDESCREEN_HEURISTIC_WIDESCREEN_RATIO;
 extern const Info<bool> GFX_CROP_TO_ASPECT_RATIO;
+// Host presentation only: shows the picture at a whole-number multiple of its size.
+extern const Info<bool> GFX_INTEGER_SCALING;
 extern const Info<bool> GFX_CROP_CUSTOM;
 extern const Info<int> GFX_CROP_CUSTOM_LEFT;
 extern const Info<int> GFX_CROP_CUSTOM_TOP;

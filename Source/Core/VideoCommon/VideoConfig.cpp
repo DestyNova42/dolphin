@@ -99,6 +99,7 @@ void VideoConfig::Refresh()
   widescreen_heuristic_widescreen_ratio =
       Config::Get(Config::GFX_WIDESCREEN_HEURISTIC_WIDESCREEN_RATIO);
   bCropToAspectRatio = Config::Get(Config::GFX_CROP_TO_ASPECT_RATIO);
+  bIntegerScaling = Config::Get(Config::GFX_INTEGER_SCALING);
   bCropCustom = Config::Get(Config::GFX_CROP_CUSTOM);
   iCropCustomLeft = Config::Get(Config::GFX_CROP_CUSTOM_LEFT);
   iCropCustomTop = Config::Get(Config::GFX_CROP_CUSTOM_TOP);

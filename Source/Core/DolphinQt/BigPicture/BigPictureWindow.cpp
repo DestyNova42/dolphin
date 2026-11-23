@@ -1057,6 +1057,59 @@ void BigPictureWindow::PollController()
   if (pad.button & PAD_TRIGGER_Z)
     held |= Bit(int(Action::Sort));
 
+  // In the menus, A / B / X / Y follow the letters printed on the controller: in a game they
+  // keep the GameCube layout (by position), but on a Nintendo-layout pad (Pro, Joy-Con,
+  // 8BitDo in Switch mode) the letters sit elsewhere than on an Xbox pad.
+  if (auto* port0 = PadController(0))
+  {
+    const std::string dev_str = port0->GetDefaultDevice().ToString();
+    std::string lower = dev_str;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    const auto has = [&lower](const char* w) { return lower.find(w) != std::string::npos; };
+    const auto device = g_controller_interface.FindDevice(port0->GetDefaultDevice());
+    if (device && !has("gamecube"))
+    {
+      const auto down = [&device](const char* name) {
+        const auto* in = device->FindInput(name);
+        return in && in->GetState() > 0.5;
+      };
+      bool a = false, b = false, xb = false, yb = false, found = false;
+      if (device->FindInput("Button A") && device->FindInput("Button B"))
+      {
+        // Named by their letters (XInput)
+        a = down("Button A"), b = down("Button B"), xb = down("Button X"), yb = down("Button Y");
+        found = true;
+      }
+      else if (device->FindInput("Button S") && device->FindInput("Button E"))
+      {
+        // Named by position (SDL, Switch 2): which letters sit where depends on the pad
+        const bool nintendo = has("switch") || has("pro controller") || has("joy-con") ||
+                              lower.rfind("switch2/", 0) == 0;
+        const bool s_ = down("Button S"), e_ = down("Button E"), w_ = down("Button W"),
+                   n_ = down("Button N");
+        a = nintendo ? e_ : s_;
+        b = nintendo ? s_ : e_;
+        xb = nintendo ? n_ : w_;
+        yb = nintendo ? w_ : n_;
+        found = true;
+      }
+      if (found)
+      {
+        held &= ~(Bit(int(Action::Accept)) | Bit(int(Action::Back)) |
+                  Bit(int(Action::Options)) | Bit(int(Action::Favorite)));
+        if (a)
+          held |= Bit(int(Action::Accept));
+        if (b)
+          held |= Bit(int(Action::Back));
+        if (xb)
+          held |= Bit(int(Action::Options));
+        if (yb)
+          held |= Bit(int(Action::Favorite));
+      }
+    }
+  }
+
   const qint64 now = m_clock.elapsed();
 
   // C-stick in the library: jump by letter (or by 10 games when not sorted by name)

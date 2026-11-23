@@ -809,6 +809,23 @@ void Presenter::UpdateDrawRectangle()
     int_draw_height = rect.GetHeight();
   }
 
+  // Integer scaling: the picture's height becomes a whole multiple of the rendered height, so
+  // every source pixel covers the same number of screen pixels ("pixel perfect"). Host-side
+  // presentation only; skipped when the picture is taller than the window.
+  if (g_ActiveConfig.bIntegerScaling && m_xfb_entry &&
+      g_ActiveConfig.aspect_mode != AspectMode::Stretch && int_draw_height > 0)
+  {
+    const int src_height = AdjustForCustomCrop(m_xfb_rect).GetHeight();
+    const int factor = src_height > 0 ? static_cast<int>(win_height) / src_height : 0;
+    if (factor >= 1)
+    {
+      const float aspect = static_cast<float>(int_draw_width) / int_draw_height;
+      int_draw_height = src_height * factor;
+      int_draw_width = std::min(static_cast<int>(std::round(int_draw_height * aspect)),
+                                static_cast<int>(win_width));
+    }
+  }
+
   m_target_rectangle.left = static_cast<int>(std::round(win_width / 2.0 - int_draw_width / 2.0));
   m_target_rectangle.top = static_cast<int>(std::round(win_height / 2.0 - int_draw_height / 2.0));
   m_target_rectangle.right = m_target_rectangle.left + int_draw_width;

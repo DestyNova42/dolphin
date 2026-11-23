@@ -577,6 +577,12 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                           {AspectMode::ForceStandard, Tr("4:3 forcé")},
                                           {AspectMode::Stretch, Tr("Étirer à la fenêtre")},
                                           {AspectMode::Raw, Tr("Pixels carrés")}}));
+    c.items.push_back(Toggle(Tr("Mise à l'échelle entière (pixel perfect)"),
+                             Tr("L'image est agrandie d'un nombre entier de fois (×2, ×3…) : "
+                                "chaque pixel a la même taille, sans flou ni déformation, avec "
+                                "des bandes noires autour. Idéal en résolution interne Native "
+                                "avec le rééchantillonnage « Bilinéaire net »."),
+                             Config::GFX_INTEGER_SCALING));
     c.items.push_back(Toggle(Tr("Écran large forcé (hack)"),
                              Tr("Élargit l'image des jeux 4:3. Peut couper des éléments."),
                              Config::GFX_WIDESCREEN_HACK));
@@ -591,8 +597,6 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Toggle(Tr("Compiler les shaders avant de démarrer"),
                              Tr("Démarrage plus long, moins de saccades ensuite."),
                              Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING));
-    c.items.push_back(Toggle(Tr("Sortie HDR"), Tr("S'applique au prochain lancement du jeu."),
-                           Config::GFX_ENHANCE_HDR_OUTPUT));
   c.items.push_back(Toggle(Tr("Afficher les FPS"), {}, Config::GFX_SHOW_FPS));
     c.items.push_back(Toggle(Tr("Afficher la vitesse"), {}, Config::GFX_SHOW_SPEED));
     c.items.push_back(Toggle(Tr("Afficher la résolution interne"), {},
@@ -603,13 +607,16 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
   // ---- Enhancements
   {
     BigPictureSettingCategory c{Tr("Améliorations"), {}};
-    c.items.push_back(Toggle(Tr("Sortie HDR"),
-                             Tr("Couleurs et luminosité étendues sur un écran HDR."),
+    c.items.push_back(Toggle(Tr("HDR"),
+                             Tr("Couleurs et luminosité étendues sur un écran HDR. S'applique au "
+                                "prochain lancement du jeu."),
                              Config::GFX_ENHANCE_HDR_OUTPUT));
-    c.items.push_back(PrefToggle(Tr("Basculer l'écran en HDR automatiquement"),
-                                 Tr("Pendant le jeu, Windows passe en HDR si la sortie HDR est "
-                                    "activée (et en SDR sinon), puis revient comme avant."),
+#ifdef _WIN32
+    c.items.push_back(PrefToggle(Tr("HDR : basculer Windows automatiquement"),
+                                 Tr("Pendant le jeu, Windows passe en HDR si le HDR est activé (et "
+                                    "en SDR sinon), puis revient comme avant."),
                                  QStringLiteral("bigpicture/auto_hdr"), true, {}));
+#endif
     c.items.push_back(Choice<int>(Tr("Résolution interne"),
                                   Tr("Plus c'est haut, plus l'image est nette et plus la carte "
                                     "graphique travaille."),
@@ -696,7 +703,6 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Toggle(Tr("Précharger les textures HD"), {},
                              Config::GFX_CACHE_HIRES_TEXTURES));
     c.items.push_back(Toggle(Tr("Mods graphiques"), {}, Config::GFX_MODS_ENABLE));
-    c.items.push_back(Toggle(Tr("Sortie HDR"), {}, Config::GFX_ENHANCE_HDR_OUTPUT));
     c.items.push_back(Choice<StereoMode>(Tr("3D stéréoscopique"), {}, Config::GFX_STEREO_MODE,
                                          {{StereoMode::Off, Tr("Désactivée")},
                                           {StereoMode::SideBySide, Tr("Côte à côte")},
