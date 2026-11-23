@@ -323,6 +323,11 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  Tr("Les boutons affichés en bas de l'écran."),
                                  QStringLiteral("bigpicture/icons"),
                                  {Tr("GameCube"), Tr("Wii (manette classique)")}, 0, {}));
+    c.items.push_back(PrefToggle(
+        Tr("Écran de la chaîne (jeux Wii)"),
+        Tr("Avant un jeu Wii, sa chaîne s'ouvre comme sur le menu Wii : l'animation et la "
+           "musique du jeu. Désactivé, le jeu démarre directement."),
+        QStringLiteral("bigpicture/channel_screen"), true, {}));
     c.items.push_back(PrefToggle(Tr("Mise en veille propre"),
                                  Tr("Avant la veille du PC ou de la console, le jeu est mis en "
                                     "pause et sauvegardé ; au réveil, le menu pause s'ouvre."),

@@ -52,6 +52,9 @@ public:
   void StopMusic();
   // 0..1 each; music 0 disables it.
   void SetVolumes(float music, float sfx);
+  // Sound of a Wii channel banner (interleaved stereo); replaces the previous one.
+  void PlayBanner(std::vector<s16> samples, int rate, bool loop, size_t loop_start);
+  void StopBanner();
   bool HasMusic() const { return m_loaded && !m_music.empty(); }
 
   static std::string SoundDirectory();
@@ -83,6 +86,11 @@ private:
 
   std::array<Clip, static_cast<size_t>(Sound::Count)> m_sounds;
   Clip m_music;
+  Clip m_banner;
+  double m_banner_pos = 0;
+  bool m_banner_on = false;
+  bool m_banner_loop = false;
+  double m_banner_loop_start = 0;
 
   std::mutex m_mutex;
   std::vector<Voice> m_voices;

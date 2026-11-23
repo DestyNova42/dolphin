@@ -48,6 +48,8 @@ add_executable(dolphin-emu
   BigPicture/BigPictureSync.cpp
   BigPicture/BigPictureSync.h
   BigPicture/BigPictureTriggers.cpp
+  BigPicture/WiiBanner.cpp
+  BigPicture/WiiBanner.h
   BigPicture/BigPictureTriggers.h
   BigPicture/BigPictureUpdater.cpp
   BigPicture/BigPictureUpdater.h
