@@ -1050,6 +1050,27 @@ void BigPictureWindow::PollController()
     held |= Bit(int(Action::Sort));
 
   const qint64 now = m_clock.elapsed();
+
+  // C-stick in the library: jump by letter (or by 10 games when not sorted by name)
+  if (m_mode == Mode::Library && m_tab != Tab::Settings && !m_entries.empty())
+  {
+    const int cx = static_cast<int>(pad.substickX) - GCPadStatus::C_STICK_CENTER_X;
+    const int cy = static_cast<int>(pad.substickY) - GCPadStatus::C_STICK_CENTER_Y;
+    const bool list = m_view == Prefs::View::List;
+    const int v = list ? -cy : cx;  // list: down = forward; covers: right = forward
+    const int dir = v > STICK_THRESHOLD ? 1 : v < -STICK_THRESHOLD ? -1 : 0;
+    if (dir != 0 && (m_jump_dir != dir || now - m_jump_last > 260))
+    {
+      m_jump_dir = dir;
+      m_jump_last = now;
+      JumpLetter(dir);
+    }
+    else if (dir == 0)
+    {
+      m_jump_dir = 0;
+    }
+  }
+
   for (int a = 0; a < int(Action::Count); ++a)
   {
     const bool is_held = held & Bit(a);
@@ -1061,7 +1082,10 @@ void BigPictureWindow::PollController()
     }
     else if (is_held && was_held && a <= int(Action::Right))
     {
-      if (now - m_held_since[a] > REPEAT_DELAY_MS && now - m_last_repeat[a] > REPEAT_RATE_MS)
+      // Held longer, it speeds up: 85 ms, then 40 ms after 1.2 s, 20 ms after 2.5 s
+      const qint64 held_for = now - m_held_since[a];
+      const qint64 rate = held_for > 2500 ? 20 : held_for > 1200 ? 40 : REPEAT_RATE_MS;
+      if (held_for > REPEAT_DELAY_MS && now - m_last_repeat[a] > rate)
       {
         m_last_repeat[a] = now;
         Press(static_cast<Action>(a));
@@ -2605,6 +2629,8 @@ void BigPictureWindow::DrawScene(QPainter& painter)
     DrawList(painter);
   else
     DrawCoverShelf(painter);
+  if (m_mode == Mode::Library)
+    DrawJumpLetter(painter);
 
   if (m_mode == Mode::Menu)
     DrawMenu(painter);
@@ -2959,8 +2985,15 @@ void BigPictureWindow::DrawHero(QPainter& painter, const Entry& sel, qreal left,
                    meta.join(QStringLiteral("   ·   ")));
   y += 40 * k;
 
-  // Title: up to two lines, shrinks if needed.
-  const QRectF title_box(left, y, max_width, 170 * k);
+  const QString maker = QString::fromStdString(sel.game->GetLongMaker()).trimmed();
+  const QString desc =
+      QString::fromStdString(sel.game->GetDescription(UICommon::GameFile::Variant::LongAndNotCustom))
+          .simplified();
+  const bool has_desc = !maker.isEmpty() || !desc.isEmpty();
+
+  // Title: up to two lines, shrinks if needed (a bit more with the description line, so the
+  // buttons stay above the shelf).
+  const QRectF title_box(left, y, max_width, (has_desc ? 140 : 170) * k);
   int title_px = int(76 * k);
   QFont title_font = Font(true, title_px, 700);
   title_font.setLetterSpacing(QFont::AbsoluteSpacing, -2 * k);
@@ -2985,45 +3018,33 @@ void BigPictureWindow::DrawHero(QPainter& painter, const Entry& sel, qreal left,
   painter.drawText(QRectF(left, y, max_width, 32 * k), Qt::AlignVCenter, PlayInfo(sel));
   y += 44 * k;
 
-  // The game's own short description, as on the console's menu (two lines at most)
+  // The game's own short description, as on the console's menu: one line
+  if (has_desc)
   {
-    const QString maker = QString::fromStdString(sel.game->GetLongMaker()).trimmed();
-    const QString desc =
-        QString::fromStdString(
-            sel.game->GetDescription(UICommon::GameFile::Variant::LongAndNotCustom))
-            .simplified();
-    if (!maker.isEmpty() || !desc.isEmpty())
+    const QFont maker_font = Font(false, int(18 * k), 700);
+    const QFont desc_font = Font(false, int(20 * k), 400);
+    qreal x = left;
+    if (!maker.isEmpty())
     {
-      const QFont maker_font = Font(false, int(18 * k), 700);
-      const QFont desc_font = Font(false, int(19 * k), 400);
-      qreal x = left;
-      if (!maker.isEmpty())
-      {
-        painter.setFont(maker_font);
-        painter.setPen(TEXT);
-        const QString m = maker.toUpper() + QStringLiteral("   ");
-        painter.drawText(QRectF(x, y, max_width, 26 * k), Qt::AlignLeft | Qt::AlignVCenter, m);
-        x += QFontMetricsF(maker_font).horizontalAdvance(m);
-      }
+      const QString m = maker.toUpper();
+      painter.setFont(maker_font);
+      painter.setPen(TEXT);
+      painter.drawText(QRectF(x, y, max_width, 28 * k), Qt::AlignLeft | Qt::AlignVCenter, m);
+      x += QFontMetricsF(maker_font).horizontalAdvance(m) + 18 * k;
+    }
+    if (!desc.isEmpty() && x < left + max_width - 80 * k)
+    {
       painter.setFont(desc_font);
       painter.setPen(TEXT_SOFT);
-      const QRectF dbox(left, y + 30 * k, std::min<qreal>(max_width, 900 * k), 56 * k);
-      const QString shown = QFontMetricsF(desc_font).elidedText(
-          desc, Qt::ElideRight, dbox.width() * 2 - 40 * k);
-      painter.drawText(dbox, Qt::TextWordWrap | Qt::AlignLeft | Qt::AlignTop, shown);
-      (void)x;
-      y += desc.isEmpty() ? 36 * k : 30 * k + std::min<qreal>(56 * k,
-                                                               QFontMetricsF(desc_font)
-                                                                   .boundingRect(dbox,
-                                                                                 Qt::TextWordWrap,
-                                                                                 shown)
-                                                                   .height()) +
-                                           14 * k;
+      const qreal w = left + max_width - x;
+      painter.drawText(QRectF(x, y, w, 28 * k), Qt::AlignLeft | Qt::AlignVCenter,
+                       QFontMetricsF(desc_font).elidedText(desc, Qt::ElideRight, w));
     }
-    else
-    {
-      y += 8 * k;
-    }
+    y += 42 * k;
+  }
+  else
+  {
+    y += 8 * k;
   }
 
   qreal bx = left;
@@ -3279,7 +3300,7 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
   if (m_mode == Mode::Library)
   {
     const bool can_resume = HasResume(*sel);
-    DrawHints(painter, {{QStringLiteral("Control_Stick"), tr("Naviguer")}},
+    DrawHints(painter, {{QStringLiteral("Control_Stick"), tr("Naviguer")}, {QStringLiteral("C-Stick"), tr("Rapide")}},
               {{QStringLiteral("A"), m_hero_focus ? tr("Valider") :
                                      can_resume   ? tr("Reprendre") :
                                                     tr("Jouer")},
@@ -3449,7 +3470,8 @@ void BigPictureWindow::DrawList(QPainter& painter)
   {
     DrawHints(painter,
               {{QStringLiteral("Control_Stick-U"), QString()},
-               {QStringLiteral("Control_Stick-D"), tr("Naviguer")}},
+               {QStringLiteral("Control_Stick-D"), tr("Naviguer")},
+               {QStringLiteral("C-Stick"), tr("Rapide")}},
               {{QStringLiteral("A"), HasResume(*sel) ? tr("Reprendre") : tr("Jouer")},
                {QStringLiteral("Y"), tr("Favori")},
                {QStringLiteral("Z"), tr("Trier")},
@@ -6974,4 +6996,86 @@ void BigPictureWindow::wheelEvent(QWheelEvent* event)
                             (back ? Action::Up : Action::Down));
   }
   event->accept();
+}
+
+// ================================================================== fast scrolling
+
+QChar BigPictureWindow::InitialOf(const Entry& e) const
+{
+  for (const QChar ch : e.title)
+  {
+    if (ch.isLetter())
+      return ch.toUpper().decompositionTag() == QChar::NoDecomposition ?
+                 ch.toUpper() :
+                 ch.toUpper().decomposition().at(0);
+    if (ch.isDigit())
+      return QLatin1Char('#');
+  }
+  return QLatin1Char('#');
+}
+
+void BigPictureWindow::JumpLetter(int dir)
+{
+  const int count = static_cast<int>(m_entries.size());
+  const int sort = Settings::GetQSettings().value(QStringLiteral("bigpicture/sort"), 0).toInt();
+  int target = m_selected;
+  if (sort == 0)
+  {
+    // Sorted by name: the first game of the next (or previous) letter
+    const QChar cur = InitialOf(m_entries[m_selected]);
+    if (dir > 0)
+    {
+      target = m_selected;
+      while (target < count - 1 && InitialOf(m_entries[target]) == cur)
+        ++target;
+    }
+    else
+    {
+      // Start of this letter; if already there, start of the previous one
+      int start = m_selected;
+      while (start > 0 && InitialOf(m_entries[start - 1]) == cur)
+        --start;
+      if (start == m_selected && start > 0)
+      {
+        const QChar prev = InitialOf(m_entries[start - 1]);
+        start -= 1;
+        while (start > 0 && InitialOf(m_entries[start - 1]) == prev)
+          --start;
+      }
+      target = start;
+    }
+  }
+  else
+  {
+    target = std::clamp(m_selected + dir * 10, 0, count - 1);
+  }
+  if (target == m_selected)
+    return;
+  m_hero_focus = false;
+  SetSelected(target);
+  m_jump_letter = sort == 0 ? QString(InitialOf(m_entries[target])) :
+                              QStringLiteral("%1").arg(target + 1);
+  m_jump_shown = m_clock.elapsed();
+}
+
+void BigPictureWindow::DrawJumpLetter(QPainter& painter)
+{
+  if (m_jump_letter.isEmpty())
+    return;
+  const qint64 age = m_clock.elapsed() - m_jump_shown;
+  if (age > 900)
+    return;
+  const qreal k = height() / 1080.0;
+  const qreal a = age < 600 ? 1.0 : 1.0 - (age - 600) / 300.0;
+  painter.save();
+  painter.setOpacity(a);
+  const QRectF r(width() / 2.0 - 90 * k, height() / 2.0 - 90 * k, 180 * k, 180 * k);
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(QColor(10, 8, 20, 210));
+  painter.drawRoundedRect(r, 36 * k, 36 * k);
+  painter.setFont(Font(true, int(96 * k), 700));
+  painter.setPen(TEXT);
+  painter.drawText(r, Qt::AlignCenter, m_jump_letter);
+  painter.restore();
+  update();
 }

@@ -532,6 +532,14 @@ private:
   void ClickEntry(int index);
   QTimer* m_cursor_timer = nullptr;
   int m_wheel_accum = 0;
+  // C-stick: jump by letter
+  QChar InitialOf(const Entry& e) const;
+  void JumpLetter(int dir);
+  void DrawJumpLetter(QPainter& painter);
+  int m_jump_dir = 0;
+  qint64 m_jump_last = 0;
+  QString m_jump_letter;
+  qint64 m_jump_shown = 0;
   void DrawDpadDot(QPainter& painter, QPointF p, qreal r);
   QHash<QString, bool> m_hd_known;
 
