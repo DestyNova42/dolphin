@@ -24,7 +24,6 @@
 
 #include "Common/CommonTypes.h"
 #include "DolphinQt/BigPicture/BigPictureSettings.h"
-#include "DolphinQt/BigPicture/WiiBanner.h"
 
 class BigPictureAudio;
 class GameListModel;
@@ -155,7 +154,6 @@ private:
     ChooseDisc,    // multi-disc game: which disc to start
     WiiTest,       // live view of an emulated Wii Remote
     WiiSaves,      // Wii save manager
-    Channel,       // Wii channel screen (animated banner) before a Wii game
   };
 
   struct SaveIcon
@@ -522,21 +520,6 @@ private:
   int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
   void TakeSleepInhibitor();
   void QuitGame();
-  // Wii channel screen
-  bool OpenChannel(const Entry& entry, int disc, bool resume);
-  void HandleChannel(Action action);
-  void DrawChannel(QPainter& painter);
-  void CloseChannel(bool to_game);
-  void ChannelStep(int dir);
-  std::unique_ptr<WiiBanner::Banner> m_banner;
-  Entry m_channel_entry;
-  int m_channel_disc = 0;
-  bool m_channel_resume = false;
-  bool m_channel_go = false;  // the next Launch() skips the channel screen
-  int m_channel_button = 1;
-  qint64 m_channel_opened = 0;
-  qint64 m_channel_last = 0;
-  Mode m_mode_before_channel = Mode::Library;
   // Mouse: clickable areas, rebuilt with each frame
   struct Hit
   {

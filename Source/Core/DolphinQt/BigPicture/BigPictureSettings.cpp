@@ -312,22 +312,10 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
         {Tr("Automatique"), Tr("Guide / Home"), Tr("Select (View)"), Tr("Les deux sticks (L3 + R3)"),
          Tr("START + Z")},
         0, {}));
-    c.items.push_back(PrefChoice(
-        Tr("Gâchettes adaptatives (DualSense)"),
-        Tr("Les gâchettes de la DualSense s'enfoncent librement puis font un clic au bout, "
-           "comme L et R de la manette GameCube. En jeu seulement. Sur Bazzite, désactive "
-           "Steam Input pour cette manette."),
-        QStringLiteral("bigpicture/adaptive_triggers"),
-        {Tr("Désactivées"), Tr("Clic GameCube"), Tr("Clic GameCube ferme")}, 1, {}));
     c.items.push_back(PrefChoice(Tr("Icônes des boutons"),
                                  Tr("Les boutons affichés en bas de l'écran."),
                                  QStringLiteral("bigpicture/icons"),
                                  {Tr("GameCube"), Tr("Wii (manette classique)")}, 0, {}));
-    c.items.push_back(PrefToggle(
-        Tr("Écran de la chaîne (jeux Wii)"),
-        Tr("Avant un jeu Wii, sa chaîne s'ouvre comme sur le menu Wii : l'animation et la "
-           "musique du jeu. Désactivé, le jeu démarre directement."),
-        QStringLiteral("bigpicture/channel_screen"), true, {}));
     c.items.push_back(PrefToggle(Tr("Mise en veille propre"),
                                  Tr("Avant la veille du PC ou de la console, le jeu est mis en "
                                     "pause et sauvegardé ; au réveil, le menu pause s'ouvre."),
@@ -881,6 +869,28 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                  Tr("La dernière manette utilisée devient celle du joueur 1, avec "
                                     "ses propres réglages."),
                                  QStringLiteral("bigpicture/autoswitch"), true, {}));
+    {
+      // Third-party "Pro Controllers" (8BitDo…) that SDL's Switch driver can't talk to
+      static const Config::Info<std::string> HIDAPI_SWITCH{
+          {Config::System::Main, "SDL_Hints", "SDL_JOYSTICK_HIDAPI_SWITCH"}, ""};
+      Item item;
+      item.label = Tr("Manettes Switch d'autres marques");
+      item.help = Tr("Pour une manette vue comme « Nintendo Switch Pro Controller » qui ne "
+                     "répond pas (8BitDo…) : Dolphin la lit alors comme une manette standard. "
+                     "Redémarre Dolphin après le changement. Les vraies manettes Pro perdent "
+                     "le gyroscope.");
+      item.kind = Item::Kind::Toggle;
+      item.is_on = [] { return Config::Get(HIDAPI_SWITCH) == "0"; };
+      item.change = [notify = host.notify](int) {
+        const bool on = Config::Get(HIDAPI_SWITCH) == "0";
+        Config::SetBase(HIDAPI_SWITCH, on ? "1" : "0");
+        Config::Save();
+        if (notify)
+          notify(Tr("Redémarre Dolphin pour appliquer"));
+      };
+      item.activate = [change = item.change] { change(1); };
+      c.items.push_back(std::move(item));
+    }
     {
       const auto test = host.test_controller;
       c.items.push_back(Action(Tr("Tester la manette"),

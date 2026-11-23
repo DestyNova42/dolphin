@@ -84,9 +84,6 @@
 #include "Core/IOS/FS/FileSystem.h"
 #include "Core/IOS/IOS.h"
 #include "DiscIO/WiiSaveBanner.h"
-#include "DiscIO/DiscExtractor.h"
-#include "DiscIO/Filesystem.h"
-#include "DiscIO/Volume.h"
 #include "InputCommon/ControllerEmu/ControlGroup/Cursor.h"
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HotkeyManager.h"
@@ -97,7 +94,6 @@
 #include "DolphinQt/BigPicture/BigPictureAudio.h"
 #include "DolphinQt/BigPicture/BigPictureDriver.h"
 #include "DolphinQt/BigPicture/BigPictureSync.h"
-#include "DolphinQt/BigPicture/BigPictureTriggers.h"
 #include "DolphinQt/BigPicture/BigPictureUpdater.h"
 #include "DolphinQt/GameList/GameListModel.h"
 #include "DolphinQt/QtUtils/ImageConverter.h"
@@ -749,7 +745,6 @@ void BigPictureWindow::Suspend()
 void BigPictureWindow::Close()
 {
   m_active = false;
-  BigPictureTriggers::Release();
   m_game_timer->stop();
   Suspend();
 }
@@ -1103,7 +1098,6 @@ void BigPictureWindow::PollInGame()
 {
   if (!m_active || m_mode != Mode::InGame)
     return;
-  BigPictureTriggers::Update(true);
   auto& system = Core::System::GetInstance();
   if (Core::GetState(system) != Core::State::Running)
     return;
@@ -1313,9 +1307,6 @@ void BigPictureWindow::HandleAction(Action action)
     break;
   case Mode::WiiSaves:
     HandleWiiSaves(action);
-    break;
-  case Mode::Channel:
-    HandleChannel(action);
     break;
   case Mode::Players:
     if (action == Action::Back || action == Action::Menu)
@@ -2209,8 +2200,11 @@ QString WiiIconName(const QString& name)
   };
   if (const auto it = map.constFind(name); it != map.constEnd())
     return it.value();
-  if (name.startsWith(QStringLiteral("Control_Stick")) || name.startsWith(QStringLiteral("C-Stick")))
-    return QStringLiteral("Wii-Control_Stick");
+  // Sticks: "l" (left) and "r" (right), like the letter buttons
+  if (name.startsWith(QStringLiteral("Control_Stick")))
+    return QStringLiteral("WCC-LS");
+  if (name.startsWith(QStringLiteral("C-Stick")))
+    return QStringLiteral("WCC-RS");
   if (name.startsWith(QStringLiteral("D-Pad")))
     return QStringLiteral("Wii-D-Pad");
   if (name.startsWith(QStringLiteral("L-")))
@@ -2530,12 +2524,6 @@ void BigPictureWindow::DrawScene(QPainter& painter)
   {
     DrawBackground(painter);
     DrawWiiTest(painter);
-    return;
-  }
-  if (m_mode == Mode::Channel)
-  {
-    DrawChannel(painter);
-    DrawToast(painter);
     return;
   }
   if (m_mode == Mode::WiiSaves)
@@ -5228,8 +5216,6 @@ void BigPictureWindow::PollDevices()
 {
   if (!m_active)
     return;
-  if (m_mode != Mode::InGame)
-    BigPictureTriggers::Update(false);
 #ifdef _WIN32
   // Bluetooth of the Switch 2 controllers: show connections and failures.
   {
@@ -5864,15 +5850,6 @@ void BigPictureWindow::StartNewGame(const Entry& entry)
 
 void BigPictureWindow::Launch(const Entry& entry, int disc, bool resume)
 {
-  // Wii games: the channel screen first, like the Wii Menu (unless turned off)
-  if (!m_channel_go && entry.game &&
-      entry.game->GetPlatform() == DiscIO::Platform::WiiDisc &&
-      Settings::GetQSettings().value(QStringLiteral("bigpicture/channel_screen"), true).toBool() &&
-      OpenChannel(entry, disc, resume))
-  {
-    return;
-  }
-  m_channel_go = false;
   const std::string id = entry.game->GetGameID();
   if (resume)
   {
@@ -7099,241 +7076,4 @@ void BigPictureWindow::DrawJumpLetter(QPainter& painter)
   painter.drawText(r, Qt::AlignCenter, m_jump_letter);
   painter.restore();
   update();
-}
-
-// ================================================================== Wii channel screen
-
-namespace
-{
-// opening.bnr from the root of the game's data partition
-QByteArray ReadOpeningBnr(const QString& path)
-{
-  const std::unique_ptr<DiscIO::Volume> volume = DiscIO::CreateVolume(path.toStdString());
-  if (!volume)
-    return {};
-  const DiscIO::Partition partition = volume->GetGamePartition();
-  const DiscIO::FileSystem* fs = volume->GetFileSystem(partition);
-  if (!fs)
-    return {};
-  const std::unique_ptr<DiscIO::FileInfo> info = fs->FindFileInfo("opening.bnr");
-  if (!info || info->GetSize() == 0 || info->GetSize() > 8 * 1024 * 1024)
-    return {};
-  QByteArray data(qsizetype(info->GetSize()), Qt::Uninitialized);
-  if (DiscIO::ReadFile(*volume, partition, info.get(), reinterpret_cast<u8*>(data.data()),
-                       info->GetSize()) != info->GetSize())
-    return {};
-  return data;
-}
-}  // namespace
-
-bool BigPictureWindow::OpenChannel(const Entry& entry, int disc, bool resume)
-{
-  const QString path = entry.discs.isEmpty() ?
-                           entry.path :
-                           entry.discs[std::clamp(disc, 0, int(entry.discs.size()) - 1)];
-  auto banner = WiiBanner::Banner::Load(ReadOpeningBnr(path));
-  if (!banner)
-    return false;
-  m_banner = std::move(banner);
-  m_channel_entry = entry;
-  m_channel_disc = disc;
-  m_channel_resume = resume;
-  m_channel_button = 1;
-  if (m_mode != Mode::Channel)
-    m_mode_before_channel = m_mode;
-  m_mode = Mode::Channel;
-  m_channel_opened = m_channel_last = m_clock.elapsed();
-  m_audio->StopMusic();
-  const WiiBanner::Sound& snd = m_banner->GetSound();
-  m_audio->PlayBanner(snd.samples, snd.rate, snd.loop, snd.loop_start);
-  update();
-  return true;
-}
-
-void BigPictureWindow::CloseChannel(bool to_game)
-{
-  m_audio->StopBanner();
-  m_banner.reset();
-  if (to_game)
-  {
-    m_channel_go = true;
-    Launch(m_channel_entry, m_channel_disc, m_channel_resume);
-    return;
-  }
-  BeginTransition(-1);
-  m_mode = m_mode_before_channel == Mode::Channel ? Mode::Library : m_mode_before_channel;
-  m_audio->StartMusic();
-  update();
-}
-
-void BigPictureWindow::ChannelStep(int dir)
-{
-  // Previous / next Wii game in the current list, like the arrows of the Wii Menu
-  const int count = static_cast<int>(m_entries.size());
-  int i = m_selected;
-  for (int n = 0; n < count; ++n)
-  {
-    i = (i + dir + count) % count;
-    const Entry& e = m_entries[i];
-    if (e.game && e.game->GetPlatform() == DiscIO::Platform::WiiDisc)
-    {
-      if (i == m_selected)
-        return;
-      SetSelected(i);
-      const Entry& sel = m_entries[i];
-      if (OpenChannel(sel, 0, HasResume(sel)))
-        m_audio->Play(Sound::Page);
-      return;
-    }
-  }
-}
-
-void BigPictureWindow::HandleChannel(Action action)
-{
-  const bool resume = HasResume(m_channel_entry);
-  const int buttons = resume ? 3 : 2;  // Retour, Démarrer/Reprendre, (Nouvelle partie)
-  switch (action)
-  {
-  case Action::Left:
-  case Action::Right:
-  {
-    const int next = std::clamp(m_channel_button + (action == Action::Right ? 1 : -1), 0,
-                                buttons - 1);
-    if (next != m_channel_button)
-    {
-      m_channel_button = next;
-      m_audio->Play(Sound::Move);
-    }
-    break;
-  }
-  case Action::PageUp:
-  case Action::PageDown:
-    ChannelStep(action == Action::PageDown ? 1 : -1);
-    break;
-  case Action::Back:
-    m_audio->Play(Sound::Back);
-    CloseChannel(false);
-    break;
-  case Action::Options:  // X: new game
-    if (resume)
-    {
-      m_channel_resume = false;
-      CloseChannel(true);
-    }
-    break;
-  case Action::Accept:
-    if (m_channel_button == 0)
-    {
-      m_audio->Play(Sound::Back);
-      CloseChannel(false);
-    }
-    else
-    {
-      m_channel_resume = resume && m_channel_button == 1;
-      CloseChannel(true);
-    }
-    break;
-  default:
-    break;
-  }
-}
-
-void BigPictureWindow::DrawChannel(QPainter& painter)
-{
-  if (!m_banner)
-    return;
-  const qreal k = height() / 1080.0;
-  const qint64 now = m_clock.elapsed();
-  m_banner->Advance(std::clamp<double>((now - m_channel_last) * 60.0 / 1000.0, 0.0, 10.0));
-  m_channel_last = now;
-
-  painter.fillRect(rect(), Qt::black);
-  // Opening: the scene zooms in from the library, like the Wii Menu
-  const qreal open = std::clamp((now - m_channel_opened) / 450.0, 0.0, 1.0);
-  const qreal e = 1 - std::pow(1 - open, 3);
-  const qreal zoom = 0.82 + 0.18 * e;
-  const QRectF full = rect();
-  const QRectF target(full.center().x() - full.width() * zoom / 2,
-                      full.center().y() - full.height() * zoom / 2, full.width() * zoom,
-                      full.height() * zoom);
-  painter.save();
-  painter.setOpacity(e);
-  m_banner->Render(painter, target);
-  painter.restore();
-
-  // Bottom bar (ours, in place of the Wii Menu's)
-  const qreal bar_h = 190 * k;
-  const QRectF bar(0, height() - bar_h, width(), bar_h);
-  QLinearGradient g(bar.topLeft(), bar.bottomLeft());
-  g.setColorAt(0, QColor(10, 8, 22, 0));
-  g.setColorAt(0.35, QColor(10, 8, 22, 215));
-  g.setColorAt(1, QColor(10, 8, 22, 245));
-  painter.fillRect(bar, g);
-
-  const bool resume = HasResume(m_channel_entry);
-  struct Btn
-  {
-    QString icon, label;
-  };
-  std::vector<Btn> btns = {{QStringLiteral("B"), tr("Menu")},
-                           {QStringLiteral("A"), resume ? tr("Reprendre") : tr("Démarrer")}};
-  if (resume)
-    btns.push_back({QStringLiteral("X"), tr("Nouvelle partie")});
-  const qreal h = 68 * k;
-  std::vector<qreal> widths;
-  qreal total = 0;
-  for (size_t i = 0; i < btns.size(); ++i)
-  {
-    const bool primary = i == 1;
-    const QFontMetricsF fm(Font(false, int((primary ? 24 : 22) * k), primary ? 600 : 500));
-    const qreal icon_size = (primary ? 40 : 36) * k;
-    const qreal w = std::max<qreal>(260 * k, 16 * k + icon_size + 14 * k +
-                                                 fm.horizontalAdvance(btns[i].label) + 32 * k);
-    widths.push_back(w);
-    total += w;
-  }
-  total += (btns.size() - 1) * 40 * k;
-  qreal x = (width() - total) / 2;
-  const qreal y = height() - 70 * k - h;
-  painter.setOpacity(e);
-  for (size_t i = 0; i < btns.size(); ++i)
-  {
-    const qreal w = DrawPillButton(painter, x, y, btns[i].icon, btns[i].label, i == 1, 1.0,
-                                   widths[i]);
-    if (static_cast<int>(i) == m_channel_button)
-    {
-      painter.setPen(QPen(ACCENT_SOFT, 3 * k));
-      painter.setBrush(Qt::NoBrush);
-      painter.drawRoundedRect(QRectF(x, y, w, h).adjusted(-6 * k, -6 * k, 6 * k, 6 * k), 21 * k,
-                              21 * k);
-    }
-    AddHit(QRectF(x, y, w, h), [this, i] {
-      m_channel_button = static_cast<int>(i);
-      HandleChannel(i == 2 ? Action::Options : Action::Accept);
-    });
-    x += w + 40 * k;
-  }
-
-  // Arrows: previous / next Wii game (L / R)
-  const qreal ay = height() * 0.42;
-  for (int side = 0; side < 2; ++side)
-  {
-    const qreal cx = side == 0 ? 60 * k : width() - 60 * k;
-    QPainterPath arrow;
-    const qreal s = 26 * k, dir = side == 0 ? -1 : 1;
-    arrow.moveTo(cx - dir * s * 0.5, ay - s);
-    arrow.lineTo(cx + dir * s * 0.5, ay);
-    arrow.lineTo(cx - dir * s * 0.5, ay + s);
-    painter.setPen(QPen(QColor(255, 255, 255, 220), 7 * k, Qt::SolidLine, Qt::RoundCap,
-                        Qt::RoundJoin));
-    painter.setBrush(Qt::NoBrush);
-    painter.drawPath(arrow);
-    const qreal icon = 44 * k;
-    DrawIcon(painter, side == 0 ? QStringLiteral("L") : QStringLiteral("R"),
-             QRectF(cx - icon / 2, ay + s + 18 * k, icon, icon));
-    AddHit(QRectF(cx - 50 * k, ay - 60 * k, 100 * k, 160 * k),
-           [this, side] { ChannelStep(side == 0 ? -1 : 1); });
-  }
-  painter.setOpacity(1);
-  update();  // animated
 }

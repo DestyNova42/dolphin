@@ -207,24 +207,6 @@ void BigPictureAudio::SetVolumes(float music, float sfx)
   m_sfx_volume = sfx * sfx;
 }
 
-void BigPictureAudio::PlayBanner(std::vector<s16> samples, int rate, bool loop, size_t loop_start)
-{
-  std::lock_guard lk(m_mutex);
-  m_banner.samples = std::move(samples);
-  m_banner.step = static_cast<double>(std::max(rate, 1)) / OUTPUT_RATE;
-  m_banner_pos = 0;
-  m_banner_loop = loop;
-  m_banner_loop_start = static_cast<double>(loop_start);
-  m_banner_on = !m_banner.empty();
-}
-
-void BigPictureAudio::StopBanner()
-{
-  std::lock_guard lk(m_mutex);
-  m_banner_on = false;
-  m_banner = Clip{};
-}
-
 void BigPictureAudio::StopMusic()
 {
   std::lock_guard lk(m_mutex);
@@ -258,30 +240,6 @@ long BigPictureAudio::Mix(float* out, long frames)
       m_music_pos += m_music.step;
       if (m_music_pos >= music_frames - 1)
         m_music_pos = 0;
-    }
-  }
-
-  if (m_banner_on && !m_banner.empty())
-  {
-    const double banner_frames = static_cast<double>(m_banner.Frames()) - 1;
-    // Channel sounds are mixed louder than the menu music, as on the Wii Menu
-    const float g = std::max(m_music_volume * 1.6f, m_sfx_volume * 0.7f);
-    for (long i = 0; i < frames; ++i)
-    {
-      if (m_banner_pos >= banner_frames)
-      {
-        if (!m_banner_loop)
-        {
-          m_banner_on = false;
-          break;
-        }
-        m_banner_pos = std::min(m_banner_loop_start, banner_frames - 1);
-      }
-      float l, r;
-      Sample(m_banner, m_banner_pos, &l, &r);
-      out[i * 2] += l * g;
-      out[i * 2 + 1] += r * g;
-      m_banner_pos += m_banner.step;
     }
   }
 
