@@ -13,6 +13,7 @@
 #include <utility>
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QDirIterator>
@@ -340,7 +341,8 @@ static std::vector<BigPictureSettingCategory> Regroup(std::vector<BigPictureSett
         {"Mode manette", "Mise en veille propre"},
         {"Mode manette", "Rechercher les mises à jour au démarrage"},
         {"Mode manette", "Rechercher une mise à jour"},
-        {"Avancé", "Interface classique"}}},
+        {"Avancé", "Interface classique"},
+        {"Avancé", "Remettre tous les réglages par défaut"}}},
       {"Avancé", {{"Général", "Double cœur"}, {"Avancé", "*"}}},
       {"Hacks graphiques", {{"Hacks graphiques", "*"}}},
   };
@@ -1420,6 +1422,68 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
     c.items.push_back(Action(Tr("Interface classique"),
                              Tr("Pour les réglages très pointus et les outils de débogage."),
                              [open_classic] { open_classic(); }));
+    {
+      // Everything back to Dolphin's defaults, twice to confirm. Kept: game folders and
+      // other paths, controller ports and mappings, favorites, play history, resume points.
+      auto armed = std::make_shared<qint64>(0);
+      const auto notify = host.notify;
+      c.items.push_back(Action(
+          Tr("Remettre tous les réglages par défaut"),
+          Tr("Appuie deux fois sur A. Les dossiers de jeux, les manettes et leur configuration, "
+             "les favoris, le temps de jeu et les reprises sont conservés."),
+          [armed, notify, changed] {
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            if (now - *armed > 4000)
+            {
+              *armed = now;
+              if (notify)
+                notify(Tr("Appuie encore sur A pour tout réinitialiser"));
+              return;
+            }
+            *armed = 0;
+            {
+              Config::ConfigChangeCallbackGuard guard;
+              const auto layer = Config::GetLayer(Config::LayerType::Base);
+              std::vector<Config::Location> remove;
+              for (const auto& [location, value] : layer->GetLayerMap())
+              {
+                if (location.system != Config::System::Main &&
+                    location.system != Config::System::GFX &&
+                    location.system != Config::System::SYSCONF)
+                  continue;
+                const std::string& section = location.section;
+                const std::string& key = location.key;
+                const bool keep =
+                    section == "General" || section == "Analytics" || section == "AutoUpdate" ||
+                    section == "NetPlay" || section == "SDL_Hints" ||
+                    (section == "Interface" && (key == "LanguageCode" || key == "ThemeName")) ||
+                    key == "Fullscreen" || key == "RenderToMain" ||
+                    key.find("Path") != std::string::npos || key.find("SIDevice") == 0 ||
+                    key.find("Folder") != std::string::npos || key.find("Wiimote") != std::string::npos;
+                if (!keep)
+                  remove.push_back(location);
+              }
+              for (const Config::Location& location : remove)
+                layer->DeleteKey(location);
+              Config::OnConfigChanged();
+            }
+            Config::Save();
+            // Controller-mode preferences
+            QSettings& settings = Settings::GetQSettings();
+            for (const char* key :
+                 {"auto_hdr", "autoswitch", "check_updates", "effect", "icons", "intro",
+                  "intro_style", "menu_button", "music", "music_volume", "onstart", "preset",
+                  "real_boot", "sfx_volume", "sleep_save", "sort", "swap_menu_buttons", "theme",
+                  "transition", "view"})
+            {
+              settings.remove(QStringLiteral("bigpicture/") + QString::fromLatin1(key));
+            }
+            if (changed)
+              changed();
+            if (notify)
+              notify(Tr("Réglages par défaut rétablis"));
+          }));
+    }
     cats.push_back(std::move(c));
   }
 
