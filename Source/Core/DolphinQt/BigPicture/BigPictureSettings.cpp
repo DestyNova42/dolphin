@@ -349,6 +349,10 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                   "Dolphin le reçoit."),
                                [diag] { diag(); }));
     }
+    c.items.push_back(PrefToggle(Tr("Inverser A/B et X/Y dans les menus"),
+                                 Tr("Dans les menus seulement : B valide et A revient, X et Y "
+                                    "échangés. En jeu, rien ne change."),
+                                 QStringLiteral("bigpicture/swap_menu_buttons"), false, {}));
     c.items.push_back(PrefChoice(Tr("Icônes des boutons"),
                                  Tr("Les boutons affichés en bas de l'écran."),
                                  QStringLiteral("bigpicture/icons"),
@@ -556,6 +560,78 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
   // ---- Graphics
   {
     BigPictureSettingCategory c{Tr("Graphismes"), {}};
+    {
+      // Presets: Dolphin's own user settings, written at once (each stays editable below)
+      const auto notify = host.notify;
+      const auto done = [notify](const QString& text) {
+        Config::Save();
+        if (notify)
+          notify(text);
+      };
+      c.items.push_back(Action(
+          Tr("Préréglage : Fidélité"),
+          Tr("Privilégie la justesse de l'émulation à la vitesse : simple cœur, accès CPU à "
+             "l'EFB, copies EFB/XFB vers la RAM, cache de textures sûr, bounding box. Plus "
+             "lent ; corrige des effets manquants dans certains jeux. Le préréglage "
+             "d'affichage du mode manette doit être Désactivé pour le garder en jeu."),
+          [done] {
+            Config::SetBase(Config::MAIN_CPU_THREAD, false);
+            Config::SetBase(Config::MAIN_SYNC_GPU, false);
+            Config::SetBase(Config::GFX_HACK_EFB_ACCESS_ENABLE, true);
+            Config::SetBase(Config::GFX_HACK_EFB_DEFER_INVALIDATION, false);
+            Config::SetBase(Config::GFX_HACK_SKIP_EFB_COPY_TO_RAM, false);
+            Config::SetBase(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM, false);
+            Config::SetBase(Config::GFX_HACK_IMMEDIATE_XFB, false);
+            Config::SetBase(Config::GFX_HACK_FAST_TEXTURE_SAMPLING, false);
+            Config::SetBase(Config::GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES, 0);
+            Config::SetBase(Config::GFX_HACK_BBOX_ENABLE, true);
+            done(Tr("Préréglage « Fidélité » appliqué"));
+          }));
+      c.items.push_back(Action(
+          Tr("Préréglage : Comme sur la console"),
+          Tr("L'image d'origine : résolution native, mise à l'échelle entière, rééchantillonnage "
+             "bilinéaire net, sans anticrénelage, filtrage forcé ni écran large forcé."),
+          [done] {
+            Config::SetBase(Config::GFX_EFB_SCALE, 1);
+            Config::SetBase(Config::GFX_INTEGER_SCALING, true);
+            Config::SetBase(Config::GFX_ENHANCE_OUTPUT_RESAMPLING,
+                            OutputResamplingMode::SharpBilinear);
+            Config::SetBase(Config::GFX_MSAA, 1u);
+            Config::SetBase(Config::GFX_SSAA, false);
+            Config::SetBase(Config::GFX_ENHANCE_MAX_ANISOTROPY, AnisotropicFilteringMode::Default);
+            Config::SetBase(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING,
+                            TextureFilteringMode::Default);
+            Config::SetBase(Config::GFX_WIDESCREEN_HACK, false);
+            Config::SetBase(Config::GFX_HACK_COPY_EFB_SCALED, true);
+            done(Tr("Préréglage « Comme sur la console » appliqué"));
+          }));
+      c.items.push_back(Action(
+          Tr("Préréglage : Par défaut"),
+          Tr("Remet les réglages ci-dessus aux valeurs par défaut de Dolphin (rapide)."),
+          [done] {
+            const auto reset = [](const auto& info) { Config::SetBase(info, info.GetDefaultValue()); };
+            reset(Config::MAIN_CPU_THREAD);
+            reset(Config::MAIN_SYNC_GPU);
+            reset(Config::GFX_HACK_EFB_ACCESS_ENABLE);
+            reset(Config::GFX_HACK_EFB_DEFER_INVALIDATION);
+            reset(Config::GFX_HACK_SKIP_EFB_COPY_TO_RAM);
+            reset(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM);
+            reset(Config::GFX_HACK_IMMEDIATE_XFB);
+            reset(Config::GFX_HACK_FAST_TEXTURE_SAMPLING);
+            reset(Config::GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES);
+            reset(Config::GFX_HACK_BBOX_ENABLE);
+            reset(Config::GFX_EFB_SCALE);
+            reset(Config::GFX_INTEGER_SCALING);
+            reset(Config::GFX_ENHANCE_OUTPUT_RESAMPLING);
+            reset(Config::GFX_MSAA);
+            reset(Config::GFX_SSAA);
+            reset(Config::GFX_ENHANCE_MAX_ANISOTROPY);
+            reset(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING);
+            reset(Config::GFX_WIDESCREEN_HACK);
+            reset(Config::GFX_HACK_COPY_EFB_SCALED);
+            done(Tr("Réglages par défaut rétablis"));
+          }));
+    }
     std::vector<std::pair<std::string, QString>> backends;
     for (const auto& backend : VideoBackendBase::GetAvailableBackends())
     {
@@ -1752,6 +1828,57 @@ void FinishBigPictureWiiSetup(int port)
   Wiimote::GetConfig()->SaveConfig();
 }
 
+bool BigPictureWiiGyroPointer(int port)
+{
+  return Settings::GetQSettings()
+      .value(QStringLiteral("bigpicture/wii_gyro_pointer/%1").arg(port), false)
+      .toBool();
+}
+
+// Pointer from the controller's gyroscope (DualSense, Pro, Pro 2, 8BitDo…) or from the
+// right stick. Input mapping only: the IMU groups of the emulated Wii Remote read the
+// controller's motion sensors, the stick pointer is cleared (and the other way round).
+void SetBigPictureWiiGyroPointer(int port, bool gyro)
+{
+  using WGr = WiimoteEmu::WiimoteGroup;
+  Settings::GetQSettings().setValue(QStringLiteral("bigpicture/wii_gyro_pointer/%1").arg(port),
+                                    gyro);
+  auto* wm = Wiimote::GetConfig()->GetController(port);
+  if (!wm)
+    return;
+  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
+  const auto set = [port](WGr g, int index, const std::string& expr) {
+    auto* group = Wiimote::GetWiimoteGroup(port, g);
+    if (index < static_cast<int>(group->controls.size()))
+      (void)group->controls[index]->control_ref->SetExpression(expr);
+  };
+  static const char* accel[] = {"Accel Up",    "Accel Down",    "Accel Left",
+                                "Accel Right", "Accel Forward", "Accel Backward"};
+  static const char* gyro_in[] = {"Gyro Pitch Up",  "Gyro Pitch Down", "Gyro Roll Left",
+                                  "Gyro Roll Right", "Gyro Yaw Left",   "Gyro Yaw Right"};
+  for (int i = 0; i < 6; ++i)
+  {
+    set(WGr::IMUAccelerometer, i, gyro ? std::string("`") + accel[i] + "`" : std::string());
+    set(WGr::IMUGyroscope, i, gyro ? std::string("`") + gyro_in[i] + "`" : std::string());
+  }
+  // Recenter: click the right stick
+  set(WGr::IMUPoint, 0, gyro ? "`Thumb R`" : "");
+  if (gyro)
+  {
+    for (int i = 0; i < 4; ++i)
+      set(WGr::Point, i, "");
+  }
+  else
+  {
+    set(WGr::Point, 0, "`Right Y+`");
+    set(WGr::Point, 1, "`Right Y-`");
+    set(WGr::Point, 2, "`Right X-`");
+    set(WGr::Point, 3, "`Right X+`");
+  }
+  wm->UpdateReferences(g_controller_interface);
+  Wiimote::GetConfig()->SaveConfig();
+}
+
 bool ApplyWiiProfile(int port, int extension, bool sideways)
 {
   using WGr = WiimoteEmu::WiimoteGroup;
@@ -1900,6 +2027,8 @@ bool ApplyWiiProfile(int port, int extension, bool sideways)
   wm->UpdateReferences(g_controller_interface);
   Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::Emulated);
   Wiimote::GetConfig()->SaveConfig();
+  if (BigPictureWiiGyroPointer(port) && !sideways)
+    SetBigPictureWiiGyroPointer(port, true);  // (the state lock is recursive)
   return true;
 }
 
@@ -1918,6 +2047,19 @@ std::vector<BigPictureSettingCategory> BuildBigPictureWiiControllers(const BigPi
     item.value = [port] { return Tr("Joueur %1").arg(*port + 1); };
     item.change = [port](int dir) { *port = (*port + dir + 4) % 4; };
     item.activate = [port] { *port = (*port + 1) % 4; };
+    c.items.push_back(std::move(item));
+  }
+  {
+    Item item;
+    item.label = Tr("Pointeur");
+    item.help = Tr("Gyroscope : vise en inclinant la manette (DualSense, manettes Pro, 8BitDo…) ; "
+                   "clic du stick droit pour recentrer. Stick droit : vise au stick.");
+    item.kind = Item::Kind::Choice;
+    item.value = [port] {
+      return BigPictureWiiGyroPointer(*port) ? Tr("Gyroscope") : Tr("Stick droit");
+    };
+    item.change = [port](int) { SetBigPictureWiiGyroPointer(*port, !BigPictureWiiGyroPointer(*port)); };
+    item.activate = [change = item.change] { change(1); };
     c.items.push_back(std::move(item));
   }
   {

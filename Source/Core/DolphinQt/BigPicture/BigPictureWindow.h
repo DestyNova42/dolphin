@@ -155,6 +155,9 @@ private:
     WiiTest,       // live view of an emulated Wii Remote
     WiiSaves,      // Wii save manager
     DeviceDiag,    // raw inputs of every controller
+    Gallery,       // screenshots
+    Stats,         // play time
+    WiiPair,       // pairing a real Wii Remote
   };
 
   struct SaveIcon
@@ -296,6 +299,16 @@ private:
   void OpenWiiSaves();
   void HandleWiiSaves(Action action);
   void DrawWiiSaves(QPainter& painter);
+  void OpenGallery();
+  void HandleGallery(Action action);
+  void DrawGallery(QPainter& painter);
+  QString ShotGameTitle(const QString& path) const;
+  void OpenStats();
+  void HandleStats(Action action);
+  void DrawStats(QPainter& painter);
+  void OpenWiiPair();
+  void HandleWiiPair(Action action);
+  void DrawWiiPair(QPainter& painter);
   void DrawWiiTest(QPainter& painter);
   void SyncSaves(bool announce);
 
@@ -515,9 +528,26 @@ private:
   bool m_ws_actions = false;
   int m_ws_action = 0;
   bool m_ws_confirm = false;
+  // Screenshot gallery
+  std::vector<QString> m_shots;  // newest first
+  int m_shot_index = 0;
+  bool m_shot_view = false;      // one screenshot on the whole screen
+  bool m_shot_delete_armed = false;
+  std::map<QString, QPixmap> m_shot_thumbs;
+  QString m_shot_full_path;
+  QPixmap m_shot_full;
+  // Statistics
+  std::vector<std::pair<Entry, qint64>> m_stats_top;     // minutes played
+  std::vector<std::pair<Entry, qint64>> m_stats_recent;  // last played (epoch s)
+  qint64 m_stats_total_min = 0;
+  int m_stats_played = 0;
+  // Real Wii Remote pairing
+  int m_pair_port = 0;
+  qint64 m_pair_last_scan = 0;
   qint64 m_home_down_since = -1;
   bool m_slept_in_game = false;
   bool m_wii_icons = false;
+  bool m_swap_menu_buttons = false;
   int m_sleep_fd = -1;  // logind "delay" inhibitor (Linux)
   void TakeSleepInhibitor();
   void QuitGame();

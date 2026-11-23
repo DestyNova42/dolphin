@@ -156,6 +156,9 @@ int BigPictureWiiExtension(int port);  // 0 none, 1 Nunchuk, 2 Classic Controlle
 // Wii Remote (+ Nunchuk) or Classic Controller on the controller of the same player.
 // Sideways Wii Remote (the Dolphin option of this player)
 bool BigPictureWiiSideways(int port);
+// Wii pointer from the controller's gyroscope (true) or the right stick
+bool BigPictureWiiGyroPointer(int port);
+void SetBigPictureWiiGyroPointer(int port, bool gyro);
 void BigPictureSetWiiSideways(int port, bool sideways);
 // After the Wii assistant: emulated source, round pointer, saved.
 void FinishBigPictureWiiSetup(int port);

@@ -22,6 +22,7 @@
 
 #include <QDateTime>
 #include <QDir>
+#include <QDesktopServices>
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QFile>
@@ -82,6 +83,9 @@
 #include "Core/HW/WiimoteEmu/Extension/Nunchuk.h"
 #include "Core/HW/WiimoteEmu/WiimoteEmu.h"
 #include "Core/HW/WiiSave.h"
+#include "Core/HW/WiimoteReal/WiimoteReal.h"
+#include "Core/Config/WiimoteSettings.h"
+#include <QImageReader>
 #include "Core/IOS/FS/FileSystem.h"
 #include "Core/IOS/IOS.h"
 #include "DiscIO/WiiSaveBanner.h"
@@ -1110,6 +1114,21 @@ void BigPictureWindow::PollController()
     }
   }
 
+  // Option: A/B and X/Y swapped in the menus only (never in a game)
+  if (m_swap_menu_buttons)
+  {
+    const auto swap = [&held](Action p, Action q) {
+      const bool hp = held & Bit(int(p)), hq = held & Bit(int(q));
+      held &= ~(Bit(int(p)) | Bit(int(q)));
+      if (hp)
+        held |= Bit(int(q));
+      if (hq)
+        held |= Bit(int(p));
+    };
+    swap(Action::Accept, Action::Back);
+    swap(Action::Options, Action::Favorite);
+  }
+
   const qint64 now = m_clock.elapsed();
 
   // C-stick in the library: jump by letter (or by 10 games when not sorted by name)
@@ -1376,6 +1395,15 @@ void BigPictureWindow::HandleAction(Action action)
     break;
   case Mode::WiiSaves:
     HandleWiiSaves(action);
+    break;
+  case Mode::Gallery:
+    HandleGallery(action);
+    break;
+  case Mode::Stats:
+    HandleStats(action);
+    break;
+  case Mode::WiiPair:
+    HandleWiiPair(action);
     break;
   case Mode::Players:
     if (action == Action::Back || action == Action::Menu)
@@ -1755,7 +1783,7 @@ void BigPictureWindow::HandleSettings(Action action)
 
 void BigPictureWindow::HandleMenu(Action action)
 {
-  constexpr int ITEMS = 9;
+  constexpr int ITEMS = 12;
   switch (action)
   {
   case Action::Down:
@@ -1796,12 +1824,21 @@ void BigPictureWindow::HandleMenu(Action action)
       OpenWiiSaves();
       break;
     case 6:
-      StartSetup(0);
+      OpenGallery();
       break;
     case 7:
-      emit ClassicRequested();
+      OpenStats();
       break;
     case 8:
+      OpenWiiPair();
+      break;
+    case 9:
+      StartSetup(0);
+      break;
+    case 10:
+      emit ClassicRequested();
+      break;
+    case 11:
       SetMode(Mode::ConfirmQuit);
       break;
     default:
@@ -2286,8 +2323,19 @@ QString WiiIconName(const QString& name)
 }
 }  // namespace
 
-void BigPictureWindow::DrawIcon(QPainter& painter, const QString& name, const QRectF& rect)
+void BigPictureWindow::DrawIcon(QPainter& painter, const QString& name_in, const QRectF& rect)
 {
+  // A/B and X/Y swapped in the menus: the hints show the button that really does it
+  QString name = name_in;
+  if (m_swap_menu_buttons && m_mode != Mode::PadTest && m_mode != Mode::WiiTest &&
+      m_mode != Mode::Remap && m_mode != Mode::Calibrate && m_mode != Mode::Setup &&
+      m_mode != Mode::DeviceDiag)
+  {
+    static const QHash<QString, QString> swapped = {
+        {QStringLiteral("A"), QStringLiteral("B")}, {QStringLiteral("B"), QStringLiteral("A")},
+        {QStringLiteral("X"), QStringLiteral("Y")}, {QStringLiteral("Y"), QStringLiteral("X")}};
+    name = swapped.value(name, name);
+  }
   // Icon style chosen in the settings (the testers and the remap keep the real buttons)
   if (m_wii_icons && m_mode != Mode::PadTest && m_mode != Mode::WiiTest &&
       m_mode != Mode::Remap && m_mode != Mode::Calibrate && m_mode != Mode::Setup)
@@ -2504,6 +2552,8 @@ void BigPictureWindow::paintEvent(QPaintEvent*)
 {
   m_hits.clear();
   m_wii_icons = Settings::GetQSettings().value(QStringLiteral("bigpicture/icons"), 0).toInt() == 1;
+  m_swap_menu_buttons =
+      Settings::GetQSettings().value(QStringLiteral("bigpicture/swap_menu_buttons"), false).toBool();
   const qreal dpr = devicePixelRatioF();
   const QSize px_size = size() * dpr;
   if (m_frame.size() != px_size)
@@ -2645,6 +2695,35 @@ void BigPictureWindow::DrawScene(QPainter& painter)
     DrawTopBar(painter);
     DrawWiiSaves(painter);
     DrawToast(painter);
+    return;
+  }
+  if (m_mode == Mode::Gallery)
+  {
+    if (m_shot_view)
+      painter.fillRect(rect(), Qt::black);
+    else
+    {
+      DrawBackground(painter);
+      DrawTopBar(painter);
+    }
+    DrawGallery(painter);
+    DrawToast(painter);
+    return;
+  }
+  if (m_mode == Mode::Stats)
+  {
+    DrawBackground(painter);
+    DrawTopBar(painter);
+    DrawStats(painter);
+    return;
+  }
+  if (m_mode == Mode::WiiPair)
+  {
+    DrawBackground(painter);
+    DrawTopBar(painter);
+    DrawWiiPair(painter);
+    DrawToast(painter);
+    update();  // live status
     return;
   }
   if (m_mode == Mode::ChooseDisc)
@@ -3699,14 +3778,37 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
       continue;
     const QRectF r(ix, y, iw, row_h);
     const bool focused = m_settings_in_items && i == m_settings_item;
+    // Value area of a choice: as wide as its text needs (the label gives way), then a
+    // smaller font, so values are never cut ("Ubershaders (asynchrone)")
+    const QFont label_font = Font(false, int(23 * k), focused ? 600 : 500);
+    const qreal label_w = QFontMetricsF(label_font).horizontalAdvance(item.label);
+    QString value_text;
+    QFont value_font = Font(false, int(22 * k), 600);
+    qreal vbox = 300 * k;
+    if (item.kind == BigPictureSettingItem::Kind::Choice)
+    {
+      value_text = item.value ? item.value() : QString();
+      const qreal room = std::max<qreal>(300 * k, r.width() - 28 * k - std::min(label_w, r.width() * 0.45) - 56 * k);
+      int px = int(22 * k);
+      qreal tw = QFontMetricsF(value_font).horizontalAdvance(value_text);
+      while (tw + 70 * k > room && px > int(15 * k))
+      {
+        --px;
+        value_font = Font(false, px, 600);
+        tw = QFontMetricsF(value_font).horizontalAdvance(value_text);
+      }
+      vbox = std::clamp<qreal>(tw + 70 * k, 300 * k, room);
+      value_text = QFontMetricsF(value_font).elidedText(value_text, Qt::ElideRight, vbox - 60 * k);
+    }
+    const qreal value_edge = 28 * k + vbox;
     AddHitAt(r.intersected(QRectF(ix - 20 * k, list_top - 6 * k, iw + 40 * k, view_h + 12 * k)),
-             [this, i, r, k](QPointF pos) {
+             [this, i, r, value_edge](QPointF pos) {
                const bool was = m_settings_in_items && m_settings_item == i;
                m_settings_in_items = true;
                m_settings_item = i;
                // The value area on the right: its left half goes back, its right half forward
-               if (pos.x() > r.right() - 360 * k)
-                 HandleAction(pos.x() < r.right() - 180 * k ? Action::Left : Action::Right);
+               if (pos.x() > r.right() - value_edge)
+                 HandleAction(pos.x() < r.right() - value_edge / 2 ? Action::Left : Action::Right);
                else if (was)
                  HandleAction(Action::Accept);
                else
@@ -3716,9 +3818,17 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
     painter.setBrush(focused ? TEXT : SURFACE);
     painter.drawRoundedRect(r, 16 * k, 16 * k);
     const QColor fg = focused ? BG : TEXT;
-    painter.setFont(Font(false, int(23 * k), focused ? 600 : 500));
+    painter.setFont(label_font);
     painter.setPen(fg);
-    painter.drawText(r.adjusted(28 * k, 0, -360 * k, 0), Qt::AlignVCenter, item.label);
+    {
+      const qreal right_room = item.kind == BigPictureSettingItem::Kind::Choice ?
+                                   value_edge + 16 * k :
+                                   item.kind == BigPictureSettingItem::Kind::Toggle ? 120 * k :
+                                                                                      200 * k;
+      const QRectF lr = r.adjusted(28 * k, 0, -right_room, 0);
+      painter.drawText(lr, Qt::AlignVCenter,
+                       QFontMetricsF(label_font).elidedText(item.label, Qt::ElideRight, lr.width()));
+    }
 
     switch (item.kind)
     {
@@ -3736,11 +3846,10 @@ void BigPictureWindow::DrawSettings(QPainter& painter, qreal top)
     }
     case BigPictureSettingItem::Kind::Choice:
     {
-      const QString value = item.value ? item.value() : QString();
-      const QRectF vr(r.right() - 28 * k - 300 * k, r.top(), 300 * k, r.height());
-      painter.setFont(Font(false, int(22 * k), 600));
+      const QRectF vr(r.right() - 28 * k - vbox, r.top(), vbox, r.height());
+      painter.setFont(value_font);
       painter.setPen(fg);
-      painter.drawText(vr.adjusted(30 * k, 0, -30 * k, 0), Qt::AlignCenter, value);
+      painter.drawText(vr.adjusted(30 * k, 0, -30 * k, 0), Qt::AlignCenter, value_text);
       QPen arrow(fg, 2.5 * k);
       arrow.setCapStyle(Qt::RoundCap);
       arrow.setJoinStyle(Qt::RoundJoin);
@@ -3848,19 +3957,21 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
   const QString items[] = {tr("Retour à la bibliothèque"), tr("Réglages"),
                            tr("Joueurs"),                 tr("Menu Wii"),
                            tr("Cartes mémoire"),          tr("Sauvegardes Wii"),
-                           tr("Configurer la manette"),   tr("Interface classique"),
-                           tr("Quitter Dolphin")};
-  qreal y = 205 * k;
-  for (int i = 0; i < 9; ++i)
+                           tr("Galerie de captures"),     tr("Statistiques"),
+                           tr("Associer une vraie Wiimote"), tr("Configurer la manette"),
+                           tr("Interface classique"),     tr("Quitter Dolphin")};
+  constexpr int COUNT = 12;
+  qreal y = 196 * k;
+  for (int i = 0; i < COUNT; ++i)
   {
-    if (i == 8)
+    if (i == COUNT - 1)
     {
-      painter.fillRect(QRectF(64 * k, y + 4 * k, 572 * k, 1 * k), LINE);
-      y += 20 * k;
+      painter.fillRect(QRectF(64 * k, y + 2 * k, 572 * k, 1 * k), LINE);
+      y += 12 * k;
     }
     // items slide in one after the other
-    const qreal ie = EaseOut((m_overlay_t - i * 0.06) / 0.7);
-    const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 62 * k);
+    const qreal ie = EaseOut((m_overlay_t - i * 0.05) / 0.7);
+    const QRectF r(64 * k - (1 - ie) * 40 * k, y, 572 * k, 52 * k);
     const bool active = i == m_menu_index;
     AddHit(r, [this, i] {
       m_menu_index = i;
@@ -3873,12 +3984,12 @@ void BigPictureWindow::DrawMenu(QPainter& painter)
       painter.setBrush(ACCENT);
       painter.drawRoundedRect(r, 16 * k, 16 * k);
       DrawIcon(painter, QStringLiteral("A"),
-               QRectF(r.right() - 28 * k - 38 * k, r.center().y() - 19 * k, 38 * k, 38 * k));
+               QRectF(r.right() - 24 * k - 36 * k, r.center().y() - 18 * k, 36 * k, 36 * k));
     }
-    painter.setFont(Font(false, int(24 * k), active ? 600 : 500));
-    painter.setPen(active ? BG : (i == 8 ? DANGER : TEXT));
-    painter.drawText(r.adjusted(28 * k, 0, 0, 0), Qt::AlignVCenter, items[i]);
-    y += 68 * k;
+    painter.setFont(Font(false, int(22 * k), active ? 600 : 500));
+    painter.setPen(active ? BG : (i == COUNT - 1 ? DANGER : TEXT));
+    painter.drawText(r.adjusted(28 * k, 0, -80 * k, 0), Qt::AlignVCenter, items[i]);
+    y += 57 * k;
   }
   painter.setOpacity(e);
 
@@ -7375,4 +7486,609 @@ void BigPictureWindow::DrawDeviceDiag(QPainter& painter)
   painter.drawText(QRectF(0, height() - 70 * k, width(), 30 * k), Qt::AlignCenter,
                    tr("Sans toucher la manette, rien ne devrait s'allumer   ·   ← → : autre manette   ·   "
                       "Maintiens START ou Échap pour quitter"));
+}
+
+// ================================================================== screenshot gallery
+
+void BigPictureWindow::OpenGallery()
+{
+  m_shots.clear();
+  m_shot_thumbs.clear();
+  m_shot_full_path.clear();
+  m_shot_full = {};
+  std::vector<std::pair<qint64, QString>> found;
+  QDirIterator it(QString::fromStdString(File::GetUserPath(D_SCREENSHOTS_IDX)),
+                  {QStringLiteral("*.png"), QStringLiteral("*.jpg")}, QDir::Files,
+                  QDirIterator::Subdirectories);
+  while (it.hasNext())
+  {
+    it.next();
+    const QFileInfo info = it.fileInfo();
+    if (info.fileName().startsWith(QStringLiteral("bigpicture_")))
+      continue;  // the pause menu's background
+    found.emplace_back(info.lastModified().toSecsSinceEpoch(), info.filePath());
+  }
+  std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (auto& [when, path] : found)
+    m_shots.push_back(std::move(path));
+  m_shot_index = 0;
+  m_shot_view = false;
+  m_shot_delete_armed = false;
+  BeginTransition(0);
+  m_mode = Mode::Gallery;
+}
+
+QString BigPictureWindow::ShotGameTitle(const QString& path) const
+{
+  // Screenshots are stored in a folder named after the game ID
+  const std::string id = QFileInfo(path).dir().dirName().toStdString();
+  for (const Entry& e : m_all)
+  {
+    if (e.game && e.game->GetGameID() == id)
+      return e.title;
+  }
+  return QString::fromStdString(id);
+}
+
+void BigPictureWindow::HandleGallery(Action action)
+{
+  const int count = static_cast<int>(m_shots.size());
+  constexpr int COLS = 4;
+  const auto move = [&](int delta) {
+    if (count == 0)
+      return;
+    const int next = std::clamp(m_shot_index + delta, 0, count - 1);
+    if (next != m_shot_index)
+    {
+      m_shot_index = next;
+      m_shot_delete_armed = false;
+      m_audio->Play(Sound::Move);
+    }
+  };
+  switch (action)
+  {
+  case Action::Left:
+    move(-1);
+    break;
+  case Action::Right:
+    move(1);
+    break;
+  case Action::Up:
+    move(m_shot_view ? -1 : -COLS);
+    break;
+  case Action::Down:
+    move(m_shot_view ? 1 : COLS);
+    break;
+  case Action::Accept:
+    if (count > 0 && !m_shot_view)
+    {
+      m_shot_view = true;
+      m_audio->Play(Sound::Confirm);
+    }
+    break;
+  case Action::Options:
+  {
+    if (count == 0)
+      break;
+    if (!m_shot_delete_armed)
+    {
+      m_shot_delete_armed = true;
+      m_audio->Play(Sound::MenuOpen);
+      Toast(tr("Appuie encore sur X pour supprimer cette capture"));
+      break;
+    }
+    const QString path = m_shots[m_shot_index];
+    if (QFile::remove(path))
+    {
+      m_audio->Play(Sound::Erase);
+      Toast(tr("Capture supprimée"));
+      m_shots.erase(m_shots.begin() + m_shot_index);
+      m_shot_thumbs.erase(path);
+      m_shot_index = std::clamp(m_shot_index, 0, std::max(0, int(m_shots.size()) - 1));
+      if (m_shots.empty())
+        m_shot_view = false;
+    }
+    else
+    {
+      m_audio->Play(Sound::Error);
+      Toast(tr("Suppression impossible"));
+    }
+    m_shot_delete_armed = false;
+    break;
+  }
+  case Action::Favorite:
+    if (count > 0)
+    {
+      QDesktopServices::openUrl(
+          QUrl::fromLocalFile(QFileInfo(m_shots[m_shot_index]).absolutePath()));
+    }
+    break;
+  case Action::Back:
+  case Action::Menu:
+    m_audio->Play(Sound::Back);
+    m_shot_delete_armed = false;
+    if (m_shot_view)
+    {
+      m_shot_view = false;
+      break;
+    }
+    BeginTransition(0);
+    m_mode = Mode::Library;
+    break;
+  default:
+    break;
+  }
+}
+
+void BigPictureWindow::DrawGallery(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  const int count = static_cast<int>(m_shots.size());
+  if (m_shot_view && count > 0)
+  {
+    const QString& path = m_shots[m_shot_index];
+    if (path != m_shot_full_path)
+    {
+      m_shot_full_path = path;
+      m_shot_full = QPixmap(path);
+    }
+    if (!m_shot_full.isNull())
+    {
+      const QSize sz = m_shot_full.size().scaled(size(), Qt::KeepAspectRatio);
+      const QRectF r((width() - sz.width()) / 2.0, (height() - sz.height()) / 2.0, sz.width(),
+                     sz.height());
+      painter.setRenderHint(QPainter::SmoothPixmapTransform);
+      painter.drawPixmap(r, m_shot_full, m_shot_full.rect());
+    }
+    // Caption on a shade at the top
+    QLinearGradient shade(0, 0, 0, 150 * k);
+    shade.setColorAt(0, QColor(0, 0, 0, 200));
+    shade.setColorAt(1, QColor(0, 0, 0, 0));
+    painter.fillRect(QRectF(0, 0, width(), 150 * k), shade);
+    painter.setFont(Font(true, int(32 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(80 * k, 30 * k, width() - 160 * k, 48 * k), Qt::AlignVCenter,
+                     ShotGameTitle(path));
+    painter.setFont(Font(false, int(20 * k), 400));
+    painter.setPen(TEXT_SOFT);
+    painter.drawText(QRectF(80 * k, 78 * k, width() - 160 * k, 30 * k), Qt::AlignVCenter,
+                     tr("%1   ·   %2 / %3")
+                         .arg(QLocale().toString(QFileInfo(path).lastModified(),
+                                                 QStringLiteral("d MMMM yyyy, HH:mm")))
+                         .arg(m_shot_index + 1)
+                         .arg(count));
+    QLinearGradient bottom(0, height() - 130 * k, 0, height());
+    bottom.setColorAt(0, QColor(0, 0, 0, 0));
+    bottom.setColorAt(1, QColor(0, 0, 0, 200));
+    painter.fillRect(QRectF(0, height() - 130 * k, width(), 130 * k), bottom);
+    DrawHints(painter, {{QStringLiteral("D-Pad-L"), tr("Précédente")},
+                        {QStringLiteral("D-Pad-R"), tr("Suivante")}},
+              {{QStringLiteral("X"), m_shot_delete_armed ? tr("Confirmer") : tr("Supprimer")},
+               {QStringLiteral("B"), tr("Retour")}});
+    return;
+  }
+
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(80 * k, 170 * k, 1200 * k, 30 * k), Qt::AlignVCenter,
+                   tr("GALERIE DE CAPTURES · %1").arg(count));
+  if (count == 0)
+  {
+    painter.setFont(Font(true, int(36 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(0, 400 * k, width(), 60 * k), Qt::AlignCenter,
+                     tr("Aucune capture pour l'instant"));
+    painter.setFont(Font(false, int(22 * k), 400));
+    painter.setPen(TEXT_SOFT);
+    painter.drawText(QRectF(0, 470 * k, width(), 40 * k), Qt::AlignCenter,
+                     tr("En jeu : menu › Capture d'écran"));
+    DrawHints(painter, {}, {{QStringLiteral("B"), tr("Retour")}});
+    return;
+  }
+
+  constexpr int COLS = 4;
+  const qreal gx = 80 * k, gy = 220 * k, gap = 24 * k;
+  const qreal cw = (width() - 2 * gx - (COLS - 1) * gap) / COLS;
+  const qreal ch = cw * 9 / 16;
+  const qreal row_h = ch + 56 * k;
+  const int rows = std::max(1, int((height() - gy - 120 * k) / row_h));
+  const int sel_row = m_shot_index / COLS;
+  const int total_rows = (count + COLS - 1) / COLS;
+  const int first_row = std::clamp(sel_row - rows / 2, 0, std::max(0, total_rows - rows));
+  int loaded = 0;
+  for (int i = first_row * COLS; i < std::min(count, (first_row + rows) * COLS); ++i)
+  {
+    const int col = i % COLS, row = i / COLS - first_row;
+    const QRectF r(gx + col * (cw + gap), gy + row * row_h, cw, ch);
+    const QString& path = m_shots[i];
+    auto it = m_shot_thumbs.find(path);
+    if (it == m_shot_thumbs.end() && loaded < 2)
+    {
+      // A few thumbnails per frame, the next ones on the following frames
+      QImageReader reader(path);
+      const QSize full = reader.size();
+      if (full.isValid())
+        reader.setScaledSize(full.scaled(int(cw), int(ch), Qt::KeepAspectRatioByExpanding));
+      it = m_shot_thumbs.emplace(path, QPixmap::fromImage(reader.read())).first;
+      ++loaded;
+    }
+    QPainterPath clip;
+    clip.addRoundedRect(r, 14 * k, 14 * k);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(SURFACE);
+    painter.drawPath(clip);
+    if (it != m_shot_thumbs.end() && !it->second.isNull())
+    {
+      painter.save();
+      painter.setClipPath(clip);
+      const QPixmap& pm = it->second;
+      const QSizeF s = QSizeF(pm.size()).scaled(r.size(), Qt::KeepAspectRatioByExpanding);
+      painter.drawPixmap(QRectF(r.center().x() - s.width() / 2, r.center().y() - s.height() / 2,
+                                s.width(), s.height()),
+                         pm, pm.rect());
+      painter.restore();
+    }
+    const bool active = i == m_shot_index;
+    if (active)
+    {
+      painter.setBrush(Qt::NoBrush);
+      painter.setPen(QPen(ACCENT, 5 * k));
+      painter.drawRoundedRect(r.adjusted(-4 * k, -4 * k, 4 * k, 4 * k), 17 * k, 17 * k);
+    }
+    painter.setFont(Font(false, int(18 * k), active ? 600 : 400));
+    painter.setPen(active ? TEXT : TEXT_SOFT);
+    painter.drawText(QRectF(r.left(), r.bottom() + 8 * k, r.width(), 30 * k), Qt::AlignVCenter,
+                     QFontMetricsF(painter.font())
+                         .elidedText(ShotGameTitle(path), Qt::ElideRight, r.width()));
+    AddHit(r, [this, i] {
+      if (m_shot_index == i)
+        HandleGallery(Action::Accept);
+      else
+      {
+        m_shot_index = i;
+        m_shot_delete_armed = false;
+        m_audio->Play(Sound::Move);
+      }
+    });
+  }
+  if (loaded > 0)
+    update();
+  DrawHints(painter, {{QStringLiteral("A"), tr("Voir")}, {QStringLiteral("Y"), tr("Ouvrir le dossier")}},
+            {{QStringLiteral("X"), m_shot_delete_armed ? tr("Confirmer") : tr("Supprimer")},
+             {QStringLiteral("B"), tr("Retour")}});
+}
+
+// ================================================================== statistics
+
+void BigPictureWindow::OpenStats()
+{
+  TimePlayed played;
+  played.Reload();
+  const QSettings& settings = Settings::GetQSettings();
+  m_stats_top.clear();
+  m_stats_recent.clear();
+  m_stats_total_min = 0;
+  m_stats_played = 0;
+  std::set<std::string> seen;  // multi-disc games share one ID
+  for (const Entry& e : m_all)
+  {
+    if (!e.game)
+      continue;
+    const std::string id = e.game->GetGameID();
+    const qint64 minutes =
+        std::chrono::duration_cast<std::chrono::minutes>(played.GetTimePlayed(id)).count();
+    const qint64 last = settings.value(LastPlayedKey(e.path), 0).toLongLong();
+    if (!seen.insert(id).second)
+      continue;
+    if (minutes > 0)
+      m_stats_top.emplace_back(e, minutes);
+    if (last > 0)
+      m_stats_recent.emplace_back(e, last);
+    if (minutes > 0 || last > 0)
+      ++m_stats_played;
+    m_stats_total_min += minutes;
+  }
+  const auto by_value = [](const auto& a, const auto& b) { return a.second > b.second; };
+  std::sort(m_stats_top.begin(), m_stats_top.end(), by_value);
+  std::sort(m_stats_recent.begin(), m_stats_recent.end(), by_value);
+  if (m_stats_top.size() > 7)
+    m_stats_top.resize(7);
+  if (m_stats_recent.size() > 7)
+    m_stats_recent.resize(7);
+  BeginTransition(0);
+  m_mode = Mode::Stats;
+}
+
+void BigPictureWindow::HandleStats(Action action)
+{
+  if (action == Action::Back || action == Action::Menu || action == Action::Accept)
+  {
+    m_audio->Play(Sound::Back);
+    BeginTransition(0);
+    m_mode = Mode::Library;
+  }
+}
+
+void BigPictureWindow::DrawStats(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  const auto duration = [this](qint64 minutes) {
+    if (minutes >= 60)
+      return tr("%1 h %2").arg(minutes / 60).arg(minutes % 60, 2, 10, QLatin1Char('0'));
+    return tr("%1 min").arg(minutes);
+  };
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(80 * k, 170 * k, 1200 * k, 30 * k), Qt::AlignVCenter,
+                   tr("STATISTIQUES"));
+
+  // Three big numbers
+  const QString big[][2] = {
+      {duration(m_stats_total_min), tr("de jeu au total")},
+      {QString::number(m_stats_played), tr("jeux lancés")},
+      {QString::number(m_all.size()), tr("jeux dans la bibliothèque")},
+  };
+  const qreal bw = (width() - 160 * k - 2 * 24 * k) / 3;
+  for (int i = 0; i < 3; ++i)
+  {
+    const QRectF r(80 * k + i * (bw + 24 * k), 215 * k, bw, 130 * k);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(r, 18 * k, 18 * k);
+    painter.setFont(Font(true, int(46 * k), 700));
+    painter.setPen(i == 0 ? ACCENT : TEXT);
+    painter.drawText(r.adjusted(28 * k, 14 * k, -28 * k, -56 * k), Qt::AlignLeft | Qt::AlignVCenter,
+                     big[i][0]);
+    painter.setFont(Font(false, int(20 * k), 400));
+    painter.setPen(TEXT_SOFT);
+    painter.drawText(r.adjusted(28 * k, 74 * k, -28 * k, -16 * k), Qt::AlignLeft | Qt::AlignVCenter,
+                     big[i][1]);
+  }
+
+  const qreal col_w = (width() - 160 * k - 48 * k) / 2;
+  const qreal top = 385 * k, row_h = 74 * k;
+  for (int side = 0; side < 2; ++side)
+  {
+    const qreal x = 80 * k + side * (col_w + 48 * k);
+    painter.setFont(label);
+    painter.setPen(ACCENT_SOFT);
+    painter.drawText(QRectF(x, top, col_w, 30 * k), Qt::AlignVCenter,
+                     side == 0 ? tr("LES PLUS JOUÉS") : tr("DERNIÈRES PARTIES"));
+    const auto& list = side == 0 ? m_stats_top : m_stats_recent;
+    if (list.empty())
+    {
+      painter.setFont(Font(false, int(22 * k), 400));
+      painter.setPen(TEXT_DIM);
+      painter.drawText(QRectF(x, top + 44 * k, col_w, 40 * k), Qt::AlignVCenter,
+                       tr("Rien pour l'instant"));
+      continue;
+    }
+    const qint64 most = m_stats_top.empty() ? 1 : std::max<qint64>(1, m_stats_top.front().second);
+    for (size_t i = 0; i < list.size(); ++i)
+    {
+      const auto& [entry, value] = list[i];
+      const QRectF r(x, top + 44 * k + i * row_h, col_w, row_h - 10 * k);
+      if (r.bottom() > height() - 110 * k)
+        break;
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(SURFACE);
+      painter.drawRoundedRect(r, 14 * k, 14 * k);
+      if (side == 0)
+      {
+        // Bar: share of the most played game
+        QColor bar = ACCENT;
+        bar.setAlpha(60);
+        painter.setBrush(bar);
+        painter.drawRoundedRect(QRectF(r.left(), r.top(), r.width() * value / most, r.height()),
+                                14 * k, 14 * k);
+      }
+      const qreal cover_h = r.height() - 12 * k;
+      const QPixmap cover = CoverFor(entry, QSize(int(cover_h * 0.72), int(cover_h)));
+      qreal tx = r.left() + 18 * k;
+      if (!cover.isNull())
+      {
+        painter.drawPixmap(QRectF(r.left() + 8 * k, r.top() + 6 * k, cover_h * 0.72, cover_h), cover,
+                           cover.rect());
+        tx = r.left() + 8 * k + cover_h * 0.72 + 14 * k;
+      }
+      const QString right = side == 0 ?
+                                duration(value) :
+                                QLocale().toString(QDateTime::fromSecsSinceEpoch(value),
+                                                   QStringLiteral("d MMM, HH:mm"));
+      painter.setFont(Font(false, int(20 * k), 500));
+      const qreal rw = QFontMetricsF(painter.font()).horizontalAdvance(right) + 24 * k;
+      painter.setPen(TEXT_SOFT);
+      painter.drawText(QRectF(r.right() - rw, r.top(), rw - 18 * k, r.height()),
+                       Qt::AlignVCenter | Qt::AlignRight, right);
+      painter.setFont(Font(false, int(21 * k), 600));
+      painter.setPen(TEXT);
+      painter.drawText(QRectF(tx, r.top(), r.right() - rw - tx, r.height()), Qt::AlignVCenter,
+                       QFontMetricsF(painter.font())
+                           .elidedText(entry.title, Qt::ElideRight, r.right() - rw - tx));
+    }
+  }
+  DrawHints(painter, {}, {{QStringLiteral("B"), tr("Retour")}});
+}
+
+// ================================================================== real Wii Remote pairing
+
+void BigPictureWindow::OpenWiiPair()
+{
+  m_pair_port = 0;
+  m_pair_last_scan = 0;
+  BeginTransition(0);
+  m_mode = Mode::WiiPair;
+}
+
+void BigPictureWindow::HandleWiiPair(Action action)
+{
+  switch (action)
+  {
+  case Action::Left:
+  case Action::Right:
+  case Action::Up:
+  case Action::Down:
+    m_pair_port = (m_pair_port + ((action == Action::Right || action == Action::Down) ? 1 : 3)) % 4;
+    m_audio->Play(Sound::Move);
+    break;
+  case Action::Accept:
+    // Use a real Wii Remote on this player (Dolphin's own "Real Wii Remote" source)
+    Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(m_pair_port), WiimoteSource::Real);
+    Config::Save();
+    WiimoteReal::Refresh();
+    m_pair_last_scan = m_clock.elapsed();
+    m_audio->Play(Sound::Confirm);
+    Toast(tr("Appuie sur SYNC ou 1 + 2 sur la Wiimote"));
+    break;
+  case Action::Options:
+    Config::SetBaseOrCurrent(Config::GetInfoForWiimoteSource(m_pair_port), WiimoteSource::Emulated);
+    Config::Save();
+    m_audio->Play(Sound::Erase);
+    Toast(tr("Joueur %1 : Wiimote émulée").arg(m_pair_port + 1));
+    break;
+  case Action::Back:
+  case Action::Menu:
+    m_audio->Play(Sound::Back);
+    BeginTransition(0);
+    m_mode = Mode::Library;
+    break;
+  default:
+    break;
+  }
+}
+
+void BigPictureWindow::DrawWiiPair(QPainter& painter)
+{
+  const qreal k = height() / 1080.0;
+  const qint64 now = m_clock.elapsed();
+  // Keep looking for Wii Remotes while this screen is open
+  bool wants_real = false;
+  for (int p = 0; p < 4; ++p)
+    wants_real |= Config::Get(Config::GetInfoForWiimoteSource(p)) == WiimoteSource::Real;
+  if (wants_real && now - m_pair_last_scan > 2500)
+  {
+    WiimoteReal::Refresh();
+    m_pair_last_scan = now;
+  }
+
+  QFont label = Font(false, int(18 * k), 600);
+  label.setLetterSpacing(QFont::AbsoluteSpacing, 1.5 * k);
+  painter.setFont(label);
+  painter.setPen(ACCENT_SOFT);
+  painter.drawText(QRectF(80 * k, 170 * k, 1200 * k, 30 * k), Qt::AlignVCenter,
+                   tr("ASSOCIER UNE VRAIE WIIMOTE"));
+
+  // One card per player
+  const qreal cw = (width() - 160 * k - 3 * 24 * k) / 4, ch = 200 * k;
+  for (int p = 0; p < 4; ++p)
+  {
+    const QRectF r(80 * k + p * (cw + 24 * k), 215 * k, cw, ch);
+    const bool active = p == m_pair_port;
+    const WiimoteSource source = Config::Get(Config::GetInfoForWiimoteSource(p));
+    bool connected = false;
+    if (source == WiimoteSource::Real)
+    {
+      std::lock_guard lk(WiimoteReal::g_wiimotes_mutex);
+      connected = WiimoteReal::g_wiimotes[p] && WiimoteReal::g_wiimotes[p]->IsConnected();
+    }
+    painter.setPen(active ? QPen(ACCENT, 5 * k) : Qt::NoPen);
+    painter.setBrush(SURFACE);
+    painter.drawRoundedRect(r, 18 * k, 18 * k);
+    painter.setFont(Font(true, int(30 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(QRectF(r.left() + 26 * k, r.top() + 22 * k, r.width() - 52 * k, 44 * k),
+                     Qt::AlignVCenter, tr("Joueur %1").arg(p + 1));
+    QString source_text, status;
+    QColor status_color = TEXT_SOFT;
+    switch (source)
+    {
+    case WiimoteSource::Real:
+      source_text = tr("Vraie Wiimote");
+      if (connected)
+      {
+        status = tr("Connectée");
+        status_color = ACCENT;
+      }
+      else
+      {
+        static const char* dots[] = {"", ".", "..", "..."};
+        status = tr("Recherche%1").arg(QString::fromLatin1(dots[(now / 400) % 4]));
+      }
+      break;
+    case WiimoteSource::Emulated:
+      source_text = tr("Wiimote émulée");
+      status = tr("Manette actuelle");
+      break;
+    default:
+      source_text = tr("Aucune");
+      break;
+    }
+    painter.setFont(Font(false, int(21 * k), 500));
+    painter.setPen(TEXT_SOFT);
+    painter.drawText(QRectF(r.left() + 26 * k, r.top() + 80 * k, r.width() - 52 * k, 34 * k),
+                     Qt::AlignVCenter, source_text);
+    if (!status.isEmpty())
+    {
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(status_color);
+      painter.drawEllipse(QRectF(r.left() + 26 * k, r.top() + 140 * k, 16 * k, 16 * k));
+      painter.setFont(Font(false, int(21 * k), 600));
+      painter.setPen(status_color == ACCENT ? ACCENT : TEXT);
+      painter.drawText(QRectF(r.left() + 52 * k, r.top() + 128 * k, r.width() - 78 * k, 40 * k),
+                       Qt::AlignVCenter, status);
+    }
+    AddHit(r, [this, p] {
+      if (m_pair_port == p)
+        HandleWiiPair(Action::Accept);
+      else
+      {
+        m_pair_port = p;
+        m_audio->Play(Sound::Move);
+      }
+    });
+  }
+
+  // Steps
+  QStringList steps = {
+      tr("Choisis le joueur puis appuie sur A : il utilisera une vraie Wiimote."),
+      tr("Retire le cache des piles et appuie sur le bouton rouge SYNC (ou maintiens 1 + 2)."),
+      tr("Les voyants clignotent pendant la recherche, puis un seul reste allumé : c'est prêt."),
+#ifdef _WIN32
+      tr("Rien ne se passe ? Associe-la d'abord dans Windows : Paramètres › Bluetooth › "
+         "Ajouter un appareil, sans code PIN, puis reviens ici."),
+#else
+      tr("Rien ne se passe ? Vérifie que le Bluetooth est activé (Paramètres de Bazzite / KDE)."),
+#endif
+      tr("X remet la Wiimote émulée (ta manette) sur ce joueur."),
+  };
+  if (Config::Get(Config::MAIN_BLUETOOTH_PASSTHROUGH_ENABLED))
+    steps.prepend(tr("Le Bluetooth passthrough est activé dans l'interface classique : désactive-le "
+                     "pour utiliser cet écran."));
+  qreal y = 460 * k;
+  painter.setFont(Font(false, int(23 * k), 400));
+  const QFontMetricsF fm(painter.font());
+  for (int i = 0; i < steps.size(); ++i)
+  {
+    const QRectF num(80 * k, y, 44 * k, 44 * k);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(RAISED);
+    painter.drawEllipse(num);
+    painter.setFont(Font(false, int(21 * k), 700));
+    painter.setPen(TEXT);
+    painter.drawText(num, Qt::AlignCenter, QString::number(i + 1));
+    painter.setFont(Font(false, int(23 * k), 400));
+    painter.setPen(TEXT_SOFT);
+    const QRectF text(144 * k, y, width() - 224 * k, 200 * k);
+    const QRectF used = fm.boundingRect(text, Qt::TextWordWrap, steps[i]);
+    painter.drawText(QRectF(text.left(), y + 6 * k, text.width(), used.height() + 4 * k),
+                     Qt::TextWordWrap, steps[i]);
+    y += std::max(56 * k, used.height() + 24 * k);
+  }
+  DrawHints(painter, {{QStringLiteral("D-Pad-L"), tr("Joueur")},
+                      {QStringLiteral("A"), tr("Vraie Wiimote")}},
+            {{QStringLiteral("X"), tr("Wiimote émulée")}, {QStringLiteral("B"), tr("Retour")}});
 }
