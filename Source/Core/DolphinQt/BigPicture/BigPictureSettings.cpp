@@ -791,11 +791,24 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                           {AspectMode::Stretch, Tr("Étirer à la fenêtre")},
                                           {AspectMode::Raw, Tr("Pixels carrés")}}));
     c.items.push_back(Toggle(Tr("Mise à l'échelle entière (pixel perfect)"),
-                             Tr("L'image est agrandie d'un nombre entier de fois (×2, ×3…) : "
-                                "chaque pixel a la même taille, sans flou ni déformation, avec "
-                                "des bandes noires autour. Idéal en résolution interne Native "
-                                "avec le rééchantillonnage « Bilinéaire net »."),
+                             Tr("L'image rendue n'est jamais étirée à la taille de l'écran : "
+                                "elle est affichée pixel pour pixel (×1) ou agrandie d'un nombre "
+                                "entier de fois, avec des bandes noires autour. Sa taille dépend "
+                                "de la résolution interne : 2× = 960 lignes, 3× = 1440 lignes "
+                                "(NTSC ; PAL : 1056 / 1584). Si l'image est plus haute que "
+                                "l'écran, baisse la résolution interne."),
                              Config::GFX_INTEGER_SCALING));
+    c.items.push_back(Choice<int>(Tr("Agrandissement entier"),
+                                  Tr("Combien de pixels d'écran pour un pixel rendu. Auto : le "
+                                     "plus grand qui tient dans l'écran."),
+                                  Config::GFX_INTEGER_SCALING_FACTOR,
+                                  {{0, Tr("Auto")},
+                                   {1, Tr("×1 (pixel pour pixel)")},
+                                   {2, Tr("×2")},
+                                   {3, Tr("×3")},
+                                   {4, Tr("×4")},
+                                   {5, Tr("×5")},
+                                   {6, Tr("×6")}}));
     c.items.push_back(Toggle(Tr("Écran large forcé (hack)"),
                              Tr("Élargit l'image des jeux 4:3. Peut couper des éléments."),
                              Config::GFX_WIDESCREEN_HACK));
@@ -835,14 +848,14 @@ std::vector<BigPictureSettingCategory> BuildBigPictureSettings(const BigPictureS
                                     "graphique travaille."),
                                   Config::GFX_EFB_SCALE,
                                   {{0, Tr("Auto (fenêtre)")},
-                                   {1, Tr("Native (480p)")},
-                                   {2, Tr("2× (720p)")},
-                                   {3, Tr("3× (1080p)")},
-                                   {4, Tr("4× (1440p)")},
-                                   {5, Tr("5× (1800p)")},
-                                   {6, Tr("6× (4K)")},
-                                   {7, Tr("7×")},
-                                   {8, Tr("8× (5K)")}}));
+                                   {1, Tr("Native (×1, 480 lignes)")},
+                                   {2, Tr("2× (960 lignes)")},
+                                   {3, Tr("3× (1440 lignes)")},
+                                   {4, Tr("4× (1920 lignes)")},
+                                   {5, Tr("5× (2400 lignes)")},
+                                   {6, Tr("6× (2880 lignes)")},
+                                   {7, Tr("7× (3360 lignes)")},
+                                   {8, Tr("8× (3840 lignes)")}}));
     {
       // Anti-aliasing: MSAA or SSAA, as one choice.
       struct AA
@@ -1620,13 +1633,13 @@ BuildBigPictureGameSettings(const std::shared_ptr<Config::Layer>& layer)
     BigPictureSettingCategory c{Tr("Graphismes"), {}};
     c.items.push_back(GameChoice<int>(layer, Tr("Résolution interne"), {}, Config::GFX_EFB_SCALE,
                                       {{0, Tr("Auto (fenêtre)")},
-                                       {1, Tr("Native (480p)")},
-                                       {2, Tr("2× (720p)")},
-                                       {3, Tr("3× (1080p)")},
-                                       {4, Tr("4× (1440p)")},
-                                       {5, Tr("5× (1800p)")},
-                                       {6, Tr("6× (4K)")},
-                                       {8, Tr("8× (5K)")}}));
+                                       {1, Tr("Native (×1, 480 lignes)")},
+                                       {2, Tr("2× (960 lignes)")},
+                                       {3, Tr("3× (1440 lignes)")},
+                                       {4, Tr("4× (1920 lignes)")},
+                                       {5, Tr("5× (2400 lignes)")},
+                                       {6, Tr("6× (2880 lignes)")},
+                                       {8, Tr("8× (3840 lignes)")}}));
     c.items.push_back(GameChoice<u32>(layer, Tr("Anticrénelage (MSAA)"), {}, Config::GFX_MSAA,
                                       {{1, Tr("Aucun")},
                                        {2, Tr("2×")},
@@ -1773,13 +1786,13 @@ std::vector<BigPictureSettingCategory> BuildBigPictureQuickSettings()
 {
   BigPictureSettingCategory c{Tr("Réglages rapides"), {}};
   c.items.push_back(Choice<int>(Tr("Résolution interne"), {}, Config::GFX_EFB_SCALE,
-                                {{1, Tr("Native (480p)")},
-                                 {2, Tr("2× (720p)")},
-                                 {3, Tr("3× (1080p)")},
-                                 {4, Tr("4× (1440p)")},
-                                 {5, Tr("5× (1800p)")},
-                                 {6, Tr("6× (4K)")},
-                                 {8, Tr("8× (5K)")}}));
+                                {{1, Tr("Native (×1, 480 lignes)")},
+                                 {2, Tr("2× (960 lignes)")},
+                                 {3, Tr("3× (1440 lignes)")},
+                                 {4, Tr("4× (1920 lignes)")},
+                                 {5, Tr("5× (2400 lignes)")},
+                                 {6, Tr("6× (2880 lignes)")},
+                                 {8, Tr("8× (3840 lignes)")}}));
   c.items.push_back(Choice<u32>(Tr("Anticrénelage (MSAA)"), {}, Config::GFX_MSAA,
                                 {{1, Tr("Aucun")}, {2, Tr("2×")}, {4, Tr("4×")}, {8, Tr("8×")}}));
   c.items.push_back(Choice<AspectMode>(Tr("Format d'image"), {}, Config::GFX_ASPECT_RATIO,
@@ -2707,7 +2720,10 @@ void ApplyBigPictureDisplayPreset(int screen_height)
   else
   {
     // TV: sharp picture at the TV's resolution (1080p: 3x, 1440p: 4x, 4K: 5x)
-    const int scale = std::clamp(static_cast<int>(std::lround(screen_height / 480.0 + 0.5)), 2, 6);
+    int scale = std::clamp(static_cast<int>(std::lround(screen_height / 480.0 + 0.5)), 2, 6);
+    // Pixel perfect: the rendered picture must fit the screen at x1 at least
+    if (Config::Get(Config::GFX_INTEGER_SCALING))
+      scale = std::clamp(static_cast<int>(screen_height) / 480, 1, 6);
     Config::SetCurrent(Config::GFX_EFB_SCALE, scale);
     Config::SetCurrent(Config::GFX_MSAA, 4u);
     Config::SetCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY, AnisotropicFilteringMode::Force16x);

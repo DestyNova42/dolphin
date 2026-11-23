@@ -815,8 +815,13 @@ void Presenter::UpdateDrawRectangle()
   if (g_ActiveConfig.bIntegerScaling && m_xfb_entry &&
       g_ActiveConfig.aspect_mode != AspectMode::Stretch && int_draw_height > 0)
   {
+    // The rendered picture (internal resolution included): at x1, one rendered pixel is one
+    // screen pixel; the picture is never stretched to the window size.
     const int src_height = AdjustForCustomCrop(m_xfb_rect).GetHeight();
-    const int factor = src_height > 0 ? static_cast<int>(win_height) / src_height : 0;
+    const int fits = src_height > 0 ? static_cast<int>(win_height) / src_height : 0;
+    int factor = fits;
+    if (g_ActiveConfig.iIntegerScalingFactor > 0)
+      factor = std::min(g_ActiveConfig.iIntegerScalingFactor, fits);
     if (factor >= 1)
     {
       const float aspect = static_cast<float>(int_draw_width) / int_draw_height;

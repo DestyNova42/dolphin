@@ -42,6 +42,8 @@ extern const Info<float> GFX_WIDESCREEN_HEURISTIC_WIDESCREEN_RATIO;
 extern const Info<bool> GFX_CROP_TO_ASPECT_RATIO;
 // Host presentation only: shows the picture at a whole-number multiple of its size.
 extern const Info<bool> GFX_INTEGER_SCALING;
+// 0: largest whole multiple that fits the window, otherwise that multiple
+extern const Info<int> GFX_INTEGER_SCALING_FACTOR;
 extern const Info<bool> GFX_CROP_CUSTOM;
 extern const Info<int> GFX_CROP_CUSTOM_LEFT;
 extern const Info<int> GFX_CROP_CUSTOM_TOP;

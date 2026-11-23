@@ -208,6 +208,7 @@ struct VideoConfig final
   float widescreen_heuristic_widescreen_ratio = 0.f;
   bool bCropToAspectRatio = false;
   bool bIntegerScaling = false;
+  int iIntegerScalingFactor = 0;
   bool bCropCustom = false;
   int iCropCustomLeft = 0;
   int iCropCustomTop = 0;

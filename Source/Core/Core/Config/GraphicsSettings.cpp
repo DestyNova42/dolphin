@@ -36,6 +36,7 @@ const Info<float> GFX_WIDESCREEN_HEURISTIC_WIDESCREEN_RATIO{
     {System::GFX, "Settings", "WidescreenHeuristicWidescreenRatio"}, (16 / 9.f) / (4 / 3.f)};
 const Info<bool> GFX_CROP_TO_ASPECT_RATIO{{System::GFX, "Settings", "Crop"}, false};
 const Info<bool> GFX_INTEGER_SCALING{{System::GFX, "Settings", "IntegerScaling"}, false};
+const Info<int> GFX_INTEGER_SCALING_FACTOR{{System::GFX, "Settings", "IntegerScalingFactor"}, 0};
 const Info<bool> GFX_CROP_CUSTOM{{System::GFX, "Settings", "CropCustom"}, false};
 const Info<int> GFX_CROP_CUSTOM_LEFT{{System::GFX, "Settings", "CropCustomLeft"}, 0};
 const Info<int> GFX_CROP_CUSTOM_TOP{{System::GFX, "Settings", "CropCustomTop"}, 0};
