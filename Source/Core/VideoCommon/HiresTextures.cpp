@@ -3,7 +3,9 @@
 
 #include "VideoCommon/HiresTextures.h"
 
+#include <chrono>
 #include <fmt/format.h>
+#include <thread>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -17,8 +19,10 @@
 #include "Common/Logging/Log.h"
 #include "Common/StringUtil.h"
 #include "Core/ConfigManager.h"
+#include "Core/Core.h"
 #include "Core/System.h"
 #include "VideoCommon/Assets/DirectFilesystemAssetLibrary.h"
+#include "VideoCommon/LoadingProgress.h"
 #include "VideoCommon/OnScreenDisplay.h"
 #include "VideoCommon/Resources/CustomResourceManager.h"
 #include "VideoCommon/VideoConfig.h"
@@ -97,8 +101,14 @@ void HiresTexture::Update()
         Common::DoFileSearch(texture_directory, extensions, /*recursive*/ true);
 
     bool failed_insert = false;
+    u64 scanned = 0;
     for (auto& path : texture_paths)
     {
+      if (g_ActiveConfig.bCacheHiresTextures)
+      {
+        VideoCommon::LoadingProgress::Report(VideoCommon::LoadingProgress::Phase::Textures,
+                                             scanned++, texture_paths.size());
+      }
       std::string filename;
       SplitPath(path, nullptr, &filename, nullptr);
 
@@ -156,6 +166,48 @@ void HiresTexture::Update()
                           s_hires_texture_id_to_arbmipmap.size(), game_id_display);
   }
   OSD::AddMessage(message, 10000);
+}
+
+// Preloading: the textures are read by the asset loader threads. Wait here until they are
+// all in memory (or the memory budget is reached), showing the progress to the frontend.
+void HiresTexture::WaitForPreload()
+{
+  namespace LP = VideoCommon::LoadingProgress;
+  const u64 total = s_hires_texture_cache.size();
+  if (total == 0)
+    return;
+
+  auto& system = Core::System::GetInstance();
+  auto& resources = system.GetCustomResourceManager();
+  using Clock = std::chrono::steady_clock;
+  u64 last_done = 0;
+  auto last_change = Clock::now();
+  while (!LP::CancelRequested() && Core::GetState(system) != Core::State::Stopping)
+  {
+    resources.XFBTriggered();  // hands the next textures to the loader threads
+    u64 done = 0;
+    for (const auto& [id, texture] : s_hires_texture_cache)
+    {
+      const VideoCommon::TextureDataResource* data = texture->LoadTexture();
+      if (data && data->IsDataProcessed() != VideoCommon::Resource::TaskComplete::No)
+        ++done;
+    }
+    LP::Report(LP::Phase::Textures, done, total);
+    if (done >= total)
+      break;
+    if (done != last_done)
+    {
+      last_done = done;
+      last_change = Clock::now();
+    }
+    else if (Clock::now() - last_change > std::chrono::seconds(5))
+    {
+      // Nothing more comes in: the memory budget for custom textures is full.
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  }
+  LP::Clear();
 }
 
 void HiresTexture::Clear()

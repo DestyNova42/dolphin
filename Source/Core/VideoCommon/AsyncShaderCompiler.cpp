@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/AsyncShaderCompiler.h"
+#include "VideoCommon/LoadingProgress.h"
 
+#include <algorithm>
 #include <thread>
 
 #include "Common/Assert.h"
@@ -96,6 +98,8 @@ bool AsyncShaderCompiler::WaitUntilCompletion(
     std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL));
     if (!HasPendingWork())
       return true;
+    if (VideoCommon::LoadingProgress::CancelRequested())
+      return false;
   }
 
   // Grab the number of pending items. We use this to work out how many are left.
@@ -108,17 +112,19 @@ bool AsyncShaderCompiler::WaitUntilCompletion(
   }
 
   // Update progress while the compiles complete.
-  while (Core::GetState(Core::System::GetInstance()) != Core::State::Stopping)
+  while (Core::GetState(Core::System::GetInstance()) != Core::State::Stopping &&
+         !VideoCommon::LoadingProgress::CancelRequested())
   {
     size_t remaining_items;
     {
       std::lock_guard pending_guard(m_pending_work_lock);
       if (m_pending_work.empty() && !m_busy_workers.load())
         return true;
-      remaining_items = m_pending_work.size();
+      // shaders being compiled right now are not done yet
+      remaining_items = m_pending_work.size() + m_busy_workers.load();
     }
 
-    progress_callback(total_items - remaining_items, total_items);
+    progress_callback(total_items - std::min(remaining_items, total_items), total_items);
     std::this_thread::sleep_for(CHECK_INTERVAL);
   }
   return false;

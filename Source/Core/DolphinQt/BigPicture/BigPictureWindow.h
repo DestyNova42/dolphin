@@ -336,6 +336,7 @@ private:
   QFont Font(bool display, int px, int weight) const;
   void DrawIconRaw(QPainter& painter, const QString& name, const QRectF& rect);
   void DrawIcon(QPainter& painter, const QString& name, const QRectF& rect);
+  void CancelLaunch();
   void DrawHints(QPainter& painter, const std::vector<std::pair<QString, QString>>& left,
                  const std::vector<std::pair<QString, QString>>& right);
   qreal DrawPillButton(QPainter& painter, qreal x, qreal y, const QString& icon,
@@ -500,6 +501,9 @@ private:
   // closing
   qreal m_close_t = 0;
   bool m_stop_sent = false;
+  bool m_cancelling = false;     // B pressed on the loading screen
+  bool m_launch_emitted = false;  // the game was asked to start
+  qreal m_cancel_t = 0;
 
   // updates
   QString m_update_url;

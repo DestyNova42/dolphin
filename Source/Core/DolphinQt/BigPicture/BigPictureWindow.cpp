@@ -60,6 +60,7 @@
 #include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
 #include "Core/Config/GraphicsSettings.h"
+#include "VideoCommon/LoadingProgress.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/Widescreen.h"
 #include "DolphinQt/BigPicture/BigPictureDisplay.h"
@@ -701,6 +702,19 @@ void BigPictureWindow::Open()
   m_resume_known.clear();
   m_resume_shot_path.clear();
   m_hd_known.clear();
+  {
+    // Shaders (once): compiled before the game starts, behind the gauge of the loading
+    // screen, instead of in the middle of the game; background compilation on every core
+    // the PC can spare instead of a single one.
+    QSettings& qs = Settings::GetQSettings();
+    if (!qs.value(QStringLiteral("bigpicture/shaders_v2"), false).toBool())
+    {
+      qs.setValue(QStringLiteral("bigpicture/shaders_v2"), true);
+      Config::SetBaseOrCurrent(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true);
+      Config::SetBaseOrCurrent(Config::GFX_SHADER_COMPILER_THREADS, -1);
+      Config::SetBaseOrCurrent(Config::GFX_SHADER_PRECOMPILER_THREADS, -1);
+    }
+  }
   static bool s_cleaned_up = false;
   if (!s_cleaned_up)
   {
@@ -777,6 +791,8 @@ void BigPictureWindow::OnEmulationStateChanged(Core::State state)
   case Core::State::Running:
     if (m_mode == Mode::Closing)
       break;  // the game is being stopped behind the black veil
+    if (m_mode == Mode::Launching && m_cancelling)
+      break;  // cancelled: it stops right away
     if (m_mode == Mode::Launching)
     {
       // Reveal the game smoothly: the menu fades away over the running game.
@@ -805,6 +821,8 @@ void BigPictureWindow::OnEmulationStateChanged(Core::State state)
     break;
   case Core::State::Uninitialized:
     m_game_timer->stop();
+    m_cancelling = false;
+    VideoCommon::LoadingProgress::Clear();
     BigPictureDisplay::RestoreHdr();
     if (m_mode == Mode::InGame || m_mode == Mode::Pause || m_mode == Mode::Launching ||
         m_mode == Mode::FadingOut || m_mode == Mode::Closing)
@@ -994,10 +1012,11 @@ void BigPictureWindow::SetMode(Mode mode)
 
 void BigPictureWindow::PollController()
 {
-  if (!m_active || !isVisible() || !isActiveWindow())
+  // While a game loads, the game window may have the focus: B still cancels.
+  if (!m_active || !isVisible() || (!isActiveWindow() && m_mode != Mode::Launching))
     return;
   if (m_mode == Mode::Setup || m_mode == Mode::InGame || m_mode == Mode::Remap ||
-      m_mode == Mode::Launching || m_mode == Mode::FadingOut || m_mode == Mode::Closing)
+      m_mode == Mode::FadingOut || m_mode == Mode::Closing)
     return;
   if (m_mode == Mode::PadTest || m_mode == Mode::WiiTest || m_mode == Mode::DeviceDiag)
   {
@@ -1378,6 +1397,10 @@ void BigPictureWindow::HandleAction(Action action)
 {
   switch (m_mode)
   {
+  case Mode::Launching:
+    if (action == Action::Back)
+      CancelLaunch();
+    break;
   case Mode::Library:
     if (m_tab == Tab::Settings)
       HandleSettings(action);
@@ -2103,6 +2126,8 @@ void BigPictureWindow::Tick()
     UpdateCalibration();
   if (m_fade_in < 1)
     m_fade_in = std::min<qreal>(1, m_fade_in + dt / 0.6);
+  if (m_cancelling)
+    m_cancel_t = std::min<qreal>(1, m_cancel_t + dt / 0.5);
   if (m_mode == Mode::Closing)
   {
     m_close_t = std::min<qreal>(1, m_close_t + dt / 0.9);
@@ -2792,16 +2817,66 @@ void BigPictureWindow::DrawScene(QPainter& painter)
     painter.setPen(TEXT);
     painter.drawText(QRectF(0, cr.bottom() + 30 * k, width(), 50 * k), Qt::AlignCenter,
                      m_running_entry.title);
-    // spinner
-    const QPointF sc(width() / 2.0, cr.bottom() + 130 * k);
-    for (int i = 0; i < 12; ++i)
+    namespace LP = VideoCommon::LoadingProgress;
+    const auto phase = static_cast<LP::Phase>(LP::s_phase.load());
+    const quint64 total = LP::s_total.load();
+    const quint64 done = std::min<quint64>(LP::s_done.load(), total);
+    if (m_mode == Mode::Launching && !m_cancelling && phase != LP::Phase::None && total > 0)
     {
-      const qreal a = i * std::numbers::pi / 6 + m_time * 5;
-      QColor c = TEXT;
-      c.setAlphaF(static_cast<float>(0.15 + 0.85 * (i / 11.0)));
-      painter.setPen(QPen(c, 4 * k, Qt::SolidLine, Qt::RoundCap));
-      painter.drawLine(QPointF(sc.x() + std::cos(a) * 12 * k, sc.y() + std::sin(a) * 12 * k),
-                       QPointF(sc.x() + std::cos(a) * 22 * k, sc.y() + std::sin(a) * 22 * k));
+      // Gauge: shader compilation, then custom textures
+      const qreal fraction = static_cast<qreal>(done) / static_cast<qreal>(total);
+      const QRectF bar((width() - 520 * k) / 2, cr.bottom() + 118 * k, 520 * k, 12 * k);
+      painter.setFont(Font(false, int(21 * k), 500));
+      painter.setPen(TEXT_SOFT);
+      const QString what = phase == LP::Phase::Shaders ? tr("Compilation des shaders") :
+                                                         tr("Préchargement des textures HD");
+      painter.drawText(QRectF(bar.left(), bar.top() - 44 * k, bar.width(), 34 * k),
+                       Qt::AlignLeft | Qt::AlignVCenter, what);
+      painter.drawText(QRectF(bar.left(), bar.top() - 44 * k, bar.width(), 34 * k),
+                       Qt::AlignRight | Qt::AlignVCenter,
+                       QStringLiteral("%1 / %2 · %3 %")
+                           .arg(done)
+                           .arg(total)
+                           .arg(static_cast<int>(fraction * 100)));
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(RAISED);
+      painter.drawRoundedRect(bar, bar.height() / 2, bar.height() / 2);
+      if (fraction > 0)
+      {
+        painter.setBrush(ACCENT);
+        const QRectF fill(bar.left(), bar.top(), std::max(bar.height(), bar.width() * fraction),
+                          bar.height());
+        painter.drawRoundedRect(fill, bar.height() / 2, bar.height() / 2);
+      }
+    }
+    else
+    {
+      // spinner
+      const QPointF sc(width() / 2.0, cr.bottom() + 130 * k);
+      for (int i = 0; i < 12; ++i)
+      {
+        const qreal a = i * std::numbers::pi / 6 + m_time * 5;
+        QColor c = TEXT;
+        c.setAlphaF(static_cast<float>(0.15 + 0.85 * (i / 11.0)));
+        painter.setPen(QPen(c, 4 * k, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(QPointF(sc.x() + std::cos(a) * 12 * k, sc.y() + std::sin(a) * 12 * k),
+                         QPointF(sc.x() + std::cos(a) * 22 * k, sc.y() + std::sin(a) * 22 * k));
+      }
+      if (m_cancelling)
+      {
+        painter.setFont(Font(false, int(21 * k), 500));
+        painter.setPen(TEXT_SOFT);
+        painter.drawText(QRectF(0, sc.y() + 40 * k, width(), 34 * k), Qt::AlignCenter,
+                         tr("Retour au menu…"));
+      }
+    }
+    if (m_mode == Mode::Launching && !m_cancelling)
+      DrawHints(painter, {}, {{QStringLiteral("B"), tr("Annuler")}});
+    if (m_cancelling)
+    {
+      QColor veil = Qt::black;
+      veil.setAlphaF(static_cast<float>(0.6 * EaseInOut(std::min<qreal>(1, m_cancel_t))));
+      painter.fillRect(rect(), veil);
     }
     return;
   }
@@ -3492,7 +3567,6 @@ void BigPictureWindow::DrawCoverShelf(QPainter& painter)
                                      can_resume   ? tr("Reprendre") :
                                                     tr("Jouer")},
                {QStringLiteral("Y"), tr("Favori")},
-               {QStringLiteral("Z"), tr("Trier")},
                {QStringLiteral("B"), tr("Quitter")},
                {QStringLiteral("Start-Pause"), tr("Menu")}});
   }
@@ -3661,7 +3735,6 @@ void BigPictureWindow::DrawList(QPainter& painter)
                {QStringLiteral("C-Stick"), tr("Rapide")}},
               {{QStringLiteral("A"), HasResume(*sel) ? tr("Reprendre") : tr("Jouer")},
                {QStringLiteral("Y"), tr("Favori")},
-               {QStringLiteral("Z"), tr("Trier")},
                {QStringLiteral("B"), tr("Quitter")},
                {QStringLiteral("Start-Pause"), tr("Menu")}});
   }
@@ -6185,8 +6258,59 @@ void BigPictureWindow::Launch(const Entry& entry, int disc, bool resume)
   BeginTransition(0);
   m_mode = Mode::Launching;
   m_fade_in = 1;
+  m_cancelling = false;
+  m_cancel_t = 0;
+  m_launch_emitted = false;
+  VideoCommon::LoadingProgress::Clear();
+  VideoCommon::LoadingProgress::s_cancel.store(false);
+  VideoCommon::LoadingProgress::s_external_ui.store(true);
   // Let the select sound play before the game takes over.
-  QTimer::singleShot(350, this, [this, path, state] { emit LaunchRequested(path, state); });
+  QTimer::singleShot(350, this, [this, path, state] {
+    if (m_cancelling)
+    {
+      // cancelled before it even started
+      m_cancelling = false;
+      m_mode = Mode::Library;
+      m_fade_in = 0;
+      m_audio->StartMusic();
+      return;
+    }
+    m_launch_emitted = true;
+    emit LaunchRequested(path, state);
+  });
+}
+
+void BigPictureWindow::CancelLaunch()
+{
+  if (m_mode != Mode::Launching || m_cancelling)
+    return;
+  m_cancelling = true;
+  m_cancel_t = 0;
+  m_audio->Play(Sound::Back);
+  // The shader compilation / texture preloading stop waiting, the game is stopped and the
+  // library comes back (when the emulation is fully stopped).
+  VideoCommon::LoadingProgress::s_cancel.store(true);
+  Config::SetCurrent(Config::MAIN_CONFIRM_ON_STOP, false);
+  if (m_launch_emitted)
+    emit StopRequested();
+  // Never stay on the loading screen.
+  QTimer::singleShot(10000, this, [this] {
+    if (m_mode == Mode::Launching && m_cancelling)
+    {
+      auto& system = Core::System::GetInstance();
+      if (Core::IsUninitialized(system))
+      {
+        m_cancelling = false;
+        setWindowOpacity(1.0);
+        Open();
+        m_fade_in = 0;
+      }
+      else
+      {
+        emit StopRequested();
+      }
+    }
+  });
 }
 
 QString BigPictureWindow::ResumeStatePath(const std::string& game_id) const

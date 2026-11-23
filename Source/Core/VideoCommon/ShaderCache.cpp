@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/ShaderCache.h"
+#include "VideoCommon/LoadingProgress.h"
 
 #include <utility>
 
@@ -171,6 +172,13 @@ void ShaderCache::WaitForAsyncCompiler()
   bool running = true;
 
   constexpr auto update_ui_progress = [](size_t completed, size_t total) {
+    VideoCommon::LoadingProgress::Report(VideoCommon::LoadingProgress::Phase::Shaders, completed,
+                                         total);
+    // The frontend shows its own gauge over the game window: presenting a window that
+    // is covered can block on some drivers.
+    if (VideoCommon::LoadingProgress::s_external_ui.load())
+      return;
+
     const float center_x = ImGui::GetIO().DisplaySize.x * 0.5f;
     const float center_y = ImGui::GetIO().DisplaySize.y * 0.5f;
     const float scale = ImGui::GetIO().DisplayFramebufferScale.x;
@@ -201,8 +209,11 @@ void ShaderCache::WaitForAsyncCompiler()
     m_async_shader_compiler->RetrieveWorkItems();
   }
 
+  VideoCommon::LoadingProgress::Clear();
+
   // An extra Present to clear the screen
-  g_presenter->Present();
+  if (!VideoCommon::LoadingProgress::s_external_ui.load())
+    g_presenter->Present();
 }
 
 template <typename SerializedUidType, typename UidType>

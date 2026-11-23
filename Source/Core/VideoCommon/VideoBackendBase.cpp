@@ -58,6 +58,7 @@
 #include "VideoCommon/PixelEngine.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/Present.h"
+#include "VideoCommon/HiresTextures.h"
 #include "VideoCommon/Resources/CustomResourceManager.h"
 #include "VideoCommon/TMEM.h"
 #include "VideoCommon/TextureCacheBase.h"
@@ -365,6 +366,10 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
 
   g_shader_cache->InitializeShaderCache();
   system.GetCustomResourceManager().Initialize();
+
+  // Custom textures to preload: read them now, while the loading screen is up.
+  if (g_ActiveConfig.bHiresTextures && g_ActiveConfig.bCacheHiresTextures)
+    HiresTexture::WaitForPreload();
 
   return true;
 }

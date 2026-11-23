@@ -31,6 +31,7 @@ class HiresTexture
 {
 public:
   static void Update();
+  static void WaitForPreload();
   static void Clear();
   static void Shutdown();
   static std::shared_ptr<HiresTexture> Search(const TextureInfo& texture_info);
